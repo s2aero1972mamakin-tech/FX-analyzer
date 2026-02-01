@@ -30,9 +30,16 @@ strength = logic.get_currency_strength()
 if df is not None and not df.empty:
     df.index = pd.to_datetime(df.index)
     last_date = df.index[-1]
+    # ★表示スパンを45日間に設定
     start_view = last_date - timedelta(days=45)
     
-    # --- 診断パネル ---
+    # ズーム範囲内の高値・安値を計算してY軸を最適化
+    mask = (df.index >= start_view)
+    df_view = df.loc[mask]
+    y_min_view = float(df_view['Low'].min())
+    y_max_view = float(df_view['High'].max())
+    
+    # --- 1. 診断パネル ---
     diag = logic.judge_condition(df)
     if diag:
         col_short, col_mid = st.columns(2)
@@ -54,24 +61,27 @@ if df is not None and not df.empty:
                 </div>
             """, unsafe_allow_html=True)
 
-    # --- 経済カレンダー用アラート ---
+    # --- 2. 経済カレンダー用アラート ---
     if diag['short']['status'] == "勢い鈍化・調整" or df['ATR'].iloc[-1] > df['ATR'].mean() * 1.5:
         st.warning("⚠️ **【警戒】ボラティリティ上昇中または重要局面です**")
         st.info("経済カレンダーを確認し、雇用統計やFOMC等の重要指標前後はポジション管理を徹底してください。")
 
     st.markdown("---") 
 
-    # --- メインチャート ---
+    # --- 3. メインチャート ---
     fig_main = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1, 
                              subplot_titles=("USD/JPY & AI予想", "米国債10年物利回り"))
 
+    # ロウソク足
     fig_main.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], 
                                      name="価格", legend="legend1"), row=1, col=1)
+    # 移動平均線
     fig_main.add_trace(go.Scatter(x=df.index, y=df['SMA_5'], name="5日線", 
                                   line=dict(color='#00ff00', width=1.5), legend="legend1"), row=1, col=1)
     fig_main.add_trace(go.Scatter(x=df.index, y=df['SMA_25'], name="25日線", 
                                   line=dict(color='orange', width=2), legend="legend1"), row=1, col=1)
 
+    # 損益分岐点（エントリー価格）
     if entry_price > 0:
         fig_main.add_trace(go.Scatter(
             x=[df.index[0], df.index[-1]], y=[entry_price, entry_price], 
@@ -87,6 +97,7 @@ if df is not None and not df.empty:
             </div>
         """, unsafe_allow_html=True)
 
+    # AI予想ライン
     if api_key and st.sidebar.button("📈 AI予想ライン反映"):
         last_row = df.iloc[-1]
         context = {"price": last_row['Close'], "us10y": last_row['US10Y'], "atr": last_row['ATR'], 
@@ -100,41 +111,49 @@ if df is not None and not df.empty:
                                           name=f"予想最低:{ai_range[1]:.2f}", 
                                           line=dict(color="green", dash="dash"), legend="legend1"), row=1, col=1)
 
+    # 米10年債
     fig_main.add_trace(go.Scatter(x=df.index, y=df['US10Y'], name="米10年債", 
                                   line=dict(color='cyan'), legend="legend2"), row=2, col=1)
 
+    # ★表示期間の強制固定（45日間）
     fig_main.update_xaxes(range=[start_view, last_date], row=1, col=1)
     fig_main.update_xaxes(range=[start_view, last_date], showticklabels=True, row=2, col=1)
-    y_min, y_max = float(df.loc[start_view:, 'Low'].min()), float(df.loc[start_view:, 'High'].max())
-    fig_main.update_yaxes(range=[y_min * 0.995, y_max * 1.005], row=1, col=1)
+    
+    # ★Y軸の自動ズーム設定
+    fig_main.update_yaxes(range=[y_min_view * 0.998, y_max_view * 1.002], autorange=False, row=1, col=1)
+
     fig_main.update_layout(height=650, template="plotly_dark", xaxis_rangeslider_visible=False,
         legend=dict(y=0.98, x=1.02), legend2=dict(y=0.45, x=1.02), showlegend=True)
     st.plotly_chart(fig_main, use_container_width=True)
 
-    # --- RSI（凡例を復活・強化） ---
+    # --- 4. RSI（凡例と数値を完全表示） ---
     current_rsi = df['RSI'].iloc[-1]
     st.subheader(f"📈 RSI（現在の過熱感: {current_rsi:.2f}）")
     fig_rsi = go.Figure()
     fig_rsi.add_trace(go.Scatter(x=df.index, y=df['RSI'], name=f"RSI(14): {current_rsi:.1f}", line=dict(color='#ff5722')))
     fig_rsi.add_hline(y=70, line=dict(color="red", dash="dash"), annotation_text="買われすぎ")
     fig_rsi.add_hline(y=30, line=dict(color="cyan", dash="dash"), annotation_text="売られすぎ")
+    
+    # RSIの期間もメインと同期
+    fig_rsi.update_xaxes(range=[start_view, last_date])
     fig_rsi.update_layout(
         height=250, template="plotly_dark", yaxis=dict(range=[0, 100]),
         showlegend=True, legend=dict(yanchor="top", y=0.98, xanchor="left", x=1.02)
     )
     st.plotly_chart(fig_rsi, use_container_width=True)
 
-    # --- 通貨強弱 ---
+    # --- 5. 通貨強弱 ---
     if strength is not None and not strength.empty:
         st.subheader("📊 通貨強弱（1ヶ月）")
         fig_str = go.Figure()
         for col in strength.columns:
             fig_str.add_trace(go.Scatter(x=strength.index, y=strength[col], name=col))
+        # 30日前から表示
         fig_str.update_layout(height=400, template="plotly_dark", xaxis=dict(range=[last_date - timedelta(days=30), last_date]),
                               showlegend=True, legend=dict(yanchor="top", y=1, xanchor="left", x=1.02))
         st.plotly_chart(fig_str, use_container_width=True)
 
-    # --- AI詳細レポート ---
+    # --- 6. AI詳細レポート ---
     st.divider()
     if st.button("✨ Gemini AI 詳細レポート"):
         if api_key:
