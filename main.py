@@ -54,12 +54,12 @@ if df is not None and not df.empty:
                     <p style="color:#555; font-size:14px; line-height:1.4;">{diag['mid']['advice']}</p>
                 </div>
             """, unsafe_allow_html=True)
-            
+
+st.markdown("---") 
+
      # --- 経済カレンダー用のアラート（簡易版：直近のボラティリティから警告） ---
 if diag['short']['status'] == "勢い鈍化・調整" or df['ATR'].iloc[-1] > df['ATR'].mean():
     st.warning("⚠️ 重要指標や急変動の警戒期間です。ストップ注文の確認を推奨します。")            
-
-st.markdown("---") 
 
 # 全角スペースを排除した正しいコード
 if diag['short']['status'] == "勢い鈍化・調整" or df['ATR'].iloc[-1] > df['ATR'].mean():
@@ -176,6 +176,7 @@ if entry_price > 0:
                 }
 
                 st.markdown(logic.get_ai_analysis(api_key, context))
+
 
 
 
