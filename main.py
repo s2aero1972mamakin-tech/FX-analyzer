@@ -56,15 +56,15 @@ if df is not None and not df.empty:
             """, unsafe_allow_html=True)
             
      # --- 経済カレンダー用のアラート（簡易版：直近のボラティリティから警告） ---
-     if diag['short']['status'] == "勢い鈍化・調整" or df['ATR'].iloc[-1] > df['ATR'].mean():
-    　　　st.warning("⚠️ 重要指標や急変動の警戒期間です。ストップ注文の確認を推奨します。")            
+if diag['short']['status'] == "勢い鈍化・調整" or df['ATR'].iloc[-1] > df['ATR'].mean():
+    st.warning("⚠️ 重要指標や急変動の警戒期間です。ストップ注文の確認を推奨します。")            
 
-     st.markdown("---") 
+st.markdown("---") 
 
-     # 全角スペースを排除した正しいコード
-     if diag['short']['status'] == "勢い鈍化・調整" or df['ATR'].iloc[-1] > df['ATR'].mean():
-         st.warning("⚠️ **【警戒】ボラティリティ上昇中または重要局面です**")
-         st.info("経済カレンダーを確認し、雇用統計やFOMC等の重要指標前後はポジション管理を徹底してください。")
+# 全角スペースを排除した正しいコード
+if diag['short']['status'] == "勢い鈍化・調整" or df['ATR'].iloc[-1] > df['ATR'].mean():
+    st.warning("⚠️ **【警戒】ボラティリティ上昇中または重要局面です**")
+    st.info("経済カレンダーを確認し、雇用統計やFOMC等の重要指標前後はポジション管理を徹底してください。")
 
     # --- メインチャート ---
     fig_main = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1, 
@@ -176,6 +176,7 @@ if entry_price > 0:
                 }
 
                 st.markdown(logic.get_ai_analysis(api_key, context))
+
 
 
 
