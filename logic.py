@@ -122,6 +122,9 @@ def get_ai_analysis(api_key, context_data):
         2. 【地政学・外部要因】インフレや景気後退、政治リスクがどう影響しているか（FPの景気サイクルに基づき解説）
         3. 【テクニカル】乖離率とRSI({r:.1f})から見て、今は「割安」か「割高」か。
         4. 【具体的戦略】NISAや外貨建資産のバランスを考える際のアドバイスのように、出口戦略（利確）を含めた今後1週間の戦略を提示
+        【重要事項】
+　　　　　1. 現在のテクニカル状況に加え、直近の米国の重要指標（雇用統計、CPI、FOMC等）が控えている場合のリスク回避策を提示してください。
+　　　　　2. ユーザーが設定した「エントリー価格」がある場合、その価格を基準とした損益状況に基づき、FP1級の視点で現実的な利確・損切ラインを具体的に（何円何銭まで）指示してください。
         """
         response = model.generate_content(prompt)
         return f"✅ 成功\n\n{response.text}"
@@ -141,4 +144,5 @@ def get_ai_range(api_key, context_data):
         import re
         nums = re.findall(r"\d+\.\d+|\d+", response.text)
         return [float(nums[0]), float(nums[1])] if len(nums) >= 2 else None
+
     except: return None
