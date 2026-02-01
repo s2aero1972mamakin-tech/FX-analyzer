@@ -4,6 +4,7 @@ from plotly.subplots import make_subplots
 import logic
 import pandas as pd
 from datetime import datetime, timedelta
+import pytz # 日本時間取得用
 
 # --- ページ設定 ---
 st.set_page_config(layout="wide", page_title="AI-FX Analyzer")
@@ -84,7 +85,7 @@ if df is not None and not df.empty:
     fig_main.add_trace(go.Scatter(x=df.index, y=df['SMA_25'], name="25日線", 
                                   line=dict(color='orange', width=2), legend="legend1"), row=1, col=1)
 
-    # 損益分岐点（エントリー価格）
+    # 損益分岐点
     if entry_price > 0:
         fig_main.add_trace(go.Scatter(
             x=[df.index[0], df.index[-1]], y=[entry_price, entry_price], 
@@ -100,11 +101,20 @@ if df is not None and not df.empty:
             </div>
         """, unsafe_allow_html=True)
 
+    # 日本時間を取得してコンテキストに含める
+    jst = pytz.timezone('Asia/Tokyo')
+    now_jst = datetime.now(jst)
+    current_time_str = now_jst.strftime("%H:%M")
+    is_gotobi = now_jst.day in [5, 10, 15, 20, 25, 30]
+
     # AI予想ライン
     if api_key and st.sidebar.button("📈 AI予想ライン反映"):
         last_row = df.iloc[-1]
-        context = {"price": last_row['Close'], "us10y": last_row['US10Y'], "atr": last_row['ATR'], 
-                   "sma_diff": (last_row['Close'] - last_row['SMA_25']) / last_row['SMA_25'] * 100, "rsi": last_row['RSI']}
+        context = {
+            "price": last_row['Close'], "us10y": last_row['US10Y'], "atr": last_row['ATR'], 
+            "sma_diff": (last_row['Close'] - last_row['SMA_25']) / last_row['SMA_25'] * 100, 
+            "rsi": last_row['RSI'], "current_time": current_time_str, "is_gotobi": is_gotobi
+        }
         ai_range = logic.get_ai_range(api_key, context)
         if ai_range:
             fig_main.add_trace(go.Scatter(x=[df.index[0], df.index[-1]], y=[ai_range[0], ai_range[0]], 
@@ -122,7 +132,7 @@ if df is not None and not df.empty:
     fig_main.update_xaxes(range=[start_view, last_date], row=1, col=1)
     fig_main.update_xaxes(range=[start_view, last_date], showticklabels=True, row=2, col=1)
     
-    # Y軸の自動ズーム設定（45日間の範囲に合わせる）
+    # Y軸の自動ズーム設定
     fig_main.update_yaxes(range=[y_min_view * 0.998, y_max_view * 1.002], autorange=False, row=1, col=1)
 
     fig_main.update_layout(height=650, template="plotly_dark", xaxis_rangeslider_visible=False,
@@ -138,10 +148,8 @@ if df is not None and not df.empty:
     fig_rsi.add_hline(y=30, line=dict(color="cyan", dash="dash"), annotation_text="売られすぎ")
     
     fig_rsi.update_xaxes(range=[start_view, last_date])
-    fig_rsi.update_layout(
-        height=250, template="plotly_dark", yaxis=dict(range=[0, 100]),
-        showlegend=True, legend=dict(yanchor="top", y=0.98, xanchor="left", x=1.02)
-    )
+    fig_rsi.update_layout(height=250, template="plotly_dark", yaxis=dict(range=[0, 100]),
+                          showlegend=True, legend=dict(yanchor="top", y=0.98, xanchor="left", x=1.02))
     st.plotly_chart(fig_rsi, use_container_width=True)
 
     # --- 5. 通貨強弱 ---
@@ -160,12 +168,9 @@ if df is not None and not df.empty:
         if api_key:
             with st.spinner('分析中...'):
                 last_row = df.iloc[-1]
-                # 最新データがnanの場合は直前の有効データを使用
                 context = {
-                    "price": last_row['Close'], 
-                    "us10y": last_row['US10Y'], 
-                    "atr": last_row['ATR'], 
+                    "price": last_row['Close'], "us10y": last_row['US10Y'], "atr": last_row['ATR'], 
                     "sma_diff": (last_row['Close'] - last_row['SMA_25']) / last_row['SMA_25'] * 100, 
-                    "rsi": last_row['RSI']
+                    "rsi": last_row['RSI'], "current_time": current_time_str, "is_gotobi": is_gotobi
                 }
                 st.markdown(logic.get_ai_analysis(api_key, context))
