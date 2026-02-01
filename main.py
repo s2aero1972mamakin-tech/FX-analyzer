@@ -16,6 +16,11 @@ except Exception:
     default_key = ""
 api_key = st.sidebar.text_input("Gemini API Key", value=default_key, type="password")
 
+# --- サイドバーに設定追加 ---
+st.sidebar.markdown("---")
+st.sidebar.subheader("🎯 トレード設定")
+entry_price = st.sidebar.number_input("エントリー価格 (円)", value=0.0, format="%.3f")
+
 # --- データ取得 ---
 usdjpy_raw, us10y_raw = logic.get_market_data()
 df = logic.calculate_indicators(usdjpy_raw, us10y_raw)
@@ -49,6 +54,10 @@ if df is not None and not df.empty:
                     <p style="color:#555; font-size:14px; line-height:1.4;">{diag['mid']['advice']}</p>
                 </div>
             """, unsafe_allow_html=True)
+            
+    # --- 経済カレンダー用のアラート（簡易版：直近のボラティリティから警告） ---
+　　 if diag['short']['status'] == "勢い鈍化・調整" or df['ATR'].iloc[-1] > df['ATR'].mean():
+   　　　t.warning("⚠️ 重要指標や急変動の警戒期間です。ストップ注文の確認を推奨します。")
 
     # --- メインチャート ---
     fig_main = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1, 
@@ -61,6 +70,27 @@ if df is not None and not df.empty:
                                   line=dict(color='#00ff00', width=1.5), legend="legend1"), row=1, col=1)
     fig_main.add_trace(go.Scatter(x=df.index, y=df['SMA_25'], name="25日線(1月)", 
                                   line=dict(color='orange', width=2), legend="legend1"), row=1, col=1)
+
+    # --- メインチャートの描画部分 (fig_main.add_trace の後に追加) ---
+if entry_price > 0:
+    # 損益分岐点の水平線
+    fig_main.add_trace(go.Scatter(
+        x=[df.index[0], df.index[-1]], 
+        y=[entry_price, entry_price], 
+        name=f"エントリー: {entry_price:.3f}円", 
+        line=dict(color="yellow", width=2, dash="dot"),
+        legend="legend1"
+    ), row=1, col=1)
+    
+    # 現在の損益状況をパネル付近に表示
+    current_price = df['Close'].iloc[-1]
+    pips = (current_price - entry_price) if entry_price != 0 else 0
+    profit_color = "#00ff00" if pips >= 0 else "#ff4b4b"
+    st.sidebar.markdown(f"""
+        <div style="background-color:{profit_color}; padding:10px; border-radius:5px; text-align:center;">
+            <span style="color:white; font-weight:bold;">現在の損益: {pips:+.3f} 円</span>
+        </div>
+    """, unsafe_allow_html=True)
 
     # AI予想ライン（凡例に動的な価格を含める修正）
     if api_key and st.sidebar.button("📈 AI予想ライン反映"):
@@ -137,4 +167,5 @@ if df is not None and not df.empty:
                     "price": last_row['Close'], "us10y": last_row['US10Y'], "atr": last_row['ATR'], 
                     "sma_diff": (last_row['Close'] - last_row['SMA_25']) / last_row['SMA_25'] * 100, "rsi": last_row['RSI']
                 }
+
                 st.markdown(logic.get_ai_analysis(api_key, context))
