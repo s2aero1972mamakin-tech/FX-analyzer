@@ -28,9 +28,12 @@ df = logic.calculate_indicators(usdjpy_raw, us10y_raw)
 strength = logic.get_currency_strength()
 
 if df is not None and not df.empty:
+    # データ欠損対策：週末などで金利データがnanになるのを防ぐ
+    df = df.ffill() 
+    
     df.index = pd.to_datetime(df.index)
     last_date = df.index[-1]
-    # ★表示スパンを45日間に設定
+    # 表示スパンを45日間に設定
     start_view = last_date - timedelta(days=45)
     
     # ズーム範囲内の高値・安値を計算してY軸を最適化
@@ -115,18 +118,18 @@ if df is not None and not df.empty:
     fig_main.add_trace(go.Scatter(x=df.index, y=df['US10Y'], name="米10年債", 
                                   line=dict(color='cyan'), legend="legend2"), row=2, col=1)
 
-    # ★表示期間の強制固定（45日間）
+    # 表示期間の強制固定（45日間）
     fig_main.update_xaxes(range=[start_view, last_date], row=1, col=1)
     fig_main.update_xaxes(range=[start_view, last_date], showticklabels=True, row=2, col=1)
     
-    # ★Y軸の自動ズーム設定
+    # Y軸の自動ズーム設定（45日間の範囲に合わせる）
     fig_main.update_yaxes(range=[y_min_view * 0.998, y_max_view * 1.002], autorange=False, row=1, col=1)
 
     fig_main.update_layout(height=650, template="plotly_dark", xaxis_rangeslider_visible=False,
         legend=dict(y=0.98, x=1.02), legend2=dict(y=0.45, x=1.02), showlegend=True)
     st.plotly_chart(fig_main, use_container_width=True)
 
-    # --- 4. RSI（凡例と数値を完全表示） ---
+    # --- 4. RSI ---
     current_rsi = df['RSI'].iloc[-1]
     st.subheader(f"📈 RSI（現在の過熱感: {current_rsi:.2f}）")
     fig_rsi = go.Figure()
@@ -134,7 +137,6 @@ if df is not None and not df.empty:
     fig_rsi.add_hline(y=70, line=dict(color="red", dash="dash"), annotation_text="買われすぎ")
     fig_rsi.add_hline(y=30, line=dict(color="cyan", dash="dash"), annotation_text="売られすぎ")
     
-    # RSIの期間もメインと同期
     fig_rsi.update_xaxes(range=[start_view, last_date])
     fig_rsi.update_layout(
         height=250, template="plotly_dark", yaxis=dict(range=[0, 100]),
@@ -148,7 +150,6 @@ if df is not None and not df.empty:
         fig_str = go.Figure()
         for col in strength.columns:
             fig_str.add_trace(go.Scatter(x=strength.index, y=strength[col], name=col))
-        # 30日前から表示
         fig_str.update_layout(height=400, template="plotly_dark", xaxis=dict(range=[last_date - timedelta(days=30), last_date]),
                               showlegend=True, legend=dict(yanchor="top", y=1, xanchor="left", x=1.02))
         st.plotly_chart(fig_str, use_container_width=True)
@@ -159,6 +160,12 @@ if df is not None and not df.empty:
         if api_key:
             with st.spinner('分析中...'):
                 last_row = df.iloc[-1]
-                context = {"price": last_row['Close'], "us10y": last_row['US10Y'], "atr": last_row['ATR'], 
-                           "sma_diff": (last_row['Close'] - last_row['SMA_25']) / last_row['SMA_25'] * 100, "rsi": last_row['RSI']}
+                # 最新データがnanの場合は直前の有効データを使用
+                context = {
+                    "price": last_row['Close'], 
+                    "us10y": last_row['US10Y'], 
+                    "atr": last_row['ATR'], 
+                    "sma_diff": (last_row['Close'] - last_row['SMA_25']) / last_row['SMA_25'] * 100, 
+                    "rsi": last_row['RSI']
+                }
                 st.markdown(logic.get_ai_analysis(api_key, context))
