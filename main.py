@@ -1,4 +1,3 @@
-
 import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -21,7 +20,6 @@ api_key = st.sidebar.text_input("Gemini API Key", value=default_key, type="passw
 st.sidebar.markdown("---")
 st.sidebar.subheader("🎯 トレード設定")
 entry_price = st.sidebar.number_input("エントリー価格 (円)", value=0.0, format="%.3f")
-# 売り買いの選択肢を追加
 trade_type = st.sidebar.radio("ポジション種別", ["買い（ロング）", "売り（ショート）"])
 
 # --- データ取得 ---
@@ -56,7 +54,7 @@ if df is not None and not df.empty:
                 </div>
             """, unsafe_allow_html=True)
 
-    # --- 経済カレンダー用アラート（条件に合う時だけ表示） ---
+    # --- 経済カレンダー用アラート ---
     if diag['short']['status'] == "勢い鈍化・調整" or df['ATR'].iloc[-1] > df['ATR'].mean() * 1.5:
         st.warning("⚠️ **【警戒】ボラティリティ上昇中または重要局面です**")
         st.info("経済カレンダーを確認し、雇用統計やFOMC等の重要指標前後はポジション管理を徹底してください。")
@@ -67,7 +65,6 @@ if df is not None and not df.empty:
     fig_main = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1, 
                              subplot_titles=("USD/JPY & AI予想", "米国債10年物利回り"))
 
-    # 1段目: USD/JPY
     fig_main.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], 
                                      name="価格", legend="legend1"), row=1, col=1)
     fig_main.add_trace(go.Scatter(x=df.index, y=df['SMA_5'], name="5日線", 
@@ -75,28 +72,21 @@ if df is not None and not df.empty:
     fig_main.add_trace(go.Scatter(x=df.index, y=df['SMA_25'], name="25日線", 
                                   line=dict(color='orange', width=2), legend="legend1"), row=1, col=1)
 
-    # --- 損益分岐点・損益表示 ---
     if entry_price > 0:
         fig_main.add_trace(go.Scatter(
             x=[df.index[0], df.index[-1]], y=[entry_price, entry_price], 
-            name="エントリー価格", line=dict(color="yellow", width=2, dash="dot"), legend="legend1"
+            name=f"購入単価:{entry_price:.2f}", line=dict(color="yellow", width=2, dash="dot"), legend="legend1"
         ), row=1, col=1)
         
         current_price = df['Close'].iloc[-1]
-        # 売り・買いに合わせて損益計算
-        if trade_type == "買い（ロング）":
-            pips = current_price - entry_price
-        else:
-            pips = entry_price - current_price
-            
-        profit_color = "#228B22" if pips >= 0 else "#B22222" # ForestGreen または FireBrick
+        pips = (current_price - entry_price) if trade_type == "買い（ロング）" else (entry_price - current_price)
+        profit_color = "#228B22" if pips >= 0 else "#B22222"
         st.sidebar.markdown(f"""
             <div style="background-color:{profit_color}; padding:10px; border-radius:8px; text-align:center; border: 1px solid white;">
                 <span style="color:white; font-weight:bold; font-size:16px;">損益状況: {pips:+.3f} 円</span>
             </div>
         """, unsafe_allow_html=True)
 
-    # AI予想ライン（ボタン押下時）
     if api_key and st.sidebar.button("📈 AI予想ライン反映"):
         last_row = df.iloc[-1]
         context = {"price": last_row['Close'], "us10y": last_row['US10Y'], "atr": last_row['ATR'], 
@@ -104,17 +94,15 @@ if df is not None and not df.empty:
         ai_range = logic.get_ai_range(api_key, context)
         if ai_range:
             fig_main.add_trace(go.Scatter(x=[df.index[0], df.index[-1]], y=[ai_range[0], ai_range[0]], 
-                                          name=f"予想最高: {ai_range[0]:.2f}", 
+                                          name=f"予想最高:{ai_range[0]:.2f}", 
                                           line=dict(color="red", dash="dash"), legend="legend1"), row=1, col=1)
             fig_main.add_trace(go.Scatter(x=[df.index[0], df.index[-1]], y=[ai_range[1], ai_range[1]], 
-                                          name=f"予想最低: {ai_range[1]:.2f}", 
+                                          name=f"予想最低:{ai_range[1]:.2f}", 
                                           line=dict(color="green", dash="dash"), legend="legend1"), row=1, col=1)
 
-    # 2段目: 米10年債
     fig_main.add_trace(go.Scatter(x=df.index, y=df['US10Y'], name="米10年債", 
                                   line=dict(color='cyan'), legend="legend2"), row=2, col=1)
 
-    # レイアウト設定
     fig_main.update_xaxes(range=[start_view, last_date], row=1, col=1)
     fig_main.update_xaxes(range=[start_view, last_date], showticklabels=True, row=2, col=1)
     y_min, y_max = float(df.loc[start_view:, 'Low'].min()), float(df.loc[start_view:, 'High'].max())
@@ -123,13 +111,17 @@ if df is not None and not df.empty:
         legend=dict(y=0.98, x=1.02), legend2=dict(y=0.45, x=1.02), showlegend=True)
     st.plotly_chart(fig_main, use_container_width=True)
 
-    # --- RSI ---
-    st.subheader("📈 RSI（過熱感）")
+    # --- RSI（凡例を復活・強化） ---
+    current_rsi = df['RSI'].iloc[-1]
+    st.subheader(f"📈 RSI（現在の過熱感: {current_rsi:.2f}）")
     fig_rsi = go.Figure()
-    fig_rsi.add_trace(go.Scatter(x=df.index, y=df['RSI'], name="RSI", line=dict(color='#ff5722')))
-    fig_rsi.add_hline(y=70, line=dict(color="red", dash="dash"))
-    fig_rsi.add_hline(y=30, line=dict(color="cyan", dash="dash"))
-    fig_rsi.update_layout(height=250, template="plotly_dark", yaxis=dict(range=[0, 100]))
+    fig_rsi.add_trace(go.Scatter(x=df.index, y=df['RSI'], name=f"RSI(14): {current_rsi:.1f}", line=dict(color='#ff5722')))
+    fig_rsi.add_hline(y=70, line=dict(color="red", dash="dash"), annotation_text="買われすぎ")
+    fig_rsi.add_hline(y=30, line=dict(color="cyan", dash="dash"), annotation_text="売られすぎ")
+    fig_rsi.update_layout(
+        height=250, template="plotly_dark", yaxis=dict(range=[0, 100]),
+        showlegend=True, legend=dict(yanchor="top", y=0.98, xanchor="left", x=1.02)
+    )
     st.plotly_chart(fig_rsi, use_container_width=True)
 
     # --- 通貨強弱 ---
@@ -138,7 +130,8 @@ if df is not None and not df.empty:
         fig_str = go.Figure()
         for col in strength.columns:
             fig_str.add_trace(go.Scatter(x=strength.index, y=strength[col], name=col))
-        fig_str.update_layout(height=400, template="plotly_dark", xaxis=dict(range=[last_date - timedelta(days=30), last_date]))
+        fig_str.update_layout(height=400, template="plotly_dark", xaxis=dict(range=[last_date - timedelta(days=30), last_date]),
+                              showlegend=True, legend=dict(yanchor="top", y=1, xanchor="left", x=1.02))
         st.plotly_chart(fig_str, use_container_width=True)
 
     # --- AI詳細レポート ---
