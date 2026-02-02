@@ -3,53 +3,92 @@ import pandas as pd
 import google.generativeai as genai
 import datetime
 
-# --- 1. 市場データ取得 ---
-# logic.py の修正例
+# --- 1. 市場データ取得（最新レート強制反映版） ---
 def get_market_data(period="1y"):
     try:
         ticker = yf.Ticker("JPY=X")
         usdjpy_df = ticker.history(period=period)
         
-        # 履歴の最新行が今日でない場合、現在のリアルタイム価格で上書きする
-        current_price = ticker.basic_info['lastPrice'] 
-        if current_price:
-            usdjpy_df.iloc[-1, usdjpy_df.columns.get_loc('Close')] = current_price
-            
+        ticker_10y = yf.Ticker("^TNX")
+        us10y_df = ticker_10y.history(period=period)
 
-# --- 2. 指標計算（ATR厳密版・SMA75含む） ---
+        if usdjpy_df.empty or us10y_df.empty: return None, None
+        
+        # --- 最新価格の強制反映ロジック（週明けの窓開け対応） ---
+        try:
+            current_price = ticker.fast_info['last_price']
+            if current_price:
+                last_date = usdjpy_df.index[-1].date()
+                today_date = datetime.datetime.now().date()
+                
+                if last_date < today_date:
+                    # 今日の行がない場合、新しく追加して現在値を反映
+                    new_row = usdjpy_df.iloc[-1].copy()
+                    new_row['Open'] = new_row['High'] = new_row['Low'] = new_row['Close'] = current_price
+                    new_date = pd.Timestamp(today_date).tz_localize(usdjpy_df.index.tz)
+                    usdjpy_df.loc[new_date] = new_row
+                else:
+                    # すでに今日の日付がある場合は最新値に更新
+                    usdjpy_df.iloc[-1, usdjpy_df.columns.get_loc('Close')] = current_price
+        except:
+            pass 
+
+        usdjpy_df.index = usdjpy_df.index.tz_localize(None)
+        us10y_df.index = us10y_df.index.tz_localize(None)
+        return usdjpy_df, us10y_df
+    except: return None, None
+
+# --- 2. 指標計算（SMA5, 25, 75） ---
 def calculate_indicators(df, us10y):
     if df is None or us10y is None: return None
     new_df = df[['Open', 'High', 'Low', 'Close']].copy()
-    new_df = new_df.ffill()
-
-    # 移動平均線 (5, 25, 75)
+    
+    # 移動平均線
     new_df['SMA_5'] = new_df['Close'].rolling(window=5).mean()
     new_df['SMA_25'] = new_df['Close'].rolling(window=25).mean()
     new_df['SMA_75'] = new_df['Close'].rolling(window=75).mean()
     
-    # RSI (14日)
+    # RSI
     delta = new_df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    new_df['RSI'] = 100 - (100 / (1 + (gain / loss)))
+    rs = gain / loss
+    new_df['RSI'] = 100 - (100 / (1 + rs))
     
-    # ATR (True Rangeを用いた厳密な計算)
+    # ATR & 金利差
     high_low = new_df['High'] - new_df['Low']
     high_close = (new_df['High'] - new_df['Close'].shift()).abs()
     low_close = (new_df['Low'] - new_df['Close'].shift()).abs()
     new_df['ATR'] = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1).rolling(window=14).mean()
-    
     new_df['US10Y'] = us10y['Close'].ffill()
     return new_df
 
-# --- 3. 診断ロジック（SMA75条件含む） ---
+# --- 3. 通貨強弱 ---
+def get_currency_strength():
+    pairs = {"EUR": "EURUSD=X", "GBP": "GBPUSD=X", "JPY": "JPY=X", "AUD": "AUDUSD=X"}
+    strength_data = pd.DataFrame()
+    for name, sym in pairs.items():
+        try:
+            ticker = yf.Ticker(sym)
+            d = ticker.history(period="1mo")['Close']
+            d.index = d.index.tz_localize(None)
+            if name == "JPY":
+                strength_data[name] = (1/d).pct_change().cumsum() * 100
+            else:
+                strength_data[name] = d.pct_change().cumsum() * 100
+        except: continue
+    if not strength_data.empty:
+        strength_data["USD"] = strength_data.mean(axis=1) * -1
+        return strength_data.ffill().dropna()
+    return pd.DataFrame()
+
+# --- 4. 売買判断 ---
 def judge_condition(df):
     if df is None or len(df) < 2: return None
     last, prev = df.iloc[-1], df.iloc[-2]
     rsi, price = last['RSI'], last['Close']
     sma5, sma25, sma75 = last['SMA_5'], last['SMA_25'], last['SMA_75']
 
-    # 中期（1ヶ月）診断
     if rsi > 70:
         mid_s, mid_c, mid_a = "‼️ 利益確定検討", "#ffeb3b", f"RSI({rsi:.1f})が70超。中期的な買われすぎ局面です。"
     elif rsi < 30:
@@ -59,7 +98,6 @@ def judge_condition(df):
     else:
         mid_s, mid_c, mid_a = "ステイ・静観", "#e0e0e0", "明確なシグナル待ち。FPの視点では無理なエントリーを避ける時期です。"
 
-    # 短期（1週間）診断 (5日線基準)
     if price > sma5:
         short_s, short_c, short_a = "上昇継続（短期）", "#e3f2fd", f"価格が5日線({sma5:.2f})の上を維持。1週間スパンの勢いは強いです。"
     else:
@@ -67,44 +105,36 @@ def judge_condition(df):
 
     return {"short": {"status": short_s, "color": short_c, "advice": short_a}, "mid": {"status": mid_s, "color": mid_c, "advice": mid_a}, "price": price}
 
-# --- 4. AI予想レンジ ---
-def get_ai_range(api_key, context):
-    try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        prompt = f"現在のUSD/JPYは{context['price']:.2f}円です。今後1週間の予想最高値と最安値を[最高, 最低]の形式（数字のみ）で返してください。"
-        response = model.generate_content(prompt)
-        import re
-        nums = re.findall(r"\d+\.\d+|\d+", response.text)
-        return [float(nums[0]), float(nums[1])] if len(nums) >= 2 else None
-    except: return None
-
-# --- 5. AI詳細レポート（全プロンプト統合版） ---
-def get_ai_analysis(api_key, context):
+# --- 5. AI分析（指定プロンプト完全反映版） ---
+def get_active_model(api_key):
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel('gemini-1.5-flash')
-    
-    # 朝の特別ロジック
-    morning_logic = ""
-    if "08:00" <= context['current_time'] <= "10:30":
-        morning_logic = f"【重要：仲値分析モード】現在{context['current_time']}です。09:55の仲値に向けた実需（{'五十日' if context['is_gotobi'] else ''}）の動きと、その後の反落リスクを考慮せよ。"
+    try:
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods: return m.name
+    except: pass
+    return "models/gemini-1.5-flash"
 
-    prompt = f"""
+def get_ai_analysis(api_key, context_data):
+    try:
+        model = genai.GenerativeModel(get_active_model(api_key))
+        p, u, a, s, r = context_data.get('price', 0.0), context_data.get('us10y', 0.0), context_data.get('atr', 0.0), context_data.get('sma_diff', 0.0), context_data.get('rsi', 50.0)
+        
+        # ご提示いただいたプロンプトをそのまま適用
+        prompt = f"""
     あなたはFP1級を保持する、極めて優秀な為替戦略家です。
     特に今週は「衆議院選挙」を控えた極めて重要な1週間であることを強く認識してください。
-    {morning_logic}
     
     【市場データ】
-    - ドル円価格: {context['price']:.3f}円
-    - 日米金利差(10年債): {context['us10y']:.2f}%
-    - ボラティリティ(ATR): {context['atr']:.3f}
-    - SMA25乖離率: {context['sma_diff']:.2f}%
-    - RSI(14日): {context['rsi']:.1f}
+    - ドル円価格: {p:.3f}円
+    - 日米金利差(10年債): {u:.2f}%
+    - ボラティリティ(ATR): {a:.3f}
+    - SMA25乖離率: {s:.2f}%
+    - RSI(14日): {r:.1f}
 
     【分析依頼：以下の4項目に沿ってFPに分かりやすく回答してください】
     1. 【ファンダメンタルズ】日米金利差の現状を「金融資産運用の利回り」の観点から解説
     2. 【地政学・外部要因】インフレや景気後退、政治リスクがどう影響しているか（FPの景気サイクルに基づき解説）特に今週は「衆議院選挙」を控えた極めて重要な1週間であることを強く認識してください。
-    3. 【テクニカル】乖離率とRSI({context['rsi']:.1f})から見て、今は「割安」か「割高」か。
+    3. 【テクニカル】乖離率とRSI({r:.1f})から見て、今は「割安」か「割高」か。
     4. 【具体的戦略】NISAや外貨建資産のバランスを考える際のアドバイスのように、出口戦略（利確）を含めた今後1週間の戦略を提示
 
     【レポート構成：必ず以下の4項目に沿って記述してください】
@@ -114,22 +144,18 @@ def get_ai_analysis(api_key, context):
     4. 経済カレンダーを踏まえた、今週の警戒イベントへの助言
     
     回答は親しみやすくも、プロの厳格さを感じる日本語でお願いします。
-    """
-    response = model.generate_content(prompt)
-    return response.text
+        """
+        response = model.generate_content(prompt)
+        return f"✅ 成功\n\n{response.text}"
+    except Exception as e: return f"AI分析エラー: {str(e)}"
 
-# --- 6. 通貨強弱 ---
-def get_currency_strength():
-    pairs = {"EUR": "EURUSD=X", "GBP": "GBPUSD=X", "JPY": "JPY=X", "AUD": "AUDUSD=X"}
-    strength_data = pd.DataFrame()
-    for name, sym in pairs.items():
-        try:
-            d = yf.download(sym, period="1mo")['Close']
-            strength_data[name] = (1/d if name == "JPY" else d).pct_change().cumsum() * 100
-        except: continue
-    if not strength_data.empty:
-        strength_data["USD"] = strength_data.mean(axis=1) * -1
-        return strength_data.ffill().dropna()
-    return pd.DataFrame()
-
-
+def get_ai_range(api_key, context_data):
+    try:
+        model = genai.GenerativeModel(get_active_model(api_key))
+        p = context_data.get('price', 0.0)
+        prompt = f"現在のドル円は {p:.2f}円です。今後1週間の[最高値, 最安値]を数字のみで返してください。"
+        response = model.generate_content(prompt)
+        import re
+        nums = re.findall(r"\d+\.\d+|\d+", response.text)
+        return [float(nums[0]), float(nums[1])] if len(nums) >= 2 else None
+    except: return None
