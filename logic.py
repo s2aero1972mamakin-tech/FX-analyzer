@@ -21,7 +21,8 @@ def get_latest_quote(symbol="JPY=X"):
         price = fi.get("last_price") or fi.get("lastPrice")
         ts = fi.get("last_timestamp") or fi.get("lastTimestamp")
         if price is not None and ts:
-            qt = pd.to_datetime(ts, unit="s", utc=True)
+            # ★修正: ここがUTCのままだと表示側でズレるので、必ずJSTに揃えて返す
+            qt = pd.to_datetime(ts, unit="s", utc=True).tz_convert(TOKYO)
             return float(price), qt
     except Exception:
         pass
@@ -42,20 +43,17 @@ def get_latest_quote(symbol="JPY=X"):
                 qt = close.index[-1]
                 if getattr(qt, "tz", None) is None:
                     qt = qt.tz_localize("UTC")
+                qt = qt.tz_convert(TOKYO)
                 return price, qt
     except Exception:
         pass
 
-    # --- 3) 為替APIフォールバック（USD→JPY を取得）---
-    # ※無料で叩ける公開API。yfinanceが死んでも取れることが多い
-    #    open.er-api.com は "USD" 基準で JPY を返す
+    # --- 3) 為替APIフォールバック（USD→JPY） ---
     try:
         r = requests.get("https://open.er-api.com/v6/latest/USD", timeout=10)
         if r.status_code == 200:
-            j = r.json()
-            rate = j["rates"]["JPY"]  # 1 USD = ??? JPY
-            # 時刻はAPI側の更新時刻に寄せたいが、まずは「今」扱いでUTCを入れる
-            qt = pd.Timestamp.utcnow().tz_localize("UTC")
+            rate = r.json()["rates"]["JPY"]
+            qt = datetime.datetime.now(TOKYO)
             return float(rate), qt
     except Exception:
         pass
@@ -98,11 +96,6 @@ def get_market_data(period="1y"):
                 # 同じ日（JST）なら最終行のCloseを更新
                 usdjpy_df.iloc[-1, usdjpy_df.columns.get_loc("Close")] = float(current_price)
 
-            # デバッグ表示（必要な間だけON）
-            print("QUOTE_TIME_UTC:", quote_time)
-            print("QUOTE_TIME_JST:", quote_time.tz_convert(TOKYO))
-            print("QUOTE_DAY_JST :", quote_time.tz_convert(TOKYO).normalize())
-
         # tz 제거（以降の処理/描画が素直になる）
         if getattr(usdjpy_df.index, "tz", None) is not None:
             usdjpy_df.index = usdjpy_df.index.tz_localize(None)
@@ -117,47 +110,40 @@ def get_market_data(period="1y"):
 
 
 # --- 2. 指標計算 ---
-def calculate_indicators(df, us10y):
-    if df is None or us10y is None: return None
-    new_df = df[['Open', 'High', 'Low', 'Close']].copy()
-    
-    # 指標の計算（bak版のSMA25, 75を維持しつつSMA5を追加）
-    new_df['SMA_5'] = new_df['Close'].rolling(window=5).mean()
-    new_df['SMA_25'] = new_df['Close'].rolling(window=25).mean()
-    new_df['SMA_75'] = new_df['Close'].rolling(window=75).mean()
-    
-    delta = new_df['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    new_df['RSI'] = 100 - (100 / (1 + (gain / loss)))
-    
-    high_low = new_df['High'] - new_df['Low']
-    high_close = (new_df['High'] - new_df['Close'].shift()).abs()
-    low_close = (new_df['Low'] - new_df['Close'].shift()).abs()
-    new_df['ATR'] = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1).rolling(window=14).mean()
-    new_df['US10Y'] = us10y['Close'].ffill()
-    return new_df
+def calculate_indicators(usdjpy_df, us10y_df):
+    if usdjpy_df is None or usdjpy_df.empty:
+        return None
 
-# --- 3. 通貨強弱 ---
-def get_currency_strength():
-    pairs = {"EUR": "EURUSD=X", "GBP": "GBPUSD=X", "JPY": "JPY=X", "AUD": "AUDUSD=X"}
-    strength_data = pd.DataFrame()
-    for name, sym in pairs.items():
-        try:
-            ticker = yf.Ticker(sym)
-            d = ticker.history(period="1mo")['Close']
-            d.index = d.index.tz_localize(None)
-            if name == "JPY":
-                strength_data[name] = (1/d).pct_change().cumsum() * 100
-            else:
-                strength_data[name] = d.pct_change().cumsum() * 100
-        except: continue
-    if not strength_data.empty:
-        strength_data["USD"] = strength_data.mean(axis=1) * -1
-        return strength_data.ffill().dropna()
-    return pd.DataFrame()
+    df = usdjpy_df.copy()
 
-# --- 4. 売買判断（詳細版） ---
+    df["SMA_5"] = df["Close"].rolling(5).mean()
+    df["SMA_25"] = df["Close"].rolling(25).mean()
+    df["SMA_75"] = df["Close"].rolling(75).mean()
+
+    # ATR
+    high_low = df["High"] - df["Low"]
+    high_close = (df["High"] - df["Close"].shift()).abs()
+    low_close = (df["Low"] - df["Close"].shift()).abs()
+    ranges = pd.concat([high_low, high_close, low_close], axis=1)
+    true_range = ranges.max(axis=1)
+    df["ATR"] = true_range.rolling(14).mean()
+
+    # RSI
+    delta = df["Close"].diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    avg_gain = gain.rolling(14).mean()
+    avg_loss = loss.rolling(14).mean()
+    rs = avg_gain / avg_loss
+    df["RSI"] = 100 - (100 / (1 + rs))
+
+    # 10年債利回り（^TNX）
+    if us10y_df is not None and not us10y_df.empty:
+        df["US10Y"] = us10y_df["Close"].reindex(df.index).ffill()
+
+    return df
+
+
 def judge_condition(df):
     if df is None or len(df) < 2: return None
     last, prev = df.iloc[-1], df.iloc[-2]
@@ -196,7 +182,6 @@ def get_ai_analysis(api_key, context_data):
         model = genai.GenerativeModel(get_active_model(api_key))
         p, u, a, s, r = context_data.get('price', 0.0), context_data.get('us10y', 0.0), context_data.get('atr', 0.0), context_data.get('sma_diff', 0.0), context_data.get('rsi', 50.0)
         
-        # あなたの渾身のプロンプトを完全復元
         prompt = f"""
     あなたはFP1級を保持する、極めて優秀な為替戦略家です。
     特に今週は「衆議院選挙」を控えた極めて重要な1週間であることを強く認識してください。
@@ -258,16 +243,18 @@ def get_ai_portfolio(api_key, context_data):
         return response.text
     except: return "ポートフォリオ分析に失敗しました。"
 
-
-
-
-
-
-
-
-
-
-
-
-
-
+def get_currency_strength():
+    pairs = {"EUR": "EURUSD=X", "GBP": "GBPUSD=X", "JPY": "JPY=X", "AUD": "AUDUSD=X"}
+    strength_data = pd.DataFrame()
+    for name, sym in pairs.items():
+        try:
+            ticker = yf.Ticker(sym)
+            d = ticker.history(period="1mo")["Close"]
+            d.index = d.index.tz_localize(None)
+            if name == "JPY":
+                strength_data[name] = (1 / d).pct_change().cumsum() * 100
+            else:
+                strength_data[name] = d.pct_change().cumsum() * 100
+        except Exception:
+            pass
+    return strength_data
