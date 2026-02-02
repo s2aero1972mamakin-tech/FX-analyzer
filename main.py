@@ -5,6 +5,7 @@ import logic
 import pandas as pd
 from datetime import datetime, timedelta
 import pytz
+
 st.caption(f"BUILD_ID: {logic.BUILD_ID}")
 
 # --- ページ設定 ---
@@ -29,55 +30,44 @@ usdjpy_raw, us10y_raw = logic.get_market_data()
 df = logic.calculate_indicators(usdjpy_raw, us10y_raw)
 strength = logic.get_currency_strength()
 
+# デバッグ（原因が出るように）
+st.caption(f"LAST_FETCH_ERROR: {getattr(logic, 'LAST_FETCH_ERROR', '')}")
+st.caption(f"usdjpy_raw: {None if usdjpy_raw is None else usdjpy_raw.shape}")
+st.caption(f"us10y_raw : {None if us10y_raw is None else us10y_raw.shape}")
+
+q_price, q_time = logic.get_latest_quote("JPY=X")
+st.caption(
+    "QUOTE(最新取得): price={} / time(JST)={}".format(
+        q_price,
+        q_time.strftime("%Y-%m-%d %H:%M:%S %Z") if q_time else None
+    )
+)
+
 if df is not None and not df.empty:
     df.index = pd.to_datetime(df.index)
 
-    # ★ diag をここで必ず作る（if diag の直前）
-    diag = logic.judge_condition(df)
-
-    last_date = df.index[-1]
-    # 直近45日間を表示
-    start_view = last_date - timedelta(days=45)
-
-    # ズーム範囲内の高値・安値を計算してY軸を最適化
-    mask = (df.index >= start_view)
-    df_view = df.loc[mask]
-
-    # デバッグ表示（ここはHTMLの外）
-    st.caption(
-        "データ最終日: {} / Close: {:.3f}".format(
-            df.index[-1],
-            float(df["Close"].iloc[-1])
-        )
-    )
-
-    q_price, q_time = logic.get_latest_quote("JPY=X")
-    st.caption(
-        "QUOTE(最新取得): price={} / time(JST)={}".format(
-            q_price,
-            q_time.strftime("%Y-%m-%d %H:%M:%S %Z") if q_time else None
-        )
-    )
-
-    y_min_view = float(df_view["Low"].min())
-    y_max_view = float(df_view["High"].max())
-
-    # --- 1. 診断パネル（安全版：diag未定義を絶対に起こさない） ---
+    # diag生成
     try:
         diag = logic.judge_condition(df)
     except Exception as e:
         diag = None
         st.error(f"judge_conditionでエラー: {e}")
 
-    # ★修正: 最新レートを「診断エリア」に明示表示（ここが表示されないバグ対策）
+    last_date = df.index[-1]
+    start_view = last_date - timedelta(days=45)
+
+    df_view = df.loc[df.index >= start_view]
+    y_min_view = float(df_view["Low"].min())
+    y_max_view = float(df_view["High"].max())
+
+    # 最新レートを診断エリアに明示
     if q_price is not None:
         st.markdown(
             f"### 💱 最新USD/JPY: **{float(q_price):.3f} 円**  <span style='color:#888; font-size:0.9em'>(更新: {(q_time.strftime('%Y-%m-%d %H:%M JST') if q_time else '時刻不明')})</span>",
             unsafe_allow_html=True,
         )
-    else:
-        st.warning("⚠ 最新USD/JPYを取得できませんでした。")
 
+    # --- 1. 診断パネル ---
     if diag is not None:
         col_short, col_mid = st.columns(2)
 
@@ -100,31 +90,25 @@ if df is not None and not df.empty:
                 </div>
             """, unsafe_allow_html=True)
     else:
-        st.warning("診断データ（diag）が作れませんでした。dfが空か、計算に失敗しています。")
+        st.warning("診断データ（diag）が作れませんでした。")
 
     # --- 2. 経済アラート ---
     if diag is not None:
         if diag['short']['status'] == "勢い鈍化・調整" or df['ATR'].iloc[-1] > df['ATR'].mean() * 1.5:
             st.warning("⚠️ **【警戒】ボラティリティ上昇中または重要局面です**")
             st.info("経済カレンダーを確認し、雇用統計やFOMC等の重要指標前後はポジション管理を徹底してください。")
-    else:
-        st.info("診断データが未生成のため、経済アラートはスキップしました。")
 
-    # --- 3. メインチャート（SMA75・凡例分離版） ---
+    # --- 3. メインチャート ---
     fig_main = make_subplots(
         rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1,
         subplot_titles=("USD/JPY & AI予想", "米国債10年物利回り")
     )
 
-    # ロウソク足
-    # ★修正: legend="legend1" がPlotly環境で落ちてグラフが出ないケースがあるので削除
     fig_main.add_trace(go.Candlestick(
         x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'],
         name="価格"
     ), row=1, col=1)
 
-    # 移動平均線（5, 25, 75）
-    # ★修正: legend="legend1" を削除
     fig_main.add_trace(go.Scatter(x=df.index, y=df['SMA_5'], name="5日線", line=dict(color='#00ff00', width=1.5)), row=1, col=1)
     fig_main.add_trace(go.Scatter(x=df.index, y=df['SMA_25'], name="25日線", line=dict(color='orange', width=2)), row=1, col=1)
     fig_main.add_trace(go.Scatter(x=df.index, y=df['SMA_75'], name="75日線", line=dict(color='gray', width=1, dash='dot')), row=1, col=1)
@@ -136,7 +120,7 @@ if df is not None and not df.empty:
             name=f"購入単価:{entry_price:.2f}", line=dict(color="yellow", width=2, dash="dot")
         ), row=1, col=1)
 
-        current_price = df['Close'].iloc[-1]
+        current_price = float(df['Close'].iloc[-1])
         pips = (current_price - entry_price) if trade_type == "買い（ロング）" else (entry_price - current_price)
         profit_color = "#228B22" if pips >= 0 else "#B22222"
         st.sidebar.markdown(f"""
@@ -167,28 +151,18 @@ if df is not None and not df.empty:
             ), row=1, col=1)
 
     # 米10年債
-    # ★修正: legend="legend2" を削除
     fig_main.add_trace(go.Scatter(
         x=df.index, y=df['US10Y'], name="米10年債", line=dict(color='cyan')
     ), row=2, col=1)
 
-    # レイアウト設定
     fig_main.update_xaxes(range=[start_view, last_date], row=1, col=1)
     fig_main.update_xaxes(range=[start_view, last_date], showticklabels=True, row=2, col=1)
     fig_main.update_yaxes(range=[y_min_view * 0.998, y_max_view * 1.002], autorange=False, row=1, col=1)
-
-    # ★修正: legend2 を削除（ここが描画停止の原因になり得る）
-    fig_main.update_layout(
-        height=650,
-        template="plotly_dark",
-        xaxis_rangeslider_visible=False,
-        legend=dict(y=0.98, x=1.02),
-        showlegend=True
-    )
+    fig_main.update_layout(height=650, template="plotly_dark", xaxis_rangeslider_visible=False, legend=dict(y=0.98, x=1.02), showlegend=True)
     st.plotly_chart(fig_main, use_container_width=True)
 
     # --- 4. RSI ---
-    current_rsi = df['RSI'].iloc[-1]
+    current_rsi = float(df['RSI'].iloc[-1])
     st.subheader(f"📈 RSI（現在の過熱感: {current_rsi:.2f}）")
     fig_rsi = go.Figure()
     fig_rsi.add_trace(go.Scatter(x=df.index, y=df['RSI'], name=f"RSI(14): {current_rsi:.1f}", line=dict(color='#ff5722')))
@@ -214,17 +188,16 @@ if df is not None and not df.empty:
             with st.spinner('分析中...'):
                 last_row = df.iloc[-1]
                 context = {
-                    "price": last_row['Close'], "us10y": last_row['US10Y'], "atr": last_row['ATR'],
-                    "sma_diff": (last_row['Close'] - last_row['SMA_25']) / last_row['SMA_25'] * 100,
-                    "rsi": last_row['RSI'], "current_time": current_time_str, "is_gotobi": is_gotobi
+                    "price": last_row['Close'],
+                    "us10y": last_row['US10Y'] if pd.notna(last_row['US10Y']) else 0.0,
+                    "atr": last_row['ATR'],
+                    "sma_diff": last_row['SMA_DIFF'],
+                    "rsi": last_row['RSI'],
+                    "current_time": current_time_str,
+                    "is_gotobi": is_gotobi
                 }
                 st.markdown(logic.get_ai_analysis(api_key, context))
+        else:
+            st.warning("Gemini API Key を入力してください。")
 else:
     st.error("データが取得できませんでした（dfが空）")
-    st.caption(f"usdjpy_raw: {None if usdjpy_raw is None else usdjpy_raw.shape}")
-    st.caption(f"us10y_raw : {None if us10y_raw is None else us10y_raw.shape}")
-    q_price, q_time = logic.get_latest_quote("JPY=X")
-    st.caption(f"latest_quote: price={q_price} time={q_time}")
-
-
-
