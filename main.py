@@ -221,3 +221,9 @@ if df is not None and not df.empty:
                 st.markdown(logic.get_ai_analysis(api_key, context))
 else:
     st.error("データが取得できませんでした（dfが空）")
+    st.caption(f"usdjpy_raw: {None if usdjpy_raw is None else usdjpy_raw.shape}")
+    st.caption(f"us10y_raw : {None if us10y_raw is None else us10y_raw.shape}")
+    q_price, q_time = logic.get_latest_quote("JPY=X")
+    st.caption(f"latest_quote: price={q_price} time={q_time}")
+
+
