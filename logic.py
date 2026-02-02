@@ -3,6 +3,7 @@ import pandas as pd
 import google.generativeai as genai
 import datetime
 import pytz
+import requests
 TOKYO = pytz.timezone("Asia/Tokyo")
 
 def get_latest_quote(symbol="JPY=X"):
@@ -71,36 +72,36 @@ def get_market_data(period="1y"):
         if usdjpy_df.empty or us10y_df.empty:
             return None, None
 
-# 最新クオート（価格 + 時刻）
-current_price, quote_time = get_latest_quote("JPY=X")
+        # 最新クオート（価格 + 時刻）
+        current_price, quote_time = get_latest_quote("JPY=X")
 
-if current_price is not None and quote_time is not None:
-    # ① クオート時刻をJSTに寄せて日付を切る（重要）
-    qt_tokyo = quote_time.tz_convert(TOKYO)
-    quote_day = qt_tokyo.normalize()
+        if current_price is not None and quote_time is not None:
+            # ① クオート時刻をJSTに寄せて日付を切る（重要）
+            qt_tokyo = quote_time.tz_convert(TOKYO)
+            quote_day = qt_tokyo.normalize()
 
-    # ② 履歴の最終日もJSTに寄せて日付を切る（重要）
-    last_idx = usdjpy_df.index[-1]
-    if getattr(last_idx, "tz", None) is not None:
-        last_day = last_idx.tz_convert(TOKYO).normalize()
-    else:
-        # tzなしならJSTとして扱う（念のため）
-        last_day = pd.Timestamp(last_idx).tz_localize(TOKYO).normalize()
+            # ② 履歴の最終日もJSTに寄せて日付を切る（重要）
+            last_idx = usdjpy_df.index[-1]
+            if getattr(last_idx, "tz", None) is not None:
+                last_day = last_idx.tz_convert(TOKYO).normalize()
+            else:
+                last_day = pd.Timestamp(last_idx).tz_localize(TOKYO).normalize()
 
-    if last_day < quote_day:
-        # 新しい日（JST）なら、その日付で行を追加
-        new_row = usdjpy_df.iloc[-1:].copy()
-        new_row.index = [quote_day]
-        new_row["Open"] = new_row["High"] = new_row["Low"] = new_row["Close"] = float(current_price)
-        usdjpy_df = pd.concat([usdjpy_df, new_row])
-    else:
-        # 同じ日（JST）なら最終行のCloseを更新
-        usdjpy_df.iloc[-1, usdjpy_df.columns.get_loc("Close")] = float(current_price)
+            if last_day < quote_day:
+                # 新しい日（JST）なら、その日付で行を追加
+                new_row = usdjpy_df.iloc[-1:].copy()
+                new_row.index = [quote_day]
+                new_row["Open"] = new_row["High"] = new_row["Low"] = new_row["Close"] = float(current_price)
+                usdjpy_df = pd.concat([usdjpy_df, new_row])
+            else:
+                # 同じ日（JST）なら最終行のCloseを更新
+                usdjpy_df.iloc[-1, usdjpy_df.columns.get_loc("Close")] = float(current_price)
 
-print("QUOTE_TIME_UTC:", quote_time)
-print("QUOTE_TIME_JST:", quote_time.tz_convert(TOKYO))
-print("QUOTE_DAY_JST :", quote_time.tz_convert(TOKYO).normalize())
-        
+            # デバッグ表示（必要な間だけON）
+            print("QUOTE_TIME_UTC:", quote_time)
+            print("QUOTE_TIME_JST:", quote_time.tz_convert(TOKYO))
+            print("QUOTE_DAY_JST :", quote_time.tz_convert(TOKYO).normalize())
+
         # tz 제거（以降の処理/描画が素直になる）
         if getattr(usdjpy_df.index, "tz", None) is not None:
             usdjpy_df.index = usdjpy_df.index.tz_localize(None)
@@ -108,8 +109,11 @@ print("QUOTE_DAY_JST :", quote_time.tz_convert(TOKYO).normalize())
             us10y_df.index = us10y_df.index.tz_localize(None)
 
         return usdjpy_df, us10y_df
-    except Exception:
+
+    except Exception as e:
+        print("get_market_data ERROR:", e)
         return None, None
+
 
 # --- 2. 指標計算 ---
 def calculate_indicators(df, us10y):
@@ -252,6 +256,7 @@ def get_ai_portfolio(api_key, context_data):
         response = model.generate_content(prompt)
         return response.text
     except: return "ポートフォリオ分析に失敗しました。"
+
 
 
 
