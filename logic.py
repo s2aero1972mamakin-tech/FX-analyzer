@@ -97,6 +97,10 @@ if current_price is not None and quote_time is not None:
         # 同じ日（JST）なら最終行のCloseを更新
         usdjpy_df.iloc[-1, usdjpy_df.columns.get_loc("Close")] = float(current_price)
 
+print("QUOTE_TIME_UTC:", quote_time)
+print("QUOTE_TIME_JST:", quote_time.tz_convert(TOKYO))
+print("QUOTE_DAY_JST :", quote_time.tz_convert(TOKYO).normalize())
+        
         # tz 제거（以降の処理/描画が素直になる）
         if getattr(usdjpy_df.index, "tz", None) is not None:
             usdjpy_df.index = usdjpy_df.index.tz_localize(None)
@@ -248,6 +252,7 @@ def get_ai_portfolio(api_key, context_data):
         response = model.generate_content(prompt)
         return response.text
     except: return "ポートフォリオ分析に失敗しました。"
+
 
 
 
