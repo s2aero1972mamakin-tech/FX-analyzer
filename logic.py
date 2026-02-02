@@ -4,17 +4,17 @@ import google.generativeai as genai
 import datetime
 
 def get_latest_quote(symbol="JPY=X"):
-    """
-    最新価格と、その価格が観測されたタイムスタンプを返す。
-    fast_infoが取れない環境でも intraday でフォールバックする。
+    """Return (latest_price, quote_time_utc).
+
+    - Try fast_info first (cheap).
+    - Fallback to intraday download (robust on Streamlit/GitHub).
     """
     price = None
     qt = None
 
-    t = yf.Ticker(symbol)
-
-    # 1) fast_info 優先
+    # 1) fast_info
     try:
+        t = yf.Ticker(symbol)
         fi = t.fast_info or {}
         price = fi.get("last_price") or fi.get("lastPrice")
         ts = fi.get("last_timestamp") or fi.get("lastTimestamp")
@@ -23,7 +23,7 @@ def get_latest_quote(symbol="JPY=X"):
     except Exception:
         pass
 
-    # 2) intraday フォールバック（Streamlit/GitHubで強い）
+    # 2) intraday fallback
     if price is None or qt is None:
         try:
             intraday = yf.download(
@@ -46,54 +46,45 @@ def get_latest_quote(symbol="JPY=X"):
     return price, qt
 
 
-# --- 1. 市場データ取得（判定を排除し、常に「今」の値をねじ込む） ---
+# --- 1. 市場データ取得（週末でも「今日行」を捏造しない版） ---
 def get_market_data(period="1y"):
     try:
         ticker = yf.Ticker("JPY=X")
-
-        # 履歴（daily）
-        usdjpy_df = ticker.history(period=period)
+        usdjpy_df = ticker.history(period=period)  # daily
         us10y_df = yf.Ticker("^TNX").history(period=period)
 
         if usdjpy_df.empty or us10y_df.empty:
             return None, None
 
-        # 最新クオート（価格+時刻）
         current_price, quote_time = get_latest_quote("JPY=X")
 
+        # 重要: 「今日」ではなく「クオートが観測された日」で更新する
         if current_price is not None and quote_time is not None:
-            # history側のtzに寄せる（なければUTC基準）
-            hist_tz = usdjpy_df.index.tz
-            qt = quote_time.tz_convert(hist_tz) if hist_tz is not None else quote_time.tz_convert("UTC")
+            hist_tz = usdjpy_df.index.tz or "UTC"
+            qt = quote_time.tz_convert(hist_tz)
 
-            # “クオートが観測された日” を基準にする
             quote_day = qt.normalize()
-
-            # historyの最終日も同じ粒度に
-            last_idx = usdjpy_df.index[-1]
-            last_day = last_idx.normalize() if getattr(last_idx, "tz", None) is not None else pd.Timestamp(last_idx).normalize()
+            last_day = usdjpy_df.index[-1].tz_convert(hist_tz).normalize()
 
             if last_day < quote_day:
-                # 新しい日なら、その日付で行を追加
+                # 新しい日（例: 月曜）なら、その日付で行を追加
                 new_row = usdjpy_df.iloc[-1:].copy()
                 new_row.index = [quote_day]
                 new_row["Open"] = new_row["High"] = new_row["Low"] = new_row["Close"] = current_price
                 usdjpy_df = pd.concat([usdjpy_df, new_row])
             else:
-                # 同じ日なら最終行を更新
+                # 同じ日なら最終行のCloseだけ更新
                 usdjpy_df.iloc[-1, usdjpy_df.columns.get_loc("Close")] = current_price
 
-        # tz 제거
+        # tz 제거（以降の処理/描画が素直になる）
         if getattr(usdjpy_df.index, "tz", None) is not None:
             usdjpy_df.index = usdjpy_df.index.tz_localize(None)
         if getattr(us10y_df.index, "tz", None) is not None:
             us10y_df.index = us10y_df.index.tz_localize(None)
 
         return usdjpy_df, us10y_df
-
     except Exception:
         return None, None
-
 
 # --- 2. 指標計算 ---
 def calculate_indicators(df, us10y):
@@ -236,9 +227,6 @@ def get_ai_portfolio(api_key, context_data):
         response = model.generate_content(prompt)
         return response.text
     except: return "ポートフォリオ分析に失敗しました。"
-
-
-
 
 
 
