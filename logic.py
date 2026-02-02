@@ -121,6 +121,7 @@ def get_latest_quote(symbol="JPY=X"):
     df = _yahoo_chart(symbol, rng="1d", interval="1m")
     if df is not None and not df.empty:
         price = float(df["Close"].iloc[-1])
+        # df.index は tz無しなので JST として付与
         qt = pd.Timestamp(df.index[-1]).tz_localize(TOKYO)
         return price, _to_jst(qt)
 
@@ -166,19 +167,19 @@ def get_market_data(period="1y"):
         us10y_df = None
 
     # 2) yfinance download fallback
-    if usdjpy_df is None or usdjpy_df.empty:
+    if usdjpy_df is None or getattr(usdjpy_df, "empty", True):
         try:
             usdjpy_df = yf.download("JPY=X", period=period, interval="1d", progress=False, threads=False)
         except Exception:
             usdjpy_df = None
 
-    if us10y_df is None or us10y_df.empty:
+    if us10y_df is None or getattr(us10y_df, "empty", True):
         try:
             us10y_df = yf.download("^TNX", period=period, interval="1d", progress=False, threads=False)
         except Exception:
             us10y_df = None
 
-    # 3) Yahoo chart API fallback（ここが今回の本命）
+    # 3) Yahoo chart API fallback（ここが本命）
     if usdjpy_df is None or getattr(usdjpy_df, "empty", True):
         usdjpy_df = _yahoo_chart("JPY=X", rng=period, interval="1d")
 
@@ -203,7 +204,7 @@ def get_market_data(period="1y"):
 
 
 # =====================================================
-# 指標計算（US10Yが無くても動く）
+# 指標計算（US10Yが無くても動く）★完全修復版
 # =====================================================
 def calculate_indicators(df, us10y):
     """
@@ -211,14 +212,15 @@ def calculate_indicators(df, us10y):
     - yfinance/download が MultiIndex columns を返す場合に備えて平坦化
     - Close が DataFrame になっても Series に正規化
     - US10Y が無くても動作
+    - try未完(SyntaxError)を完全修復
+    - return new_df を必ず返す
     """
     if df is None or getattr(df, "empty", True):
         return None
 
-    # --- 0) MultiIndex columns を平坦化（これが今回の本命修正） ---
+    # --- 0) MultiIndex columns を平坦化 ---
     try:
         if isinstance(df.columns, pd.MultiIndex):
-            # 通常は level0 が OHLC 名（Open/High/Low/Close）
             df = df.copy()
             df.columns = [c[0] for c in df.columns]
     except Exception:
@@ -233,24 +235,21 @@ def calculate_indicators(df, us10y):
     new_df = df[need_cols].copy()
 
     # CloseがDataFrameになってしまうケースの最終保険
-    if isinstance(new_df["Close"], pd.DataFrame):
-        new_df["Close"] = new_df["Close"].iloc[:, 0]
-    if isinstance(new_df["Open"], pd.DataFrame):
-        new_df["Open"] = new_df["Open"].iloc[:, 0]
-    if isinstance(new_df["High"], pd.DataFrame):
-        new_df["High"] = new_df["High"].iloc[:, 0]
-    if isinstance(new_df["Low"], pd.DataFrame):
-        new_df["Low"] = new_df["Low"].iloc[:, 0]
+    # （MultiIndexで取り切れないケース吸収）
+    for c in ["Open", "High", "Low", "Close"]:
+        if isinstance(new_df[c], pd.DataFrame):
+            new_df[c] = new_df[c].iloc[:, 0]
 
     # 数値化（文字列混入対策）
     for c in ["Open", "High", "Low", "Close"]:
         new_df[c] = pd.to_numeric(new_df[c], errors="coerce")
+
     new_df = new_df.dropna(subset=["Close"])
     if new_df.empty:
         return None
 
     # SMA
-    new_df["SMA_5"]  = new_df["Close"].rolling(window=5).mean()
+    new_df["SMA_5"] = new_df["Close"].rolling(window=5).mean()
     new_df["SMA_25"] = new_df["Close"].rolling(window=25).mean()
     new_df["SMA_75"] = new_df["Close"].rolling(window=75).mean()
 
@@ -264,25 +263,37 @@ def calculate_indicators(df, us10y):
     high_low = new_df["High"] - new_df["Low"]
     high_close = (new_df["High"] - new_df["Close"].shift()).abs()
     low_close = (new_df["Low"] - new_df["Close"].shift()).abs()
-    new_df["ATR"] = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1).rolling(window=14).mean()
+    new_df["ATR"] = (
+        pd.concat([high_low, high_close, low_close], axis=1)
+        .max(axis=1)
+        .rolling(window=14)
+        .mean()
+    )
 
-    # ★ここでの ValueError を潰す（Close/SMA_25 が Series 化されている前提）
+    # SMA乖離率
     new_df["SMA_DIFF"] = (new_df["Close"] - new_df["SMA_25"]) / new_df["SMA_25"] * 100
 
-    # US10Y（無ければ NaN）
+    # US10Y（無ければ NaN）★ここが壊れていたので完全修復
     if us10y is not None and (not getattr(us10y, "empty", True)):
         try:
             if isinstance(us10y.columns, pd.MultiIndex):
                 us10y = us10y.copy()
                 us10y.columns = [c[0] for c in us10y.columns]
+
             if "Close" in us10y.columns:
                 s = us10y["Close"]
                 if isinstance(s, pd.DataFrame):
                     s = s.iloc[:, 0]
-                new_df["US10Y"] = pd.to_numeric(s, errors="coerce").reindex(new_df.index).ffill()
+                s = pd.to_numeric(s, errors="coerce")
+                new_df["US10Y"] = s.reindex(new_df.index).ffill()
             else:
                 new_df["US10Y"] = float("nan")
+        except Exception:
+            new_df["US10Y"] = float("nan")
+    else:
+        new_df["US10Y"] = float("nan")
 
+    return new_df
 
 
 # =====================================================
@@ -359,9 +370,9 @@ def get_active_model(api_key):
     genai.configure(api_key=api_key)
     try:
         for m in genai.list_models():
-            if 'generateContent' in m.supported_generation_methods:
+            if "generateContent" in m.supported_generation_methods:
                 return m.name
-    except:
+    except Exception:
         pass
     return "models/gemini-1.5-flash"
 
@@ -369,8 +380,15 @@ def get_active_model(api_key):
 def get_ai_analysis(api_key, context_data):
     try:
         model = genai.GenerativeModel(get_active_model(api_key))
-        p, u, a, s, r = context_data.get('price', 0.0), context_data.get('us10y', 0.0), context_data.get('atr', 0.0), context_data.get('sma_diff', 0.0), context_data.get('rsi', 50.0)
+        p, u, a, s, r = (
+            context_data.get("price", 0.0),
+            context_data.get("us10y", 0.0),
+            context_data.get("atr", 0.0),
+            context_data.get("sma_diff", 0.0),
+            context_data.get("rsi", 50.0),
+        )
 
+        # あなたの渾身のプロンプトを完全復元（省略なし）
         prompt = f"""
     あなたはFP1級を保持する、極めて優秀な為替戦略家です。
     特に今週は「衆議院選挙」を控えた極めて重要な1週間であることを強く認識してください。
@@ -402,10 +420,11 @@ def get_ai_analysis(api_key, context_data):
         return f"AI分析エラー: {str(e)}"
 
 
+# --- bak版から復元した予想レンジ機能 ---
 def get_ai_range(api_key, context_data):
     try:
         model = genai.GenerativeModel(get_active_model(api_key))
-        p = context_data.get('price', 0.0)
+        p = context_data.get("price", 0.0)
         prompt = f"""
         現在のドル円は {p:.2f}円です。
         直近のテクニカルとファンダメンタルズから、今後1週間の「予想最高値」と「予想最安値」を予測してください。
@@ -416,14 +435,19 @@ def get_ai_range(api_key, context_data):
         import re
         nums = re.findall(r"\d+\.\d+|\d+", response.text)
         return [float(nums[0]), float(nums[1])] if len(nums) >= 2 else None
-    except:
+    except Exception:
         return None
 
 
+# --- bak版から復元したポートフォリオ機能 ---
 def get_ai_portfolio(api_key, context_data):
     try:
         model = genai.GenerativeModel(get_active_model(api_key))
-        p, u, s = context_data.get('price', 0.0), context_data.get('us10y', 0.0), context_data.get('sma_diff', 0.0)
+        p, u, s = (
+            context_data.get("price", 0.0),
+            context_data.get("us10y", 0.0),
+            context_data.get("sma_diff", 0.0),
+        )
         prompt = f"""
         あなたはFP1級技能士です。以下のデータに基づき、日本円、米ドル、ユーロ、豪ドル、英ポンドの最適な資産配分（合計100%）を提案してください。
         価格:{p:.2f}円, 金利差:{u:.2f}%, 乖離率:{s:.2f}%
@@ -432,6 +456,5 @@ def get_ai_portfolio(api_key, context_data):
         """
         response = model.generate_content(prompt)
         return response.text
-    except:
+    except Exception:
         return "ポートフォリオ分析に失敗しました。"
-
