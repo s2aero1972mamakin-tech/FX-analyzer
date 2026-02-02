@@ -41,7 +41,6 @@ if df is not None and not df.empty:
     y_min_view = float(df_view['Low'].min())
     y_max_view = float(df_view['High'].max())
 
-　　st.caption(f"データ最終日: {df.index[-1]} / Close: {df['Close'].iloc[-1]:.3f}")
     
     # --- 1. 診断パネル（HTML/CSSを完全復元） ---
     diag = logic.judge_condition(df)
@@ -162,5 +161,6 @@ if df is not None and not df.empty:
                     "rsi": last_row['RSI'], "current_time": current_time_str, "is_gotobi": is_gotobi
                 }
                 st.markdown(logic.get_ai_analysis(api_key, context))
+
 
 
