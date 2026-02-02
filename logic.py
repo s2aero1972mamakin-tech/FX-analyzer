@@ -3,33 +3,21 @@ import pandas as pd
 import google.generativeai as genai
 import datetime
 
-# --- 1. 市場データ取得（最新レート強制反映・GitHubキャッシュ対策版） ---
+# --- 1. 市場データ取得（判定を排除し、常に「今」の値をねじ込む） ---
 def get_market_data(period="1y"):
     try:
         ticker = yf.Ticker("JPY=X")
-        # 履歴を取得
         usdjpy_df = ticker.history(period=period)
         us10y_df = yf.Ticker("^TNX").history(period=period)
 
         if usdjpy_df.empty or us10y_df.empty: return None, None
         
-        # --- 診断パネルを「今」の価格にするための強制更新ロジック ---
         try:
-            # 確定データではなく、今配信されている「生の値」を直接取得
+            # 「日付が古いかどうか」の判定を完全に撤廃
             current_price = ticker.fast_info['last_price']
             if current_price:
-                today_date = pd.Timestamp.now(tz=usdjpy_df.index.tz).normalize()
-                last_date = usdjpy_df.index[-1].normalize()
-
-                if last_date < today_date:
-                    # 履歴が先週末で止まっていれば、今日の行を「今」の価格で新設
-                    new_row = usdjpy_df.iloc[-1:].copy()
-                    new_row.index = [today_date]
-                    new_row['Open'] = new_row['High'] = new_row['Low'] = new_row['Close'] = current_price
-                    usdjpy_df = pd.concat([usdjpy_df, new_row])
-                else:
-                    # すでに今日の日付があれば、終値を最新値で更新
-                    usdjpy_df.iloc[-1, usdjpy_df.columns.get_loc('Close')] = current_price
+                # 取得したデータの「最後の行」を、無条件で今のレート(155.xx円)に書き換える
+                usdjpy_df.iloc[-1, usdjpy_df.columns.get_loc('Close')] = current_price
         except:
             pass 
 
@@ -179,3 +167,4 @@ def get_ai_portfolio(api_key, context_data):
         response = model.generate_content(prompt)
         return response.text
     except: return "ポートフォリオ分析に失敗しました。"
+
