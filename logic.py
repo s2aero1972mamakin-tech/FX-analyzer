@@ -2,36 +2,100 @@ import yfinance as yf
 import pandas as pd
 import google.generativeai as genai
 import datetime
+import pandas as pd
+import yfinance as yf
+
+def get_latest_quote(symbol="JPY=X"):
+    """
+    最新価格と、その価格が観測されたタイムスタンプを返す。
+    fast_infoが取れない環境でも intraday でフォールバックする。
+    """
+    price = None
+    qt = None
+
+    t = yf.Ticker(symbol)
+
+    # 1) fast_info 優先
+    try:
+        fi = t.fast_info or {}
+        price = fi.get("last_price") or fi.get("lastPrice")
+        ts = fi.get("last_timestamp") or fi.get("lastTimestamp")
+        if ts:
+            qt = pd.to_datetime(ts, unit="s", utc=True)
+    except Exception:
+        pass
+
+    # 2) intraday フォールバック（Streamlit/GitHubで強い）
+    if price is None or qt is None:
+        try:
+            intraday = yf.download(
+                symbol,
+                period="5d",
+                interval="5m",
+                progress=False,
+                threads=False,
+            )
+            if not intraday.empty:
+                close = intraday["Close"].dropna()
+                if len(close) > 0:
+                    price = float(close.iloc[-1])
+                    qt = close.index[-1]
+                    if getattr(qt, "tz", None) is None:
+                        qt = qt.tz_localize("UTC")
+        except Exception:
+            pass
+
+    return price, qt
+
 
 # --- 1. 市場データ取得（判定を排除し、常に「今」の値をねじ込む） ---
 def get_market_data(period="1y"):
     try:
         ticker = yf.Ticker("JPY=X")
+
+        # 履歴（daily）
         usdjpy_df = ticker.history(period=period)
         us10y_df = yf.Ticker("^TNX").history(period=period)
 
-        if usdjpy_df.empty or us10y_df.empty: return None, None
-        
-        try:
-            # 常に今の本当の価格（155円でも、150円でも、149円でも）を拾う
-            current_price = ticker.fast_info['last_price']
-            if current_price:
-                # 154.780 という古い数字を、最新の時価で強制的に塗りつぶす
-                usdjpy_df.iloc[-1, usdjpy_df.columns.get_loc('Close')] = current_price
-                
-                # グラフの右端を今日の日付として正しく認識させる処理
-                today_date = pd.Timestamp.now(tz=usdjpy_df.index.tz).normalize()
-                if usdjpy_df.index[-1].normalize() < today_date:
-                    new_row = usdjpy_df.iloc[-1:].copy()
-                    new_row.index = [today_date]
-                    usdjpy_df = pd.concat([usdjpy_df, new_row])
-        except:
-            pass 
+        if usdjpy_df.empty or us10y_df.empty:
+            return None, None
 
-        usdjpy_df.index = usdjpy_df.index.tz_localize(None)
-        us10y_df.index = us10y_df.index.tz_localize(None)
+        # 最新クオート（価格+時刻）
+        current_price, quote_time = get_latest_quote("JPY=X")
+
+        if current_price is not None and quote_time is not None:
+            # history側のtzに寄せる（なければUTC基準）
+            hist_tz = usdjpy_df.index.tz
+            qt = quote_time.tz_convert(hist_tz) if hist_tz is not None else quote_time.tz_convert("UTC")
+
+            # “クオートが観測された日” を基準にする
+            quote_day = qt.normalize()
+
+            # historyの最終日も同じ粒度に
+            last_idx = usdjpy_df.index[-1]
+            last_day = last_idx.normalize() if getattr(last_idx, "tz", None) is not None else pd.Timestamp(last_idx).normalize()
+
+            if last_day < quote_day:
+                # 新しい日なら、その日付で行を追加
+                new_row = usdjpy_df.iloc[-1:].copy()
+                new_row.index = [quote_day]
+                new_row["Open"] = new_row["High"] = new_row["Low"] = new_row["Close"] = current_price
+                usdjpy_df = pd.concat([usdjpy_df, new_row])
+            else:
+                # 同じ日なら最終行を更新
+                usdjpy_df.iloc[-1, usdjpy_df.columns.get_loc("Close")] = current_price
+
+        # tz 제거
+        if getattr(usdjpy_df.index, "tz", None) is not None:
+            usdjpy_df.index = usdjpy_df.index.tz_localize(None)
+        if getattr(us10y_df.index, "tz", None) is not None:
+            us10y_df.index = us10y_df.index.tz_localize(None)
+
         return usdjpy_df, us10y_df
-    except: return None, None
+
+    except Exception:
+        return None, None
+
 
 # --- 2. 指標計算 ---
 def calculate_indicators(df, us10y):
@@ -174,6 +238,7 @@ def get_ai_portfolio(api_key, context_data):
         response = model.generate_content(prompt)
         return response.text
     except: return "ポートフォリオ分析に失敗しました。"
+
 
 
 
