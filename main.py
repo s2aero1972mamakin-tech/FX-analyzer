@@ -33,6 +33,12 @@ strength = logic.get_currency_strength()
 
 if df is not None and not df.empty:
     df.index = pd.to_datetime(df.index)
+    st.caption(
+        "データ最終日: {} / Close: {:.3f}".format(
+            df.index[-1],
+            float(df["Close"].iloc[-1])
+        )
+    )
     last_date = df.index[-1]
     # 直近45日間を表示
     start_view = last_date - timedelta(days=45)
@@ -44,16 +50,7 @@ if df is not None and not df.empty:
     y_max_view = float(df_view['High'].max())
 
     
-    # --- 1. 診断パネル（HTML/CSSを完全復元） ---
-diag = logic.judge_condition(df)
-
-# ★ ここに入れる（HTMLの外・ifの前）
-st.caption(
-    "データ最終日: {} / Close: {:.3f}".format(
-        df.index[-1],
-        float(df["Close"].iloc[-1])
-    )
-)
+    # --- 1. 診断パネル（HTML/CSSを完全復元） --
 
 if diag:
     col_short, col_mid = st.columns(2)
@@ -175,6 +172,7 @@ if diag:
                     "rsi": last_row['RSI'], "current_time": current_time_str, "is_gotobi": is_gotobi
                 }
                 st.markdown(logic.get_ai_analysis(api_key, context))
+
 
 
 
