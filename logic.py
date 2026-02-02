@@ -4,17 +4,16 @@ import google.generativeai as genai
 import datetime
 
 def get_latest_quote(symbol="JPY=X"):
-    """Return (latest_price, quote_time_utc).
-
-    - Try fast_info first (cheap).
-    - Fallback to intraday download (robust on Streamlit/GitHub).
+    """
+    最新価格と、その価格が観測された時刻を返す（fast_infoがダメならintradayで拾う）
     """
     price = None
     qt = None
 
-    # 1) fast_info
+    t = yf.Ticker(symbol)
+
+    # 1) fast_info 優先
     try:
-        t = yf.Ticker(symbol)
         fi = t.fast_info or {}
         price = fi.get("last_price") or fi.get("lastPrice")
         ts = fi.get("last_timestamp") or fi.get("lastTimestamp")
@@ -23,7 +22,7 @@ def get_latest_quote(symbol="JPY=X"):
     except Exception:
         pass
 
-    # 2) intraday fallback
+    # 2) intraday フォールバック（Streamlit/GitHubで強い）
     if price is None or qt is None:
         try:
             intraday = yf.download(
@@ -44,6 +43,7 @@ def get_latest_quote(symbol="JPY=X"):
             pass
 
     return price, qt
+
 
 
 # --- 1. 市場データ取得（週末でも「今日行」を捏造しない版） ---
@@ -227,6 +227,7 @@ def get_ai_portfolio(api_key, context_data):
         response = model.generate_content(prompt)
         return response.text
     except: return "ポートフォリオ分析に失敗しました。"
+
 
 
 
