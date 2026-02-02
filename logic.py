@@ -13,15 +13,18 @@ def get_market_data(period="1y"):
         if usdjpy_df.empty or us10y_df.empty: return None, None
         
         try:
-            # 「今日かどうか」を判定するのをやめます。
-            # 常に「今現在、動いている生の値」を取得するように命令します。
+            # 常に今の本当の価格（155円でも、150円でも、149円でも）を拾う
             current_price = ticker.fast_info['last_price']
-            
             if current_price:
-                # 154.780 という古い数字が入っている場所を、
-                # 強制的に「今現在の本当の価格」で塗りつぶします。
-                # これにより、市場が149円なら、パネルも149円になります。
+                # 154.780 という古い数字を、最新の時価で強制的に塗りつぶす
                 usdjpy_df.iloc[-1, usdjpy_df.columns.get_loc('Close')] = current_price
+                
+                # グラフの右端を今日の日付として正しく認識させる処理
+                today_date = pd.Timestamp.now(tz=usdjpy_df.index.tz).normalize()
+                if usdjpy_df.index[-1].normalize() < today_date:
+                    new_row = usdjpy_df.iloc[-1:].copy()
+                    new_row.index = [today_date]
+                    usdjpy_df = pd.concat([usdjpy_df, new_row])
         except:
             pass 
 
@@ -171,6 +174,7 @@ def get_ai_portfolio(api_key, context_data):
         response = model.generate_content(prompt)
         return response.text
     except: return "ポートフォリオ分析に失敗しました。"
+
 
 
 
