@@ -100,13 +100,12 @@ else:
 
 
     # --- 2. 経済アラート ---
-    # --- 2. 経済アラート ---
-if diag is not None:
-    if diag['short']['status'] == "勢い鈍化・調整" or df['ATR'].iloc[-1] > df['ATR'].mean() * 1.5:
-        st.warning("⚠️ **【警戒】ボラティリティ上昇中または重要局面です**")
-        st.info("経済カレンダーを確認し、雇用統計やFOMC等の重要指標前後はポジション管理を徹底してください。")
-else:
-    st.info("診断データが未生成のため、経済アラートはスキップしました。")
+    if diag is not None:
+        if diag['short']['status'] == "勢い鈍化・調整" or df['ATR'].iloc[-1] > df['ATR'].mean() * 1.5:
+            st.warning("⚠️ **【警戒】ボラティリティ上昇中または重要局面です**")
+            st.info("経済カレンダーを確認し、雇用統計やFOMC等の重要指標前後はポジション管理を徹底してください。")
+    else:
+        st.info("診断データが未生成のため、経済アラートはスキップしました。")
 
 
     # --- 3. メインチャート（SMA75・凡例分離版） ---
@@ -199,6 +198,7 @@ else:
                     "rsi": last_row['RSI'], "current_time": current_time_str, "is_gotobi": is_gotobi
                 }
                 st.markdown(logic.get_ai_analysis(api_key, context))
+
 
 
 
