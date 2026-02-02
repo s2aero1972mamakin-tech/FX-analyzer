@@ -3,31 +3,32 @@ import pandas as pd
 import google.generativeai as genai
 import datetime
 
-# --- 1. 市場データ取得（最新レート反映・GitHubキャッシュ対策版） ---
+# --- 1. 市場データ取得（最新レート強制反映・GitHubキャッシュ対策版） ---
 def get_market_data(period="1y"):
     try:
         ticker = yf.Ticker("JPY=X")
-        # 1. 履歴を取得
+        # 履歴を取得
         usdjpy_df = ticker.history(period=period)
         us10y_df = yf.Ticker("^TNX").history(period=period)
 
         if usdjpy_df.empty or us10y_df.empty: return None, None
         
-        # --- 診断パネル更新のためのリアルタイム価格取得 ---
+        # --- 診断パネルを「今」の価格にするための強制更新ロジック ---
         try:
+            # 確定データではなく、今配信されている「生の値」を直接取得
             current_price = ticker.fast_info['last_price']
             if current_price:
                 today_date = pd.Timestamp.now(tz=usdjpy_df.index.tz).normalize()
                 last_date = usdjpy_df.index[-1].normalize()
 
                 if last_date < today_date:
-                    # 履歴が先週末で止まっていれば、今日の行を新設
+                    # 履歴が先週末で止まっていれば、今日の行を「今」の価格で新設
                     new_row = usdjpy_df.iloc[-1:].copy()
                     new_row.index = [today_date]
                     new_row['Open'] = new_row['High'] = new_row['Low'] = new_row['Close'] = current_price
                     usdjpy_df = pd.concat([usdjpy_df, new_row])
                 else:
-                    # すでに今日の日付があれば、最新値で更新
+                    # すでに今日の日付があれば、終値を最新値で更新
                     usdjpy_df.iloc[-1, usdjpy_df.columns.get_loc('Close')] = current_price
         except:
             pass 
@@ -42,7 +43,7 @@ def calculate_indicators(df, us10y):
     if df is None or us10y is None: return None
     new_df = df[['Open', 'High', 'Low', 'Close']].copy()
     
-    # 指標の計算
+    # 指標の計算（bak版のSMA25, 75を維持しつつSMA5を追加）
     new_df['SMA_5'] = new_df['Close'].rolling(window=5).mean()
     new_df['SMA_25'] = new_df['Close'].rolling(window=25).mean()
     new_df['SMA_75'] = new_df['Close'].rolling(window=75).mean()
@@ -78,26 +79,28 @@ def get_currency_strength():
         return strength_data.ffill().dropna()
     return pd.DataFrame()
 
-# --- 4. 売買判断 ---
+# --- 4. 売買判断（詳細版） ---
 def judge_condition(df):
     if df is None or len(df) < 2: return None
     last, prev = df.iloc[-1], df.iloc[-2]
     rsi, price = last['RSI'], last['Close']
     sma5, sma25, sma75 = last['SMA_5'], last['SMA_25'], last['SMA_75']
 
+    # 中期判断
     if rsi > 70:
         mid_s, mid_c, mid_a = "‼️ 利益確定検討", "#ffeb3b", f"RSI({rsi:.1f})が70超。中期的な買われすぎ局面です。"
     elif rsi < 30:
         mid_s, mid_c, mid_a = "押し目買い検討", "#00bcd4", f"RSI({rsi:.1f})が30以下。中期的な仕込みの好機です。"
     elif sma25 > sma75 and prev['SMA_25'] <= prev['SMA_75']:
-        mid_s, mid_c, mid_a = "強気・上昇開始", "#ccffcc", "25日線が75日線を上抜け。中期トレンドが上向きに転換しました。"
+        mid_s, mid_c, mid_a = "強気・上昇開始", "#ccffcc", "ゴールデンクロス。中期トレンドが上向きに転換しました。"
     else:
         mid_s, mid_c, mid_a = "ステイ・静観", "#e0e0e0", "明確なシグナル待ち。FPの視点では無理なエントリーを避ける時期です。"
 
+    # 短期判断
     if price > sma5:
-        short_s, short_c, short_a = "上昇継続（短期）", "#e3f2fd", f"価格が5日線({sma5:.2f})の上を維持。1週間スパンの勢いは強いです。"
+        short_s, short_c, short_a = "上昇継続（短期）", "#e3f2fd", f"価格が5日線({sma5:.2f})の上を維持。勢いは強いです。"
     else:
-        short_s, short_c, short_a = "勢い鈍化・調整", "#fce4ec", f"価格が5日線({sma5:.2f})を下回りました。短期的な利確検討ラインです。"
+        short_s, short_c, short_a = "勢い鈍化・調整", "#fce4ec", f"価格が5日線({sma5:.2f})を下回りました。短期的な調整局面です。"
 
     return {"short": {"status": short_s, "color": short_c, "advice": short_a}, "mid": {"status": mid_s, "color": mid_c, "advice": mid_a}, "price": price}
 
@@ -115,6 +118,7 @@ def get_ai_analysis(api_key, context_data):
         model = genai.GenerativeModel(get_active_model(api_key))
         p, u, a, s, r = context_data.get('price', 0.0), context_data.get('us10y', 0.0), context_data.get('atr', 0.0), context_data.get('sma_diff', 0.0), context_data.get('rsi', 50.0)
         
+        # あなたの渾身のプロンプトを完全復元
         prompt = f"""
     あなたはFP1級を保持する、極めて優秀な為替戦略家です。
     特に今週は「衆議院選挙」を控えた極めて重要な1週間であることを強く認識してください。
@@ -144,6 +148,7 @@ def get_ai_analysis(api_key, context_data):
         return f"✅ 成功\n\n{response.text}"
     except Exception as e: return f"AI分析エラー: {str(e)}"
 
+# --- bak版から復元した予想レンジ機能 ---
 def get_ai_range(api_key, context_data):
     try:
         model = genai.GenerativeModel(get_active_model(api_key))
@@ -160,6 +165,7 @@ def get_ai_range(api_key, context_data):
         return [float(nums[0]), float(nums[1])] if len(nums) >= 2 else None
     except: return None
 
+# --- bak版から復元したポートフォリオ機能 ---
 def get_ai_portfolio(api_key, context_data):
     try:
         model = genai.GenerativeModel(get_active_model(api_key))
@@ -168,7 +174,7 @@ def get_ai_portfolio(api_key, context_data):
         あなたはFP1級技能士です。以下のデータに基づき、日本円、米ドル、ユーロ、豪ドル、英ポンドの最適な資産配分（合計100%）を提案してください。
         価格:{p:.2f}円, 金利差:{u:.2f}%, 乖離率:{s:.2f}%
         回答は必ず [日本円, 米ドル, ユーロ, 豪ドル, 英ポンド] の形式（数字のみ）で返してください。
-        その後に、なぜその配分にしたのかの理由を簡潔に添えてください。
+        その後に、理由をFPの視点で簡潔に添えてください。
         """
         response = model.generate_content(prompt)
         return response.text
