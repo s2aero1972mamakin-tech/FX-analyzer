@@ -6,7 +6,6 @@ import requests
 import time
 from datetime import datetime
 
-BUILD_ID = "2026-02-02_03"
 TOKYO = pytz.timezone("Asia/Tokyo")
 
 # 取得失敗時の理由をここに残す（main.pyで表示できる）
@@ -492,3 +491,4 @@ def get_ai_portfolio(api_key, context_data):
         return response.text
     except Exception:
         return "ポートフォリオ分析に失敗しました。"
+
