@@ -3,6 +3,7 @@ import pandas as pd
 import google.generativeai as genai
 import datetime
 import pytz
+TOKYO = pytz.timezone("Asia/Tokyo")
 
 def get_latest_quote(symbol="JPY=X"):
     """
@@ -69,8 +70,6 @@ def get_market_data(period="1y"):
 
         if usdjpy_df.empty or us10y_df.empty:
             return None, None
-
-        TOKYO = pytz.timezone("Asia/Tokyo")
 
 # 最新クオート（価格 + 時刻）
 current_price, quote_time = get_latest_quote("JPY=X")
@@ -253,6 +252,7 @@ def get_ai_portfolio(api_key, context_data):
         response = model.generate_content(prompt)
         return response.text
     except: return "ポートフォリオ分析に失敗しました。"
+
 
 
 
