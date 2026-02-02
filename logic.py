@@ -206,9 +206,25 @@ def get_market_data(period="1y"):
 # 指標計算（US10Yが無くても動く）
 # =====================================================
 def calculate_indicators(df, us10y):
+    """
+    ★修正点:
+    - yfinance/download が MultiIndex columns を返す場合に備えて平坦化
+    - Close が DataFrame になっても Series に正規化
+    - US10Y が無くても動作
+    """
     if df is None or getattr(df, "empty", True):
         return None
 
+    # --- 0) MultiIndex columns を平坦化（これが今回の本命修正） ---
+    try:
+        if isinstance(df.columns, pd.MultiIndex):
+            # 通常は level0 が OHLC 名（Open/High/Low/Close）
+            df = df.copy()
+            df.columns = [c[0] for c in df.columns]
+    except Exception:
+        pass
+
+    # 必要列チェック
     need_cols = ["Open", "High", "Low", "Close"]
     for c in need_cols:
         if c not in df.columns:
@@ -216,29 +232,57 @@ def calculate_indicators(df, us10y):
 
     new_df = df[need_cols].copy()
 
-    new_df["SMA_5"] = new_df["Close"].rolling(window=5).mean()
+    # CloseがDataFrameになってしまうケースの最終保険
+    if isinstance(new_df["Close"], pd.DataFrame):
+        new_df["Close"] = new_df["Close"].iloc[:, 0]
+    if isinstance(new_df["Open"], pd.DataFrame):
+        new_df["Open"] = new_df["Open"].iloc[:, 0]
+    if isinstance(new_df["High"], pd.DataFrame):
+        new_df["High"] = new_df["High"].iloc[:, 0]
+    if isinstance(new_df["Low"], pd.DataFrame):
+        new_df["Low"] = new_df["Low"].iloc[:, 0]
+
+    # 数値化（文字列混入対策）
+    for c in ["Open", "High", "Low", "Close"]:
+        new_df[c] = pd.to_numeric(new_df[c], errors="coerce")
+    new_df = new_df.dropna(subset=["Close"])
+    if new_df.empty:
+        return None
+
+    # SMA
+    new_df["SMA_5"]  = new_df["Close"].rolling(window=5).mean()
     new_df["SMA_25"] = new_df["Close"].rolling(window=25).mean()
     new_df["SMA_75"] = new_df["Close"].rolling(window=75).mean()
 
+    # RSI
     delta = new_df["Close"].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     new_df["RSI"] = 100 - (100 / (1 + (gain / loss)))
 
+    # ATR
     high_low = new_df["High"] - new_df["Low"]
     high_close = (new_df["High"] - new_df["Close"].shift()).abs()
     low_close = (new_df["Low"] - new_df["Close"].shift()).abs()
     new_df["ATR"] = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1).rolling(window=14).mean()
 
+    # ★ここでの ValueError を潰す（Close/SMA_25 が Series 化されている前提）
     new_df["SMA_DIFF"] = (new_df["Close"] - new_df["SMA_25"]) / new_df["SMA_25"] * 100
 
-    # US10Y（無ければNaN列）
-    if us10y is not None and (not getattr(us10y, "empty", True)) and ("Close" in us10y.columns):
-        new_df["US10Y"] = us10y["Close"].reindex(new_df.index).ffill()
-    else:
-        new_df["US10Y"] = float("nan")
+    # US10Y（無ければ NaN）
+    if us10y is not None and (not getattr(us10y, "empty", True)):
+        try:
+            if isinstance(us10y.columns, pd.MultiIndex):
+                us10y = us10y.copy()
+                us10y.columns = [c[0] for c in us10y.columns]
+            if "Close" in us10y.columns:
+                s = us10y["Close"]
+                if isinstance(s, pd.DataFrame):
+                    s = s.iloc[:, 0]
+                new_df["US10Y"] = pd.to_numeric(s, errors="coerce").reindex(new_df.index).ffill()
+            else:
+                new_df["US10Y"] = float("nan")
 
-    return new_df
 
 
 # =====================================================
@@ -390,3 +434,4 @@ def get_ai_portfolio(api_key, context_data):
         return response.text
     except:
         return "ポートフォリオ分析に失敗しました。"
+
