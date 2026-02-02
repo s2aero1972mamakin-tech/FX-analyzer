@@ -5,78 +5,95 @@ import datetime
 
 def get_latest_quote(symbol="JPY=X"):
     """
-    最新価格と、その価格が観測された時刻を返す（fast_infoがダメならintradayで拾う）
+    最新価格とその時刻を返す。
+    1) yfinance fast_info
+    2) yfinance intraday (1m)
+    3) 為替APIフォールバック（USDJPY）
     """
-    price = None
-    qt = None
-
-    t = yf.Ticker(symbol)
-
-    # 1) fast_info 優先
+    # --- 1) fast_info ---
     try:
+        t = yf.Ticker(symbol)
         fi = t.fast_info or {}
         price = fi.get("last_price") or fi.get("lastPrice")
         ts = fi.get("last_timestamp") or fi.get("lastTimestamp")
-        if ts:
+        if price is not None and ts:
             qt = pd.to_datetime(ts, unit="s", utc=True)
+            return float(price), qt
     except Exception:
         pass
 
-    # 2) intraday フォールバック（Streamlit/GitHubで強い）
-    if price is None or qt is None:
-        try:
-            intraday = yf.download(
-                symbol,
-                period="5d",
-                interval="5m",
-                progress=False,
-                threads=False,
-            )
-            if not intraday.empty:
-                close = intraday["Close"].dropna()
-                if len(close) > 0:
-                    price = float(close.iloc[-1])
-                    qt = close.index[-1]
-                    if getattr(qt, "tz", None) is None:
-                        qt = qt.tz_localize("UTC")
-        except Exception:
-            pass
+    # --- 2) intraday 1m（Cloudで5mより成功することがある） ---
+    try:
+        intraday = yf.download(
+            symbol,
+            period="1d",
+            interval="1m",
+            progress=False,
+            threads=False,
+        )
+        if not intraday.empty:
+            close = intraday["Close"].dropna()
+            if len(close) > 0:
+                price = float(close.iloc[-1])
+                qt = close.index[-1]
+                if getattr(qt, "tz", None) is None:
+                    qt = qt.tz_localize("UTC")
+                return price, qt
+    except Exception:
+        pass
 
-    return price, qt
+    # --- 3) 為替APIフォールバック（USD→JPY を取得）---
+    # ※無料で叩ける公開API。yfinanceが死んでも取れることが多い
+    #    open.er-api.com は "USD" 基準で JPY を返す
+    try:
+        r = requests.get("https://open.er-api.com/v6/latest/USD", timeout=10)
+        if r.status_code == 200:
+            j = r.json()
+            rate = j["rates"]["JPY"]  # 1 USD = ??? JPY
+            # 時刻はAPI側の更新時刻に寄せたいが、まずは「今」扱いでUTCを入れる
+            qt = pd.Timestamp.utcnow().tz_localize("UTC")
+            return float(rate), qt
+    except Exception:
+        pass
 
+    return None, None
 
 
 # --- 1. 市場データ取得（週末でも「今日行」を捏造しない版） ---
-# --- 1. 市場データ取得（時価を最優先し、暴落にも即応する修正版） ---
 def get_market_data(period="1y"):
     try:
         ticker = yf.Ticker("JPY=X")
-        usdjpy_df = ticker.history(period=period)
+        usdjpy_df = ticker.history(period=period)  # daily
         us10y_df = yf.Ticker("^TNX").history(period=period)
 
         if usdjpy_df.empty or us10y_df.empty:
             return None, None
 
-        # 常に最新の時価を直接取得する
-        current_price, _ = get_latest_quote("JPY=X")
+        current_price, quote_time = get_latest_quote("JPY=X")
 
-        if current_price is not None:
-            # 取得した全データの最後の行（154.780など）を、今の本当の価格で上書き
-            # これにより、市場が149円になれば、即座にグラフもパネルも149円になります
-            usdjpy_df.iloc[-1, usdjpy_df.columns.get_loc("Close")] = current_price
-            
-            # 日付が古い（金曜）ままなら、今日の日付として行を「最新化」する
-            today = pd.Timestamp.now().normalize()
-            if usdjpy_df.index[-1].normalize() < today:
-                # 最後の行をコピーして「今日の日付」として追加
+        # 重要: 「今日」ではなく「クオートが観測された日」で更新する
+        if current_price is not None and quote_time is not None:
+            hist_tz = usdjpy_df.index.tz or "UTC"
+            qt = quote_time.tz_convert(hist_tz)
+
+            quote_day = qt.normalize()
+            last_day = usdjpy_df.index[-1].tz_convert(hist_tz).normalize()
+
+            if last_day < quote_day:
+                # 新しい日（例: 月曜）なら、その日付で行を追加
                 new_row = usdjpy_df.iloc[-1:].copy()
-                new_row.index = [today]
-                new_row["Close"] = current_price
+                new_row.index = [quote_day]
+                new_row["Open"] = new_row["High"] = new_row["Low"] = new_row["Close"] = current_price
                 usdjpy_df = pd.concat([usdjpy_df, new_row])
+            else:
+                # 同じ日なら最終行のCloseだけ更新
+                usdjpy_df.iloc[-1, usdjpy_df.columns.get_loc("Close")] = current_price
 
-        # 描画エラーを防ぐための処理
-        usdjpy_df.index = usdjpy_df.index.tz_localize(None)
-        us10y_df.index = us10y_df.index.tz_localize(None)
+        # tz 제거（以降の処理/描画が素直になる）
+        if getattr(usdjpy_df.index, "tz", None) is not None:
+            usdjpy_df.index = usdjpy_df.index.tz_localize(None)
+        if getattr(us10y_df.index, "tz", None) is not None:
+            us10y_df.index = us10y_df.index.tz_localize(None)
 
         return usdjpy_df, us10y_df
     except Exception:
@@ -223,6 +240,7 @@ def get_ai_portfolio(api_key, context_data):
         response = model.generate_content(prompt)
         return response.text
     except: return "ポートフォリオ分析に失敗しました。"
+
 
 
 
