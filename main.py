@@ -6,6 +6,7 @@ import pandas as pd
 from datetime import datetime, timedelta
 import pytz
 
+
 # --- ページ設定 ---
 st.set_page_config(layout="wide", page_title="AI-FX Analyzer")
 st.title("🤖 AI連携型 USD/JPY 戦略分析ツール")
@@ -159,3 +160,4 @@ if df is not None and not df.empty:
                     "rsi": last_row['RSI'], "current_time": current_time_str, "is_gotobi": is_gotobi
                 }
                 st.markdown(logic.get_ai_analysis(api_key, context))
+
