@@ -43,26 +43,38 @@ if df is not None and not df.empty:
 
     
     # --- 1. 診断パネル（HTML/CSSを完全復元） ---
-    diag = logic.judge_condition(df)
-    if diag:
-        col_short, col_mid = st.columns(2)
-        with col_short:
-            st.markdown(f"""
-                <div style="background-color:{diag['short']['color']}; padding:20px; border-radius:12px; border:1px solid #ddd; min-height:220px;">
-                    <h3 style="color:#333; margin:0; font-size:16px;">📅 1週間スパン（短期勢い）</h3>
-                    <h2 style="color:#333; margin:10px 0; font-size:24px;">{diag['short']['status']}</h2>
-                    <p style="color:#555; font-size:14px; line-height:1.6;">{diag['short']['advice']}</p>
-                    <p style="color:#666; font-size:14px; font-weight:bold; margin-top:10px;">現在値: {diag['price']:.3f} 円</p>
-                </div>
-            """, unsafe_allow_html=True)
-        with col_mid:
-            st.markdown(f"""
-                <div style="background-color:{diag['mid']['color']}; padding:20px; border-radius:12px; border:1px solid #ddd; min-height:220px;">
-                    <h3 style="color:#333; margin:0; font-size:16px;">🗓️ 1ヶ月スパン（中期トレンド）</h3>
-                    <h2 style="color:#333; margin:10px 0; font-size:24px;">{diag['mid']['status']}</h2>
-                    <p style="color:#555; font-size:14px; line-height:1.6;">{diag['mid']['advice']}</p>
-                </div>
-            """, unsafe_allow_html=True)
+diag = logic.judge_condition(df)
+
+# ★ ここに入れる（HTMLの外・ifの前）
+st.caption(
+    "データ最終日: {} / Close: {:.3f}".format(
+        df.index[-1],
+        float(df["Close"].iloc[-1])
+    )
+)
+
+if diag:
+    col_short, col_mid = st.columns(2)
+
+    with col_short:
+        st.markdown(f"""
+            <div style="background-color:{diag['short']['color']}; padding:20px; border-radius:12px; border:1px solid #ddd; min-height:220px;">
+                <h3 style="color:#333; margin:0; font-size:16px;">📅 1週間スパン（短期勢い）</h3>
+                <h2 style="color:#333; margin:10px 0; font-size:24px;">{diag['short']['status']}</h2>
+                <p style="color:#555; font-size:14px; line-height:1.6;">{diag['short']['advice']}</p>
+                <p style="color:#666; font-size:14px; font-weight:bold; margin-top:10px;">現在値: {diag['price']:.3f} 円</p>
+            </div>
+        """, unsafe_allow_html=True)
+
+    with col_mid:
+        st.markdown(f"""
+            <div style="background-color:{diag['mid']['color']}; padding:20px; border-radius:12px; border:1px solid #ddd; min-height:220px;">
+                <h3 style="color:#333; margin:0; font-size:16px;">🗓️ 1ヶ月スパン（中期トレンド）</h3>
+                <h2 style="color:#333; margin:10px 0; font-size:24px;">{diag['mid']['status']}</h2>
+                <p style="color:#555; font-size:14px; line-height:1.6;">{diag['mid']['advice']}</p>
+            </div>
+        """, unsafe_allow_html=True)
+
 
     # --- 2. 経済アラート ---
     if diag['short']['status'] == "勢い鈍化・調整" or df['ATR'].iloc[-1] > df['ATR'].mean() * 1.5:
@@ -161,6 +173,7 @@ if df is not None and not df.empty:
                     "rsi": last_row['RSI'], "current_time": current_time_str, "is_gotobi": is_gotobi
                 }
                 st.markdown(logic.get_ai_analysis(api_key, context))
+
 
 
 
