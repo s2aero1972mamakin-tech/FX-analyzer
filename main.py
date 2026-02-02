@@ -5,6 +5,8 @@ import logic
 import pandas as pd
 from datetime import datetime, timedelta
 import pytz
+st.caption(f"BUILD_ID: {logic.BUILD_ID}")
+
 
 
 # --- ページ設定 ---
@@ -173,6 +175,7 @@ if diag:
                     "rsi": last_row['RSI'], "current_time": current_time_str, "is_gotobi": is_gotobi
                 }
                 st.markdown(logic.get_ai_analysis(api_key, context))
+
 
 
 
