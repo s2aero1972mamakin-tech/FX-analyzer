@@ -2,6 +2,7 @@ import yfinance as yf
 import pandas as pd
 import google.generativeai as genai
 import datetime
+import pytz
 
 def get_latest_quote(symbol="JPY=X"):
     """
@@ -252,6 +253,7 @@ def get_ai_portfolio(api_key, context_data):
         response = model.generate_content(prompt)
         return response.text
     except: return "ポートフォリオ分析に失敗しました。"
+
 
 
 
