@@ -59,8 +59,10 @@ st.caption(
         q_time.tz_convert("Asia/Tokyo") if q_time else None
     )
 )
+
 Low'].min())
-    y_max_view = float(df_view['High'].max())
+y_min_view = float(df_view['Low'].min())
+y_max_view = float(df_view['High'].max())
 
     
     # --- 1. 診断パネル（安全版：diag未定義を絶対に起こさない） ---
@@ -193,6 +195,7 @@ else:
                     "rsi": last_row['RSI'], "current_time": current_time_str, "is_gotobi": is_gotobi
                 }
                 st.markdown(logic.get_ai_analysis(api_key, context))
+
 
 
 
