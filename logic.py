@@ -3,50 +3,54 @@ import pandas as pd
 import google.generativeai as genai
 import datetime
 
-# --- 1. 市場データ取得（最新レート反映改修） ---
+# --- 1. 市場データ取得（最新レート強制反映・診断パネル更新版） ---
 def get_market_data(period="1y"):
     try:
-        # 1. 履歴データの取得
         ticker = yf.Ticker("JPY=X")
         usdjpy_df = ticker.history(period=period)
+        
         ticker_10y = yf.Ticker("^TNX")
         us10y_df = ticker_10y.history(period=period)
 
         if usdjpy_df.empty or us10y_df.empty: return None, None
-
-        # 2. 【差分：最新価格のねじ込み】
-        # 月曜日の朝など、historyに今日の行がない場合に、最新値を強制的に追加します
+        
+        # --- 差分：診断パネルの価格を今日のものに強制更新するロジック ---
         try:
-            # 最新の配信価格を取得
+            # 最新のリアルタイム価格を取得
             current_price = ticker.fast_info['last_price']
             if current_price:
+                # 履歴データの最後の日付（先週末など）を取得
                 last_date = usdjpy_df.index[-1].date()
-                today_date = datetime.datetime.now().date()
+                # 今日の日付を取得
+                today_date = datetime.date.today()
                 
                 if last_date < today_date:
-                    # 今日の行が存在しない（先週末で止まっている）場合
-                    new_row = usdjpy_df.iloc[-1].copy()
+                    # 【重要】履歴が先週末で止まっている場合、今日の行を新設する
+                    new_row = usdjpy_df.iloc[-1:].copy()
+                    # インデックスを今日の日付（タイムゾーン維持）に差し替え
+                    new_index = pd.to_datetime([today_date]).tz_localize(usdjpy_df.index.tz)
+                    new_row.index = new_index
+                    # 全ての値を現在値に書き換える
                     new_row['Open'] = new_row['High'] = new_row['Low'] = new_row['Close'] = current_price
-                    # 今日の日付で新しい行を作成（タイムゾーンを合わせる）
-                    new_date = pd.Timestamp(today_date).tz_localize(usdjpy_df.index.tz)
-                    usdjpy_df.loc[new_date] = new_row
+                    # 元のデータに結合
+                    usdjpy_df = pd.concat([usdjpy_df, new_row])
                 else:
-                    # すでに今日の行がある場合は、最新価格で終値を更新
+                    # すでに今日の行がある場合は、最新価格を終値に上書き
                     usdjpy_df.iloc[-1, usdjpy_df.columns.get_loc('Close')] = current_price
         except:
-            pass # 取得失敗時は安全のため履歴データのままで処理
+            pass # リアルタイム取得失敗時は履歴データのまま進む
 
         usdjpy_df.index = usdjpy_df.index.tz_localize(None)
         us10y_df.index = us10y_df.index.tz_localize(None)
         return usdjpy_df, us10y_df
     except: return None, None
 
-# --- 2. 指標計算（5日移動平均線を追加） ---
+# --- 2. 指標計算（プロンプトに合わせSMA5等維持） ---
 def calculate_indicators(df, us10y):
     if df is None or us10y is None: return None
     new_df = df[['Open', 'High', 'Low', 'Close']].copy()
     
-    # 移動平均線（5日、25日、75日）
+    # 移動平均線
     new_df['SMA_5'] = new_df['Close'].rolling(window=5).mean()
     new_df['SMA_25'] = new_df['Close'].rolling(window=25).mean()
     new_df['SMA_75'] = new_df['Close'].rolling(window=75).mean()
@@ -87,17 +91,11 @@ def get_currency_strength():
 
 # --- 4. 売買判断 ---
 def judge_condition(df):
-    if df is None or len(df) < 2: 
-        return None
-
+    if df is None or len(df) < 2: return None
     last, prev = df.iloc[-1], df.iloc[-2]
-    rsi = last['RSI']
-    price = last['Close']
-    sma5 = last['SMA_5']
-    sma25 = last['SMA_25']
-    sma75 = last['SMA_75']
+    rsi, price = last['RSI'], last['Close']
+    sma5, sma25, sma75 = last['SMA_5'], last['SMA_25'], last['SMA_75']
 
-    # 中期（1ヶ月）診断
     if rsi > 70:
         mid_s, mid_c, mid_a = "‼️ 利益確定検討", "#ffeb3b", f"RSI({rsi:.1f})が70超。中期的な買われすぎ局面です。"
     elif rsi < 30:
@@ -107,19 +105,14 @@ def judge_condition(df):
     else:
         mid_s, mid_c, mid_a = "ステイ・静観", "#e0e0e0", "明確なシグナル待ち。FPの視点では無理なエントリーを避ける時期です。"
 
-    # 短期（1週間）診断（5日線基準）
     if price > sma5:
         short_s, short_c, short_a = "上昇継続（短期）", "#e3f2fd", f"価格が5日線({sma5:.2f})の上を維持。1週間スパンの勢いは強いです。"
     else:
         short_s, short_c, short_a = "勢い鈍化・調整", "#fce4ec", f"価格が5日線({sma5:.2f})を下回りました。短期的な利確検討ラインです。"
 
-    return {
-        "short": {"status": short_s, "color": short_c, "advice": short_a},
-        "mid": {"status": mid_s, "color": mid_c, "advice": mid_a},
-        "price": price
-    }
+    return {"short": {"status": short_s, "color": short_c, "advice": short_a}, "mid": {"status": mid_s, "color": mid_c, "advice": mid_a}, "price": price}
 
-# --- 5. AI統合分析（★プロンプト完全維持★） ---
+# --- 5. AI分析（指定プロンプトを完全復旧） ---
 def get_active_model(api_key):
     genai.configure(api_key=api_key)
     try:
@@ -133,7 +126,7 @@ def get_ai_analysis(api_key, context_data):
         model = genai.GenerativeModel(get_active_model(api_key))
         p, u, a, s, r = context_data.get('price', 0.0), context_data.get('us10y', 0.0), context_data.get('atr', 0.0), context_data.get('sma_diff', 0.0), context_data.get('rsi', 50.0)
         
-        # あなたが指定したFP1級・選挙特化型プロンプトをそのまま適用
+        # ユーザー指定のFP1級・選挙プロンプト（一文字も省かず）
         prompt = f"""
     あなたはFP1級を保持する、極めて優秀な為替戦略家です。
     特に今週は「衆議院選挙」を控えた極めて重要な1週間であることを強く認識してください。
