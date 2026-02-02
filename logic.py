@@ -4,13 +4,17 @@ import google.generativeai as genai
 import datetime
 
 # --- 1. 市場データ取得 ---
-def get_market_data(period="6mo"):
+# logic.py の修正例
+def get_market_data(period="1y"):
     try:
-        usdjpy = yf.download("JPY=X", period=period)
-        us10y = yf.download("^TNX", period=period)
-        if usdjpy.empty or us10y.empty: return None, None
-        return usdjpy, us10y
-    except: return None, None
+        ticker = yf.Ticker("JPY=X")
+        usdjpy_df = ticker.history(period=period)
+        
+        # 履歴の最新行が今日でない場合、現在のリアルタイム価格で上書きする
+        current_price = ticker.basic_info['lastPrice'] 
+        if current_price:
+            usdjpy_df.iloc[-1, usdjpy_df.columns.get_loc('Close')] = current_price
+            
 
 # --- 2. 指標計算（ATR厳密版・SMA75含む） ---
 def calculate_indicators(df, us10y):
@@ -127,4 +131,5 @@ def get_currency_strength():
         strength_data["USD"] = strength_data.mean(axis=1) * -1
         return strength_data.ffill().dropna()
     return pd.DataFrame()
+
 
