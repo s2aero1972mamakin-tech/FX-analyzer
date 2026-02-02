@@ -55,9 +55,14 @@ if df is not None and not df.empty:
     y_max_view = float(df_view['High'].max())
 
     
-    # --- 1. 診断パネル（HTML/CSSを完全復元） --
+    # --- 1. 診断パネル（安全版：diag未定義を絶対に起こさない） ---
+try:
+    diag = logic.judge_condition(df)
+except Exception as e:
+    diag = None
+    st.error(f"judge_conditionでエラー: {e}")
 
-if diag:
+if diag is not None:
     col_short, col_mid = st.columns(2)
 
     with col_short:
@@ -78,6 +83,9 @@ if diag:
                 <p style="color:#555; font-size:14px; line-height:1.6;">{diag['mid']['advice']}</p>
             </div>
         """, unsafe_allow_html=True)
+else:
+    st.warning("診断データ（diag）が作れませんでした。dfが空か、計算に失敗しています。")
+
 
 
     # --- 2. 経済アラート ---
@@ -177,6 +185,7 @@ if diag:
                     "rsi": last_row['RSI'], "current_time": current_time_str, "is_gotobi": is_gotobi
                 }
                 st.markdown(logic.get_ai_analysis(api_key, context))
+
 
 
 
