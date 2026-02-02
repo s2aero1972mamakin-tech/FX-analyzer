@@ -13,10 +13,13 @@ def get_market_data(period="1y"):
         if usdjpy_df.empty or us10y_df.empty: return None, None
         
         try:
-            # 「日付が古いかどうか」の判定を完全に撤廃
+            # 【ここが心臓部】
+            # 「確定データ」を待つのをやめ、常に「今動いている生の値」を取得します。
+            # 149円になれば149円を、150円になれば150円を自動的に拾います。
             current_price = ticker.fast_info['last_price']
+            
             if current_price:
-                # 取得したデータの「最後の行」を、無条件で今のレート(155.xx円)に書き換える
+                # データの最後の一行を、今の本当の価格（時価）で書き換えます。
                 usdjpy_df.iloc[-1, usdjpy_df.columns.get_loc('Close')] = current_price
         except:
             pass 
@@ -167,4 +170,5 @@ def get_ai_portfolio(api_key, context_data):
         response = model.generate_content(prompt)
         return response.text
     except: return "ポートフォリオ分析に失敗しました。"
+
 
