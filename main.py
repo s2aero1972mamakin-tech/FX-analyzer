@@ -34,20 +34,6 @@ strength = logic.get_currency_strength()
 if df is not None and not df.empty:
     df.index = pd.to_datetime(df.index)
 
-    st.caption(
-        "データ最終日: {} / Close: {:.3f}".format(
-            df.index[-1],
-            float(df["Close"].iloc[-1])
-        )
-    )
-
-q_price, q_time = logic.get_latest_quote("JPY=X")
-st.caption(
-    "QUOTE(最新取得): price={} / time(JST)={}".format(
-        q_price,
-        q_time.tz_convert("Asia/Tokyo") if q_time else None
-    )
-    
     # ★ diag をここで必ず作る（if diag の直前）
     diag = logic.judge_condition(df)
     
@@ -58,7 +44,22 @@ st.caption(
     # ズーム範囲内の高値・安値を計算してY軸を最適化（ここが省略されていました）
     mask = (df.index >= start_view)
     df_view = df.loc[mask]
-    y_min_view = float(df_view['Low'].min())
+    y_min_view = float(df_view['st.caption(
+    "データ最終日: {} / Close: {:.3f}".format(
+        df.index[-1],
+        float(df["Close"].iloc[-1])
+    )
+)
+
+q_price, q_time = logic.get_latest_quote("JPY=X")
+
+st.caption(
+    "QUOTE(最新取得): price={} / time(JST)={}".format(
+        q_price,
+        q_time.tz_convert("Asia/Tokyo") if q_time else None
+    )
+)
+Low'].min())
     y_max_view = float(df_view['High'].max())
 
     
@@ -192,6 +193,7 @@ else:
                     "rsi": last_row['RSI'], "current_time": current_time_str, "is_gotobi": is_gotobi
                 }
                 st.markdown(logic.get_ai_analysis(api_key, context))
+
 
 
 
