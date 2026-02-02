@@ -7,9 +7,21 @@ import requests
 BUILD_ID = "2026-02-02_01"
 TOKYO = pytz.timezone("Asia/Tokyo")
 
+def _to_jst(ts):
+    """TimestampをJSTに揃えて返す（NoneはNone）。"""
+    if ts is None:
+        return None
+    try:
+        if getattr(ts, "tzinfo", None) is None:
+            # yfinanceがnaiveで返すケース対策（基本UTC扱い）
+            ts = ts.tz_localize("UTC")
+        return ts.tz_convert(TOKYO)
+    except Exception:
+        return ts
+
 def get_latest_quote(symbol="JPY=X"):
     """
-    最新価格とその時刻を返す。
+    最新価格とその時刻(JST)を返す。
     1) yfinance fast_info
     2) yfinance intraday (1m)
     3) 為替APIフォールバック（USDJPY）
@@ -21,13 +33,13 @@ def get_latest_quote(symbol="JPY=X"):
         price = fi.get("last_price") or fi.get("lastPrice")
         ts = fi.get("last_timestamp") or fi.get("lastTimestamp")
         if price is not None and ts:
-            # ★修正: ここがUTCのままだと表示側でズレるので、必ずJSTに揃えて返す
-            qt = pd.to_datetime(ts, unit="s", utc=True).tz_convert(TOKYO)
+            qt = pd.to_datetime(ts, unit="s", utc=True)
+            qt = _to_jst(qt)
             return float(price), qt
     except Exception:
         pass
 
-    # --- 2) intraday 1m（Cloudで5mより成功することがある） ---
+    # --- 2) intraday 1m ---
     try:
         intraday = yf.download(
             symbol,
@@ -41,19 +53,19 @@ def get_latest_quote(symbol="JPY=X"):
             if len(close) > 0:
                 price = float(close.iloc[-1])
                 qt = close.index[-1]
-                if getattr(qt, "tz", None) is None:
-                    qt = qt.tz_localize("UTC")
-                qt = qt.tz_convert(TOKYO)
+                qt = _to_jst(qt)
                 return price, qt
     except Exception:
         pass
 
-    # --- 3) 為替APIフォールバック（USD→JPY） ---
+    # --- 3) 為替APIフォールバック（USD→JPY を取得）---
     try:
         r = requests.get("https://open.er-api.com/v6/latest/USD", timeout=10)
         if r.status_code == 200:
-            rate = r.json()["rates"]["JPY"]
-            qt = datetime.datetime.now(TOKYO)
+            j = r.json()
+            rate = j["rates"]["JPY"]
+            qt = pd.Timestamp.utcnow().tz_localize("UTC")
+            qt = _to_jst(qt)
             return float(rate), qt
     except Exception:
         pass
@@ -61,46 +73,59 @@ def get_latest_quote(symbol="JPY=X"):
     return None, None
 
 
-# --- 1. 市場データ取得（週末でも「今日行」を捏造しない版） ---
+# --- 1. 市場データ取得（強化版：historyが空ならdownloadへ） ---
 def get_market_data(period="1y"):
     try:
-        ticker = yf.Ticker("JPY=X")
-        usdjpy_df = ticker.history(period=period)  # daily
-        us10y_df = yf.Ticker("^TNX").history(period=period)
+        # まずはhistory
+        usdjpy_df = yf.Ticker("JPY=X").history(period=period)
+        us10y_df  = yf.Ticker("^TNX").history(period=period)
 
-        if usdjpy_df.empty or us10y_df.empty:
+        # historyが空ならdownloadへフォールバック（ここが重要）
+        if usdjpy_df is None or usdjpy_df.empty:
+            usdjpy_df = yf.download("JPY=X", period=period, interval="1d", progress=False, threads=False)
+
+        if us10y_df is None or us10y_df.empty:
+            us10y_df = yf.download("^TNX", period=period, interval="1d", progress=False, threads=False)
+
+        # usdjpyがまだ空なら諦める（ここだけは必須）
+        if usdjpy_df is None or usdjpy_df.empty:
             return None, None
 
         # 最新クオート（価格 + 時刻）
         current_price, quote_time = get_latest_quote("JPY=X")
 
-        if current_price is not None and quote_time is not None:
-            # ① クオート時刻をJSTに寄せて日付を切る（重要）
-            qt_tokyo = quote_time.tz_convert(TOKYO)
-            quote_day = qt_tokyo.normalize()
+        if current_price is not None and quote_time is not None and "Close" in usdjpy_df.columns:
+            # ① クオート時刻をJSTに寄せて日付を切る
+            qt_tokyo = _to_jst(quote_time)
+            quote_day = pd.Timestamp(qt_tokyo).normalize()
 
-            # ② 履歴の最終日もJSTに寄せて日付を切る（重要）
+            # ② 履歴の最終日もJSTに寄せて日付を切る（indexはtz無しが多い）
             last_idx = usdjpy_df.index[-1]
-            if getattr(last_idx, "tz", None) is not None:
-                last_day = last_idx.tz_convert(TOKYO).normalize()
-            else:
-                last_day = pd.Timestamp(last_idx).tz_localize(TOKYO).normalize()
+            last_day = pd.Timestamp(last_idx).normalize()
 
+            # ③ 新しい日なら行追加 / 同日ならClose更新
             if last_day < quote_day:
-                # 新しい日（JST）なら、その日付で行を追加
                 new_row = usdjpy_df.iloc[-1:].copy()
                 new_row.index = [quote_day]
-                new_row["Open"] = new_row["High"] = new_row["Low"] = new_row["Close"] = float(current_price)
+                # Open/High/Low/Closeが存在しない形（稀）もあるので安全に
+                for col in ["Open", "High", "Low", "Close"]:
+                    if col in new_row.columns:
+                        new_row[col] = float(current_price)
                 usdjpy_df = pd.concat([usdjpy_df, new_row])
             else:
-                # 同じ日（JST）なら最終行のCloseを更新
                 usdjpy_df.iloc[-1, usdjpy_df.columns.get_loc("Close")] = float(current_price)
 
-        # tz 제거（以降の処理/描画が素直になる）
-        if getattr(usdjpy_df.index, "tz", None) is not None:
-            usdjpy_df.index = usdjpy_df.index.tz_localize(None)
-        if getattr(us10y_df.index, "tz", None) is not None:
-            us10y_df.index = us10y_df.index.tz_localize(None)
+        # tz 제거（描画やrollingの安定化）
+        try:
+            if getattr(usdjpy_df.index, "tz", None) is not None:
+                usdjpy_df.index = usdjpy_df.index.tz_localize(None)
+        except Exception:
+            pass
+        try:
+            if us10y_df is not None and getattr(us10y_df.index, "tz", None) is not None:
+                us10y_df.index = us10y_df.index.tz_localize(None)
+        except Exception:
+            pass
 
         return usdjpy_df, us10y_df
 
@@ -109,79 +134,113 @@ def get_market_data(period="1y"):
         return None, None
 
 
-# --- 2. 指標計算 ---
-def calculate_indicators(usdjpy_df, us10y_df):
-    if usdjpy_df is None or usdjpy_df.empty:
+# --- 2. 指標計算（US10Yが無くても返す版） ---
+def calculate_indicators(df, us10y):
+    # ★修正：us10yがNone/空でもdfさえあれば進める
+    if df is None or getattr(df, "empty", True):
         return None
 
-    df = usdjpy_df.copy()
+    # 必要列が無い形で来たら、落とさずNone
+    need_cols = ["Open", "High", "Low", "Close"]
+    for c in need_cols:
+        if c not in df.columns:
+            return None
 
-    df["SMA_5"] = df["Close"].rolling(5).mean()
-    df["SMA_25"] = df["Close"].rolling(25).mean()
-    df["SMA_75"] = df["Close"].rolling(75).mean()
+    new_df = df[need_cols].copy()
 
-    # ATR
-    high_low = df["High"] - df["Low"]
-    high_close = (df["High"] - df["Close"].shift()).abs()
-    low_close = (df["Low"] - df["Close"].shift()).abs()
-    ranges = pd.concat([high_low, high_close, low_close], axis=1)
-    true_range = ranges.max(axis=1)
-    df["ATR"] = true_range.rolling(14).mean()
+    # SMA
+    new_df["SMA_5"]  = new_df["Close"].rolling(window=5).mean()
+    new_df["SMA_25"] = new_df["Close"].rolling(window=25).mean()
+    new_df["SMA_75"] = new_df["Close"].rolling(window=75).mean()
 
     # RSI
-    delta = df["Close"].diff()
-    gain = delta.where(delta > 0, 0.0)
-    loss = -delta.where(delta < 0, 0.0)
-    avg_gain = gain.rolling(14).mean()
-    avg_loss = loss.rolling(14).mean()
-    rs = avg_gain / avg_loss
-    df["RSI"] = 100 - (100 / (1 + rs))
+    delta = new_df["Close"].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    new_df["RSI"] = 100 - (100 / (1 + (gain / loss)))
 
-    # 10年債利回り（^TNX）
-    if us10y_df is not None and not us10y_df.empty:
-        df["US10Y"] = us10y_df["Close"].reindex(df.index).ffill()
+    # ATR
+    high_low = new_df["High"] - new_df["Low"]
+    high_close = (new_df["High"] - new_df["Close"].shift()).abs()
+    low_close = (new_df["Low"] - new_df["Close"].shift()).abs()
+    new_df["ATR"] = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1).rolling(window=14).mean()
 
-    return df
+    # US10Y（無ければNaN列を作る）
+    if us10y is not None and (not getattr(us10y, "empty", True)) and ("Close" in us10y.columns):
+        s = us10y["Close"].reindex(new_df.index).ffill()
+        new_df["US10Y"] = s
+    else:
+        new_df["US10Y"] = float("nan")
 
+    return new_df
 
+# --- 3. 通貨強弱 ---
+def get_currency_strength():
+    pairs = {"EUR": "EURUSD=X", "GBP": "GBPUSD=X", "JPY": "JPY=X", "AUD": "AUDUSD=X"}
+    strength_data = pd.DataFrame()
+    for name, sym in pairs.items():
+        try:
+            ticker = yf.Ticker(sym)
+            d = ticker.history(period="1mo")["Close"]
+            d.index = d.index.tz_localize(None)
+            if name == "JPY":
+                strength_data[name] = (1 / d).pct_change().cumsum() * 100
+            else:
+                strength_data[name] = d.pct_change().cumsum() * 100
+        except Exception:
+            pass
+    if not strength_data.empty:
+        strength_data["USD"] = strength_data.mean(axis=1) * -1
+        return strength_data.ffill().dropna()
+    return pd.DataFrame()
+
+# --- 4. 売買判断（詳細版） ---
 def judge_condition(df):
     if df is None or len(df) < 2: return None
     last, prev = df.iloc[-1], df.iloc[-2]
-    rsi, price = last['RSI'], last['Close']
-    sma5, sma25, sma75 = last['SMA_5'], last['SMA_25'], last['SMA_75']
+    rsi, price = last["RSI"], last["Close"]
+    sma5, sma25, sma75 = last["SMA_5"], last["SMA_25"], last["SMA_75"]
 
-    # 中期判断
     if rsi > 70:
         mid_s, mid_c, mid_a = "‼️ 利益確定検討", "#ffeb3b", f"RSI({rsi:.1f})が70超。中期的な買われすぎ局面です。"
     elif rsi < 30:
         mid_s, mid_c, mid_a = "押し目買い検討", "#00bcd4", f"RSI({rsi:.1f})が30以下。中期的な仕込みの好機です。"
-    elif sma25 > sma75 and prev['SMA_25'] <= prev['SMA_75']:
+    elif sma25 > sma75 and prev["SMA_25"] <= prev["SMA_75"]:
         mid_s, mid_c, mid_a = "強気・上昇開始", "#ccffcc", "ゴールデンクロス。中期トレンドが上向きに転換しました。"
     else:
         mid_s, mid_c, mid_a = "ステイ・静観", "#e0e0e0", "明確なシグナル待ち。FPの視点では無理なエントリーを避ける時期です。"
 
-    # 短期判断
     if price > sma5:
         short_s, short_c, short_a = "上昇継続（短期）", "#e3f2fd", f"価格が5日線({sma5:.2f})の上を維持。勢いは強いです。"
     else:
         short_s, short_c, short_a = "勢い鈍化・調整", "#fce4ec", f"価格が5日線({sma5:.2f})を下回りました。短期的な調整局面です。"
 
-    return {"short": {"status": short_s, "color": short_c, "advice": short_a}, "mid": {"status": mid_s, "color": mid_c, "advice": mid_a}, "price": price}
+    return {"short": {"status": short_s, "color": short_c, "advice": short_a},
+            "mid": {"status": mid_s, "color": mid_c, "advice": mid_a},
+            "price": price}
 
 # --- 5. AI分析（FP1級・衆院選プロンプト完全版） ---
 def get_active_model(api_key):
     genai.configure(api_key=api_key)
     try:
         for m in genai.list_models():
-            if 'generateContent' in m.supported_generation_methods: return m.name
-    except: pass
+            if "generateContent" in m.supported_generation_methods:
+                return m.name
+    except:
+        pass
     return "models/gemini-1.5-flash"
 
 def get_ai_analysis(api_key, context_data):
     try:
         model = genai.GenerativeModel(get_active_model(api_key))
-        p, u, a, s, r = context_data.get('price', 0.0), context_data.get('us10y', 0.0), context_data.get('atr', 0.0), context_data.get('sma_diff', 0.0), context_data.get('rsi', 50.0)
-        
+        p, u, a, s, r = (
+            context_data.get("price", 0.0),
+            context_data.get("us10y", 0.0),
+            context_data.get("atr", 0.0),
+            context_data.get("sma_diff", 0.0),
+            context_data.get("rsi", 50.0),
+        )
+
         prompt = f"""
     あなたはFP1級を保持する、極めて優秀な為替戦略家です。
     特に今週は「衆議院選挙」を控えた極めて重要な1週間であることを強く認識してください。
@@ -209,13 +268,13 @@ def get_ai_analysis(api_key, context_data):
         """
         response = model.generate_content(prompt)
         return f"✅ 成功\n\n{response.text}"
-    except Exception as e: return f"AI分析エラー: {str(e)}"
+    except Exception as e:
+        return f"AI分析エラー: {str(e)}"
 
-# --- bak版から復元した予想レンジ機能 ---
 def get_ai_range(api_key, context_data):
     try:
         model = genai.GenerativeModel(get_active_model(api_key))
-        p = context_data.get('price', 0.0)
+        p = context_data.get("price", 0.0)
         prompt = f"""
         現在のドル円は {p:.2f}円です。
         直近のテクニカルとファンダメンタルズから、今後1週間の「予想最高値」と「予想最安値」を予測してください。
@@ -223,16 +282,19 @@ def get_ai_range(api_key, context_data):
         [最高値, 最安値]
         """
         response = model.generate_content(prompt)
-        import re
-        nums = re.findall(r"\d+\.\d+|\d+", response.text)
+        nums = __import__("re").findall(r"\d+\.\d+|\d+", response.text)
         return [float(nums[0]), float(nums[1])] if len(nums) >= 2 else None
-    except: return None
+    except:
+        return None
 
-# --- bak版から復元したポートフォリオ機能 ---
 def get_ai_portfolio(api_key, context_data):
     try:
         model = genai.GenerativeModel(get_active_model(api_key))
-        p, u, s = context_data.get('price', 0.0), context_data.get('us10y', 0.0), context_data.get('sma_diff', 0.0)
+        p, u, s = (
+            context_data.get("price", 0.0),
+            context_data.get("us10y", 0.0),
+            context_data.get("sma_diff", 0.0),
+        )
         prompt = f"""
         あなたはFP1級技能士です。以下のデータに基づき、日本円、米ドル、ユーロ、豪ドル、英ポンドの最適な資産配分（合計100%）を提案してください。
         価格:{p:.2f}円, 金利差:{u:.2f}%, 乖離率:{s:.2f}%
@@ -241,20 +303,5 @@ def get_ai_portfolio(api_key, context_data):
         """
         response = model.generate_content(prompt)
         return response.text
-    except: return "ポートフォリオ分析に失敗しました。"
-
-def get_currency_strength():
-    pairs = {"EUR": "EURUSD=X", "GBP": "GBPUSD=X", "JPY": "JPY=X", "AUD": "AUDUSD=X"}
-    strength_data = pd.DataFrame()
-    for name, sym in pairs.items():
-        try:
-            ticker = yf.Ticker(sym)
-            d = ticker.history(period="1mo")["Close"]
-            d.index = d.index.tz_localize(None)
-            if name == "JPY":
-                strength_data[name] = (1 / d).pct_change().cumsum() * 100
-            else:
-                strength_data[name] = d.pct_change().cumsum() * 100
-        except Exception:
-            pass
-    return strength_data
+    except:
+        return "ポートフォリオ分析に失敗しました。"
