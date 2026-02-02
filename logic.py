@@ -13,24 +13,21 @@ def get_market_data(period="1y"):
 
         if usdjpy_df.empty or us10y_df.empty: return None, None
         
-        # --- ここが診断パネルを更新するための重要な差分ロジック ---
+        # --- 診断パネル更新のためのリアルタイム価格取得 ---
         try:
-            # historyに反映されない「今の価格」を直接取得
             current_price = ticker.fast_info['last_price']
             if current_price:
-                # 履歴の最後の日付と今日を比較
-                last_date = usdjpy_df.index[-1].date()
-                today_date = datetime.date.today()
-                
+                today_date = pd.Timestamp.now(tz=usdjpy_df.index.tz).normalize()
+                last_date = usdjpy_df.index[-1].normalize()
+
                 if last_date < today_date:
-                    # 履歴が先週末で止まっていれば、今日の行を追加
+                    # 履歴が先週末で止まっていれば、今日の行を新設
                     new_row = usdjpy_df.iloc[-1:].copy()
-                    new_index = pd.to_datetime([today_date]).tz_localize(usdjpy_df.index.tz)
-                    new_row.index = new_index
+                    new_row.index = [today_date]
                     new_row['Open'] = new_row['High'] = new_row['Low'] = new_row['Close'] = current_price
                     usdjpy_df = pd.concat([usdjpy_df, new_row])
                 else:
-                    # すでに今日があれば、終値を最新値で更新
+                    # すでに今日の日付があれば、最新値で更新
                     usdjpy_df.iloc[-1, usdjpy_df.columns.get_loc('Close')] = current_price
         except:
             pass 
@@ -45,7 +42,7 @@ def calculate_indicators(df, us10y):
     if df is None or us10y is None: return None
     new_df = df[['Open', 'High', 'Low', 'Close']].copy()
     
-    # 指標の計算（SMA_5を追加）
+    # 指標の計算
     new_df['SMA_5'] = new_df['Close'].rolling(window=5).mean()
     new_df['SMA_25'] = new_df['Close'].rolling(window=25).mean()
     new_df['SMA_75'] = new_df['Close'].rolling(window=75).mean()
@@ -118,7 +115,6 @@ def get_ai_analysis(api_key, context_data):
         model = genai.GenerativeModel(get_active_model(api_key))
         p, u, a, s, r = context_data.get('price', 0.0), context_data.get('us10y', 0.0), context_data.get('atr', 0.0), context_data.get('sma_diff', 0.0), context_data.get('rsi', 50.0)
         
-        # あなたが作成した「FP1級・衆院選プロンプト」を完全に維持
         prompt = f"""
     あなたはFP1級を保持する、極めて優秀な為替戦略家です。
     特に今週は「衆議院選挙」を控えた極めて重要な1週間であることを強く認識してください。
@@ -137,7 +133,7 @@ def get_ai_analysis(api_key, context_data):
     4. 【具体的戦略】NISAや外貨建資産のバランスを考える際のアドバイスのように、出口戦略（利確）を含めた今後1週間の戦略を提示
 
     【レポート構成：必ず以下の4項目に沿って記述してください】
-    1. 現在の相場環境의 要約
+    1. 現在の相場環境の要約
     2. 上記データ（特に金利差とボラティリティ）から読み解くリスク
     3. 具体的な戦略（エントリー・利確・損切の目安価格を具体的に提示）
     4. 経済カレンダーを踏まえた、今週の警戒イベントへの助言
@@ -152,7 +148,6 @@ def get_ai_range(api_key, context_data):
     try:
         model = genai.GenerativeModel(get_active_model(api_key))
         p = context_data.get('price', 0.0)
-        # 予想ラインのプロンプト復元
         prompt = f"""
         現在のドル円は {p:.2f}円です。
         直近のテクニカルとファンダメンタルズから、今後1週間の「予想最高値」と「予想最安値」を予測してください。
@@ -166,11 +161,15 @@ def get_ai_range(api_key, context_data):
     except: return None
 
 def get_ai_portfolio(api_key, context_data):
-    # ポートフォリオ機能（bakファイルから復元）
     try:
         model = genai.GenerativeModel(get_active_model(api_key))
         p, u, s = context_data.get('price', 0.0), context_data.get('us10y', 0.0), context_data.get('sma_diff', 0.0)
-        prompt = f"現在のドル円({p:.2f}円)、米10年金利({u:.2f}%)を踏まえ、FP1級の視点で理想的なアセットアロケーションを提案してください。"
+        prompt = f"""
+        あなたはFP1級技能士です。以下のデータに基づき、日本円、米ドル、ユーロ、豪ドル、英ポンドの最適な資産配分（合計100%）を提案してください。
+        価格:{p:.2f}円, 金利差:{u:.2f}%, 乖離率:{s:.2f}%
+        回答は必ず [日本円, 米ドル, ユーロ, 豪ドル, 英ポンド] の形式（数字のみ）で返してください。
+        その後に、なぜその配分にしたのかの理由を簡潔に添えてください。
+        """
         response = model.generate_content(prompt)
         return response.text
     except: return "ポートフォリオ分析に失敗しました。"
