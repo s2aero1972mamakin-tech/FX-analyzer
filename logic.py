@@ -1,15 +1,39 @@
 import yfinance as yf
 import pandas as pd
 import google.generativeai as genai
-import datetime
 import pytz
 import requests
+import time
+from datetime import datetime
 
-BUILD_ID = "2026-02-02_02"
+BUILD_ID = "2026-02-02_03"
 TOKYO = pytz.timezone("Asia/Tokyo")
 
 # 取得失敗時の理由をここに残す（main.pyで表示できる）
 LAST_FETCH_ERROR = ""
+
+# -----------------------------
+# 超軽量TTLキャッシュ（Streamlit再実行対策）
+# -----------------------------
+# key -> (expire_epoch, value)
+_TTL_CACHE = {}
+
+
+def _cache_get(key):
+    try:
+        exp, val = _TTL_CACHE.get(key, (0, None))
+        if time.time() <= exp:
+            return val
+    except Exception:
+        pass
+    return None
+
+
+def _cache_set(key, val, ttl_sec):
+    try:
+        _TTL_CACHE[key] = (time.time() + float(ttl_sec), val)
+    except Exception:
+        pass
 
 
 def _set_err(msg: str):
@@ -28,28 +52,60 @@ def _to_jst(ts):
         return ts
 
 
+def _requests_get_json(url, params=None, timeout=15):
+    """
+    Yahoo側が弾きやすいのでUAを付ける
+    """
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        )
+    }
+    r = requests.get(url, params=params, headers=headers, timeout=timeout)
+    return r, r.json() if r.status_code == 200 else None
+
+
 # =====================================================
-# Yahoo Chart API 直叩きフォールバック
+# Yahoo Chart API 直叩きフォールバック（TTLキャッシュ付き）
 # =====================================================
-def _yahoo_chart(symbol: str, rng: str = "1y", interval: str = "1d"):
+def _yahoo_chart(symbol: str, rng: str = "1y", interval: str = "1d", ttl_sec: int = 900):
     """
     Yahoo Finance unofficial chart API.
     symbol: "JPY=X" or "^TNX"
     rng: "1d","5d","1mo","3mo","6mo","1y","2y","5y","10y","max"
     interval: "1m","2m","5m","15m","30m","60m","90m","1d","1wk","1mo"
+
+    ttl_sec:
+      - 日足: 900秒（15分）
+      - 1分足: 60秒 など、呼ぶ側で調整
     """
+    cache_key = f"yahoo_chart::{symbol}::{rng}::{interval}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     try:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
         params = {"range": rng, "interval": interval}
-        r = requests.get(url, params=params, timeout=15)
-        if r.status_code != 200:
-            _set_err(f"Yahoo chart HTTP {r.status_code}: {r.text[:120]}")
+        r, j = _requests_get_json(url, params=params, timeout=15)
+
+        if r.status_code != 200 or j is None:
+            # 429などのとき
+            preview = ""
+            try:
+                preview = (r.text or "")[:120]
+            except Exception:
+                preview = ""
+            _set_err(f"Yahoo chart HTTP {r.status_code}: {preview}")
+            _cache_set(cache_key, None, ttl_sec=30)  # 失敗も短時間キャッシュ
             return None
 
-        j = r.json()
         res = j.get("chart", {}).get("result", None)
         if not res:
             _set_err(f"Yahoo chart no result: {j.get('chart', {}).get('error')}")
+            _cache_set(cache_key, None, ttl_sec=30)
             return None
 
         res0 = res[0]
@@ -57,6 +113,7 @@ def _yahoo_chart(symbol: str, rng: str = "1y", interval: str = "1d"):
         quote = res0.get("indicators", {}).get("quote", [{}])[0]
         if not ts or not quote:
             _set_err("Yahoo chart missing timestamp/quote")
+            _cache_set(cache_key, None, ttl_sec=30)
             return None
 
         idx = pd.to_datetime(ts, unit="s", utc=True).tz_convert(TOKYO).tz_localize(None)
@@ -71,26 +128,39 @@ def _yahoo_chart(symbol: str, rng: str = "1y", interval: str = "1d"):
             },
             index=idx,
         )
-        # 欠損が混ざるので掃除
+
         df = df.dropna(subset=["Close"])
         if df.empty:
             _set_err("Yahoo chart df empty after dropna")
+            _cache_set(cache_key, None, ttl_sec=30)
             return None
+
+        _cache_set(cache_key, df, ttl_sec=ttl_sec)
         return df
+
     except Exception as e:
         _set_err(f"Yahoo chart exception: {e}")
+        _cache_set(cache_key, None, ttl_sec=30)
         return None
 
 
 # =====================================================
-# 最新為替レート（3段 + Yahoo直叩き）
+# 最新為替レート（ボタン押下でのみ呼ぶ想定／TTLキャッシュ付き）
 # =====================================================
 def get_latest_quote(symbol="JPY=X"):
     """
     最新価格と時刻(JST)を返す。
-    yfinance全滅時でも Yahoo chart API で返す。
+    - 基本は Yahoo chart 1m（TTL 60秒）
+    - 429なら None/None（main側で日足終値にフォールバック）
     """
-    # 1) yfinance fast_info
+    # 1) Yahoo chart API (1d, 1m)
+    df = _yahoo_chart(symbol, rng="1d", interval="1m", ttl_sec=60)
+    if df is not None and not df.empty:
+        price = float(df["Close"].iloc[-1])
+        qt = pd.Timestamp(df.index[-1]).tz_localize(TOKYO)
+        return price, _to_jst(qt)
+
+    # 2) yfinance fast_info（念のため）
     try:
         t = yf.Ticker(symbol)
         fi = t.fast_info or {}
@@ -102,30 +172,7 @@ def get_latest_quote(symbol="JPY=X"):
     except Exception:
         pass
 
-    # 2) yfinance intraday
-    try:
-        intraday = yf.download(symbol, period="1d", interval="1m", progress=False, threads=False)
-        if intraday is not None and not intraday.empty:
-            close = intraday["Close"].dropna()
-            if len(close) > 0:
-                price = float(close.iloc[-1])
-                qt = close.index[-1]
-                qt = pd.Timestamp(qt)
-                if getattr(qt, "tzinfo", None) is None:
-                    qt = qt.tz_localize("UTC")
-                return price, _to_jst(qt)
-    except Exception:
-        pass
-
-    # 3) Yahoo chart API (1d, 1m)
-    df = _yahoo_chart(symbol, rng="1d", interval="1m")
-    if df is not None and not df.empty:
-        price = float(df["Close"].iloc[-1])
-        # df.index は tz無しなので JST として付与
-        qt = pd.Timestamp(df.index[-1]).tz_localize(TOKYO)
-        return price, _to_jst(qt)
-
-    # 4) 為替APIフォールバック（USD→JPY）
+    # 3) 為替APIフォールバック（USD→JPY）
     try:
         r = requests.get("https://open.er-api.com/v6/latest/USD", timeout=10)
         if r.status_code == 200:
@@ -139,7 +186,7 @@ def get_latest_quote(symbol="JPY=X"):
 
 
 # =====================================================
-# 市場データ取得（yfinance→Yahoo chartへフォールバック）
+# 市場データ取得（まずyfinance、ダメならYahoo chart）
 # =====================================================
 def get_market_data(period="1y"):
     """
@@ -149,7 +196,7 @@ def get_market_data(period="1y"):
     usdjpy_df = None
     us10y_df = None
 
-    # 1) yfinance history
+    # 1) yfinance history（Cloud側で通ることが多い）
     try:
         usdjpy_df = yf.Ticker("JPY=X").history(period=period)
         if usdjpy_df is not None and not usdjpy_df.empty:
@@ -166,7 +213,7 @@ def get_market_data(period="1y"):
     except Exception:
         us10y_df = None
 
-    # 2) yfinance download fallback
+    # 2) yfinance download fallback（MultiIndexの可能性あり）
     if usdjpy_df is None or getattr(usdjpy_df, "empty", True):
         try:
             usdjpy_df = yf.download("JPY=X", period=period, interval="1d", progress=False, threads=False)
@@ -179,12 +226,12 @@ def get_market_data(period="1y"):
         except Exception:
             us10y_df = None
 
-    # 3) Yahoo chart API fallback（ここが本命）
+    # 3) Yahoo chart fallback（日足はTTL 15分）
     if usdjpy_df is None or getattr(usdjpy_df, "empty", True):
-        usdjpy_df = _yahoo_chart("JPY=X", rng=period, interval="1d")
+        usdjpy_df = _yahoo_chart("JPY=X", rng=period, interval="1d", ttl_sec=900)
 
     if us10y_df is None or getattr(us10y_df, "empty", True):
-        us10y_df = _yahoo_chart("^TNX", rng=period, interval="1d")
+        us10y_df = _yahoo_chart("^TNX", rng=period, interval="1d", ttl_sec=900)
 
     # usdjpyが取れないなら終了
     if usdjpy_df is None or getattr(usdjpy_df, "empty", True):
@@ -192,33 +239,22 @@ def get_market_data(period="1y"):
             _set_err("All sources failed for JPY=X")
         return None, None
 
-    # 最新クオートをCloseに反映（取れた場合のみ）
-    q_price, q_time = get_latest_quote("JPY=X")
-    if q_price is not None and "Close" in usdjpy_df.columns:
-        try:
-            usdjpy_df.iloc[-1, usdjpy_df.columns.get_loc("Close")] = float(q_price)
-        except Exception:
-            pass
-
     return usdjpy_df, us10y_df
 
 
 # =====================================================
-# 指標計算（US10Yが無くても動く）★完全修復版
+# 指標計算（US10Yが無くても動く）完全安定版
 # =====================================================
 def calculate_indicators(df, us10y):
     """
-    ★修正点:
     - yfinance/download が MultiIndex columns を返す場合に備えて平坦化
     - Close が DataFrame になっても Series に正規化
     - US10Y が無くても動作
-    - try未完(SyntaxError)を完全修復
-    - return new_df を必ず返す
     """
     if df is None or getattr(df, "empty", True):
         return None
 
-    # --- 0) MultiIndex columns を平坦化 ---
+    # MultiIndex columns を平坦化
     try:
         if isinstance(df.columns, pd.MultiIndex):
             df = df.copy()
@@ -226,7 +262,6 @@ def calculate_indicators(df, us10y):
     except Exception:
         pass
 
-    # 必要列チェック
     need_cols = ["Open", "High", "Low", "Close"]
     for c in need_cols:
         if c not in df.columns:
@@ -234,14 +269,13 @@ def calculate_indicators(df, us10y):
 
     new_df = df[need_cols].copy()
 
-    # CloseがDataFrameになってしまうケースの最終保険
-    # （MultiIndexで取り切れないケース吸収）
-    for c in ["Open", "High", "Low", "Close"]:
+    # Close等がDataFrameになってしまう最終保険
+    for c in need_cols:
         if isinstance(new_df[c], pd.DataFrame):
             new_df[c] = new_df[c].iloc[:, 0]
 
-    # 数値化（文字列混入対策）
-    for c in ["Open", "High", "Low", "Close"]:
+    # 数値化
+    for c in need_cols:
         new_df[c] = pd.to_numeric(new_df[c], errors="coerce")
 
     new_df = new_df.dropna(subset=["Close"])
@@ -273,7 +307,7 @@ def calculate_indicators(df, us10y):
     # SMA乖離率
     new_df["SMA_DIFF"] = (new_df["Close"] - new_df["SMA_25"]) / new_df["SMA_25"] * 100
 
-    # US10Y（無ければ NaN）★ここが壊れていたので完全修復
+    # US10Y（無ければ NaN）
     if us10y is not None and (not getattr(us10y, "empty", True)):
         try:
             if isinstance(us10y.columns, pd.MultiIndex):
@@ -297,15 +331,15 @@ def calculate_indicators(df, us10y):
 
 
 # =====================================================
-# 通貨強弱
+# 通貨強弱（1ヶ月）
 # =====================================================
 def get_currency_strength():
     pairs = {"EUR": "EURUSD=X", "GBP": "GBPUSD=X", "JPY": "JPY=X", "AUD": "AUDUSD=X"}
     strength_data = pd.DataFrame()
     for name, sym in pairs.items():
         try:
-            # yfinanceが死んでる環境向けに Yahoo chart API も使う
             d = None
+            # yfinance優先
             try:
                 t = yf.Ticker(sym).history(period="1mo")
                 if t is not None and not t.empty:
@@ -313,8 +347,9 @@ def get_currency_strength():
             except Exception:
                 d = None
 
+            # Yahoo fallback（TTL 15分）
             if d is None or len(d) == 0:
-                tmp = _yahoo_chart(sym, rng="1mo", interval="1d")
+                tmp = _yahoo_chart(sym, rng="1mo", interval="1d", ttl_sec=900)
                 if tmp is not None and not tmp.empty:
                     d = tmp["Close"]
 
@@ -364,7 +399,7 @@ def judge_condition(df):
 
 
 # =====================================================
-# --- AI分析群（あなたのコードを完全保持） ---
+# --- 5. AI分析（FP1級・衆院選プロンプト完全版） ---
 # =====================================================
 def get_active_model(api_key):
     genai.configure(api_key=api_key)
@@ -388,7 +423,6 @@ def get_ai_analysis(api_key, context_data):
             context_data.get("rsi", 50.0),
         )
 
-        # あなたの渾身のプロンプトを完全復元（省略なし）
         prompt = f"""
     あなたはFP1級を保持する、極めて優秀な為替戦略家です。
     特に今週は「衆議院選挙」を控えた極めて重要な1週間であることを強く認識してください。
