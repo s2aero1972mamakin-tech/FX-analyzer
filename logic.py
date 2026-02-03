@@ -283,7 +283,8 @@ def calculate_indicators(df, us10y):
 # 通貨強弱
 # =====================================================
 def get_currency_strength():
-    pairs = {"EUR": "EURUSD=X", "GBP": "GBPUSD=X", "JPY": "JPY=X", "AUD": "AUDUSD=X"}
+    pairs = {"日本円": "JPY=X", "ユーロ": "EURUSD=X", "英ポンド": "GBPUSD=X", "豪ドル": "AUDUSD=X"}
+    strength_data = pd.DataFrame()
     strength_data = pd.DataFrame()
 
     for name, sym in pairs.items():
@@ -438,3 +439,4 @@ def get_ai_range(api_key, context_data):
         return [float(nums[0]), float(nums[1])] if len(nums) >= 2 else None
     except:
         return None
+
