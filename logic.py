@@ -52,6 +52,7 @@ if df is None or df.empty:
     st.error("データが取得できませんでした。")
     st.stop()
 
+# 軸同期のためにインデックスを正規化
 df.index = pd.to_datetime(df.index)
 
 # AI予想ライン反映
@@ -115,8 +116,15 @@ if diag is not None:
             st.warning("⚠️ **【警戒】ボラティリティ上昇中または重要局面です**")
     except Exception: pass
 
-# --- 3. メインチャート ---
-fig_main = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08, subplot_titles=("USD/JPY & AI予想", "米国債10年物利回り"), row_heights=[0.7, 0.3])
+# --- 3. メインチャート（45日同期・完全修正） ---
+fig_main = make_subplots(
+    rows=2, cols=1, 
+    shared_xaxes=True, 
+    vertical_spacing=0.08, 
+    subplot_titles=("USD/JPY & AI予想", "米国債10年物利回り"),
+    row_heights=[0.7, 0.3]
+)
+
 fig_main.add_trace(go.Candlestick(x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name="価格"), row=1, col=1)
 fig_main.add_trace(go.Scatter(x=df.index, y=df["SMA_5"], name="5日線", line=dict(color="#00ff00", width=1.5)), row=1, col=1)
 fig_main.add_trace(go.Scatter(x=df.index, y=df["SMA_25"], name="25日線", line=dict(color="orange", width=2)), row=1, col=1)
@@ -158,7 +166,7 @@ if strength is not None and not strength.empty:
     fig_str.update_layout(height=400, template="plotly_dark", showlegend=True, margin=dict(r=240))
     st.plotly_chart(fig_str, use_container_width=True)
 
-# --- 6. AI詳細レポート ---
+# --- 6. AI詳細レポート & ポートフォリオ ---
 st.divider()
 col_rep, col_port = st.columns(2)
 if col_rep.button("✨ Gemini AI 詳細レポート"):
@@ -187,7 +195,7 @@ if col_port.button("💰 最適ポートフォリオ提示"):
             st.markdown(logic.get_ai_portfolio(api_key, {}))
     else: st.warning("Gemini API Key を入力してください。")
 
-# --- 7. ロボ的注文戦略セクション（修正点） ---
+# --- 7. ロボ的注文戦略セクション（連動版） ---
 st.divider()
 st.subheader("🤖 AIトレード命令書（診断連動型）")
 if st.button("📝 診断に基づいた注文価格を算出"):
@@ -195,15 +203,14 @@ if st.button("📝 診断に基づいた注文価格を算出"):
         if not st.session_state.last_ai_report:
             st.warning("先に『✨ Gemini AI 詳細レポート』を実行してください。")
         else:
-            with st.spinner("診断内容を読み込み、注文票を作成中..."):
+            with st.spinner("診断連動中..."):
                 last_row = df.iloc[-1]
-                # 【修正：パネル診断の結果を context に含める】
                 context = {
                     "price": float(last_row["Close"]),
                     "atr": float(last_row["ATR"]),
                     "last_report": st.session_state.last_ai_report,
-                    "panel_short": diag['short']['status'] if diag else "不明", # ← 追加
-                    "panel_mid": diag['mid']['status'] if diag else "不明"      # ← 追加
+                    "panel_short": diag['short']['status'] if diag else "不明",
+                    "panel_mid": diag['mid']['status'] if diag else "不明"
                 }
                 strategy = logic.get_ai_order_strategy(api_key, context)
                 st.info("AI診断およびパネル診断との整合性を確認しました。")
