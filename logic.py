@@ -313,7 +313,6 @@ def get_currency_strength():
             pass
 
     if not strength_data.empty:
-        # 他のAIが指摘していた点を考慮しつつ、米ドル（USD）を追加
         strength_data["米ドル"] = strength_data.mean(axis=1) * -1
         return strength_data.ffill().dropna()
 
@@ -375,16 +374,9 @@ def get_ai_analysis(api_key, context_data):
             context_data.get("sma_diff", 0.0),
             context_data.get("rsi", 50.0),
         )
-        ps = context_data.get("panel_short", "不明")
-        pm = context_data.get("panel_mid", "不明")
 
         prompt = f"""
 あなたはFP1級を保持する、極めて優秀な為替戦略家です。
-現在、システムは以下のテクニカル診断を下しています。
-- 短期診断: {ps}
-- 中期診断: {pm}
-
-この診断結果を無視せず、ファンダメンタルズ（金利差、衆院選リスク等）と統合して、最終的な詳細レポートを作成してください。
 特に今週は「衆議院選挙」を控えた極めて重要な1週間であることを強く認識してください。
 
 【市場データ】
@@ -412,6 +404,9 @@ def get_ai_analysis(api_key, context_data):
 回答は親しみやすくも、プロの厳格さを感じる日本語でお願いします。
         """
 
+        response = model.generate_content(prompt)
+        return response.text
+
     except Exception as e:
         return f"AI分析エラー: {str(e)}"
 
@@ -421,7 +416,7 @@ def get_ai_portfolio(api_key, context_data):
         model = genai.GenerativeModel(get_active_model(api_key))
         prompt = f"""
         あなたはFP1級技能士です。
-        日本円、米ドル、ユーロ、豪ドル、英ポンドの
+        日本円, 米ドル, ユーロ, 豪ドル, 英ポンドの
         最適配分（合計100%）を
         [日本円, 米ドル, ユーロ, 豪ドル, 英ポンド]
         形式で提示してください。
@@ -432,7 +427,7 @@ def get_ai_portfolio(api_key, context_data):
     except Exception:
         return "ポートフォリオ分析に失敗しました。"
 
-# main.pyで使用されているため維持
+
 def get_ai_range(api_key, context_data):
     try:
         model = genai.GenerativeModel(get_active_model(api_key))
@@ -446,49 +441,44 @@ def get_ai_range(api_key, context_data):
         return None
 
 # =====================================================
-# ✅ 改修版: 全診断データ連動型・ロボ的注文戦略生成
+# ✅ 新規追加: ロボ的注文戦略生成（全診断連動型）
 # =====================================================
 def get_ai_order_strategy(api_key, context_data):
     try:
         model = genai.GenerativeModel(get_active_model(api_key))
-        
-        # 基本データの抽出
         p = context_data.get('price', 0.0)
         a = context_data.get('atr', 0.0)
-        
-        # ✅ 連動用データの抽出（main.pyから渡されるパネル情報とレポート）
-        ps = context_data.get("panel_short", "不明")  # 上部パネル：短期
-        pm = context_data.get("panel_mid", "不明")    # 上部パネル：中期
-        report = context_data.get('last_report', "なし") # 詳細レポート内容
+        report = context_data.get('last_report', "なし")
+        ps = context_data.get("panel_short", "不明")
+        pm = context_data.get("panel_mid", "不明")
         
         prompt = f"""
 あなたはFX投資ロボットの執行エンジンです。
-単なる数値計算だけでなく、上部パネルの診断結果と、あなた自身が作成した詳細レポートを「完全遵守」して注文票を作成してください。
+上部パネルの診断と、あなた自身が作成したレポートを完全遵守し、具体的な「注文票」を1つ作成してください。
 
-【1. 現在の市場ステータス（上部パネル連動）】
-- 短期診断（1週間）: {ps}
-- 中期診断（1ヶ月）: {pm}
+【1. 現在の市場診断（上部パネル連動）】
+- 短期診断: {ps}
+- 中期診断: {pm}
 
-【2. あなたの直前の詳細レポート（思考プロセス）】
+【2. あなたの詳細分析レポート（思考プロセス）】
 {report}
 
 【3. 数値データ】
 - 現在価格: {p:.3f} 円
 - ATR(ボラティリティ): {a:.3f} 円
 
-【タスク】
-上記の「診断の方向性」に100%合致する具体的な注文（指値, IFD, OCO, IFDOCO等）を作成してください。
-もし診断が「勢い鈍化・調整」なら、現在の成行買いは避け、ATRを考慮した深い位置での指値買い、あるいは戻り売りを提案してください。
+【命令】
+診断結果と1ミリも矛盾しない注文票（指値, IFD, OCO, IFDOCOのいずれか）を提示してください。
+診断が「調整」や「静観」なら、現在の成行ではなく、有利な位置での指値待機を提案してください。
 
-【出力フォーマット】
+出力フォーマット：
 🤖 **ロボ指示：[注文方式] を推奨（診断連動済み）**
 - **ENTRY**: [価格] 円
 - **LIMIT (利確)**: [価格] 円
 - **STOP (損切)**: [価格] 円
-- **診断との整合性**: [なぜこの価格か、上部パネルの「{ps}/{pm}」という結果をどう反映したか説明してください]
+- **診断との整合性**: [なぜこの価格か、パネル診断結果「{ps}/{pm}」をどう反映したか説明]
 """
         response = model.generate_content(prompt)
         return response.text
     except Exception as e:
         return f"注文戦略生成エラー: {str(e)}"
-
