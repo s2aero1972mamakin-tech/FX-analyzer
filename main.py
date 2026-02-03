@@ -149,8 +149,9 @@ if api_key and st.sidebar.button("📈 AI予想ライン反映"):
             name=f"予想最低:{ai_range[1]:.2f}", line=dict(color="green", dash="dash")
         ), row=1, col=1)
 
+# 米10年債の凡例修正（名前を明記し showlegend を強制）
 fig_main.add_trace(go.Scatter(
-    x=df.index, y=df["US10Y"], name="米10年債", line=dict(color="cyan")
+    x=df.index, y=df["US10Y"], name="米10年債", line=dict(color="cyan"), showlegend=True
 ), row=2, col=1)
 
 fig_main.update_xaxes(range=[start_view, last_date], row=1, col=1)
@@ -164,33 +165,40 @@ fig_main.update_layout(
 )
 st.plotly_chart(fig_main, use_container_width=True)
 
-# --- 4. RSI（配色変更：上・緑 / 下・赤） ---
-st.subheader(f"📈 RSI (現在: {df['RSI'].iloc[-1]:.1f})")
+# --- 4. RSI（配色変更：上・緑、下・赤） ---
+current_rsi = float(df["RSI"].iloc[-1])
+st.subheader(f"📈 RSI（現在の過熱感: {current_rsi:.2f}）")
 fig_rsi = go.Figure()
-fig_rsi.add_trace(go.Scatter(x=df.index, y=df["RSI"], name="RSI(14)", line=dict(color="#ff5722")))
-# 指示通り配色変更（上：緑、下：赤）
-fig_rsi.add_hline(y=70, line=dict(color="#00ff00", dash="dash"), annotation_text="70:買われすぎ(緑)")
+fig_rsi.add_trace(go.Scatter(x=df.index, y=df["RSI"], name=f"RSI(14): {current_rsi:.1f}", line=dict(color="#ff5722")))
+# 修正：上（70）を緑、下（30）を赤に変更
+fig_rsi.add_hline(y=70, line=dict(color="#00ff00", dash="dash"), annotation_text="70：買われすぎ(緑)")
 fig_rsi.add_hline(y=30, line=dict(color="#ff0000", dash="dash"), annotation_text="30:売られすぎ(赤)")
 fig_rsi.update_xaxes(range=[start_view, last_date])
-fig_rsi.update_layout(height=250, template="plotly_dark", yaxis=dict(range=[0, 100]), showlegend=True,
-                       legend=dict(x=1.02, y=1, xanchor="left", yanchor="top"), margin=dict(r=240))
+fig_rsi.update_layout(height=250, template="plotly_dark", yaxis=dict(range=[0, 100]), showlegend=True, margin=dict(r=240))
 st.plotly_chart(fig_rsi, use_container_width=True)
 
-# --- 5. 通貨強弱（特定の色指定：日本円=赤、ユーロ=紫など） ---
+# --- 5. 通貨強弱（配色指定：日本円=赤、ユーロ=紫、英ポンド=薄灰色） ---
 if strength is not None and not strength.empty:
-    st.subheader("📊 通貨強弱（1ヶ月推移）")
+    st.subheader("📊 通貨強弱（1ヶ月）")
     fig_str = go.Figure()
-    # 色指定マッピング
-    color_map = {"日本円": "#ff0000", "豪ドル": "#00ff00", "ユーロ": "#a020f0", "英ポンド": "#ee0fd0", "米ドル": "#ede218"}
+    # 色マッピング：日本円=赤、豪ドル=緑、ユーロ=紫、英ポンド=薄灰色(背景で見えるように)、米ドル=金
+    color_map = {
+        "日本円": "#ff0000", 
+        "豪ドル": "#00ff00", 
+        "ユーロ": "#a020f0", 
+        "英ポンド": "#c0c0c0", # 白ではなくシルバー
+        "米ドル": "#ffd700"
+    }
     for col in strength.columns:
         fig_str.add_trace(go.Scatter(x=strength.index, y=strength[col], name=col, line=dict(color=color_map.get(col))))
-    fig_str.update_layout(height=400, template="plotly_dark", showlegend=True,
-                           legend=dict(x=1.02, y=1, xanchor="left", yanchor="top"), margin=dict(r=240))
+    fig_str.update_layout(height=400, template="plotly_dark", showlegend=True, margin=dict(r=240))
     st.plotly_chart(fig_str, use_container_width=True)
 
-# --- 6. AI詳細レポート ---
+# --- 6. AI詳細レポート & ポートフォリオ ---
 st.divider()
-if st.button("✨ Gemini AI 詳細レポート"):
+col_rep, col_port = st.columns(2)
+
+if col_rep.button("✨ Gemini AI 詳細レポート"):
     if api_key:
         with st.spinner("分析中..."):
             last_row = df.iloc[-1]
@@ -211,5 +219,9 @@ if st.button("✨ Gemini AI 詳細レポート"):
     else:
         st.warning("Gemini API Key を入力してください。")
 
-
-
+if col_port.button("💰 最適ポートフォリオ提示"):
+    if api_key:
+        with st.spinner("計算中..."):
+            st.markdown(logic.get_ai_portfolio(api_key, {}))
+    else:
+        st.warning("Gemini API Key を入力してください。")
