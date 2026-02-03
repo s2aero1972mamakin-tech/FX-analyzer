@@ -1,18 +1,10 @@
-
 import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import pandas as pd
 from datetime import datetime, timedelta
 import pytz
-
-import logic  # ← ここでimportできている前提
-
-# ✅ BUILD_ID が無くても落ちない
-st.caption(f"BUILD_ID: {getattr(logic, 'BUILD_ID', 'MISSING_BUILD_ID')}")
-
-# ✅ どのlogicが読まれているか表示（原因特定用）
-st.caption(f"logic file: {getattr(logic, '__file__', 'UNKNOWN')}")
+import logic  # ← logic.pyが必要
 
 # --- ページ設定 ---
 st.set_page_config(layout="wide", page_title="AI-FX Analyzer")
@@ -46,30 +38,18 @@ usdjpy_raw, us10y_raw = logic.get_market_data()
 df = logic.calculate_indicators(usdjpy_raw, us10y_raw)
 strength = logic.get_currency_strength()
 
-# デバッグ表示（診断）
-st.caption(f"LAST_FETCH_ERROR: {getattr(logic, 'LAST_FETCH_ERROR', '')}")
-st.caption(f"usdjpy_raw: {None if usdjpy_raw is None else usdjpy_raw.shape}")
-st.caption(f"us10y_raw : {None if us10y_raw is None else us10y_raw.shape}")
-
 # QUOTEが取れない場合、日足終値で必ず埋める（表示が消えない）
 if (q_price is None) and (df is not None) and (not df.empty):
     q_price = float(df["Close"].iloc[-1])
     q_time = pd.Timestamp(df.index[-1]).tz_localize("Asia/Tokyo")
 
-st.caption(
-    "QUOTE(最新取得): price={} / time(JST)={}".format(
-        q_price,
-        q_time.strftime("%Y-%m-%d %H:%M:%S %Z") if q_time else None
-    )
-)
-
 if df is None or df.empty:
-    st.error("データが取得できませんでした（dfが空）")
+    st.error("データが取得できませんでした。")
     st.stop()
 
 df.index = pd.to_datetime(df.index)
 
-# diag生成
+# 診断(diag)生成
 try:
     diag = logic.judge_condition(df)
 except Exception as e:
@@ -83,15 +63,15 @@ df_view = df.loc[df.index >= start_view]
 y_min_view = float(df_view["Low"].min())
 y_max_view = float(df_view["High"].max())
 
-# 最新レートを診断エリアに明示
+# 最新レート表示（リッチ版）
 if q_price is not None:
     st.markdown(
-        f"### 💱 最新USD/JPY: **{float(q_price):.3f} 円**  "
+        f"### 💱 最新USD/JPY: **{float(q_price):.3f} 円** "
         f"<span style='color:#888; font-size:0.9em'>(更新: {(q_time.strftime('%Y-%m-%d %H:%M JST') if q_time else '時刻不明')})</span>",
         unsafe_allow_html=True,
     )
 
-# --- 1. 診断パネル ---
+# --- 1. 診断パネル (HTML装飾完全再現) ---
 if diag is not None:
     col_short, col_mid = st.columns(2)
 
@@ -114,7 +94,7 @@ if diag is not None:
             </div>
         """, unsafe_allow_html=True)
 else:
-    st.warning("診断データ（diag）が作れませんでした。")
+    st.warning("診断データ（diag）が作成できませんでした。")
 
 # --- 2. 経済アラート ---
 if diag is not None:
@@ -125,7 +105,7 @@ if diag is not None:
     except Exception:
         pass
 
-# --- 3. メインチャート（凡例は右側固定） ---
+# --- 3. メインチャート ---
 fig_main = make_subplots(
     rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1,
     subplot_titles=("USD/JPY & AI予想", "米国債10年物利回り")
@@ -178,11 +158,8 @@ fig_main.update_xaxes(range=[start_view, last_date], showticklabels=True, row=2,
 fig_main.update_yaxes(range=[y_min_view * 0.998, y_max_view * 1.002], autorange=False, row=1, col=1)
 
 fig_main.update_layout(
-    height=650,
-    template="plotly_dark",
-    xaxis_rangeslider_visible=False,
-    showlegend=True,
-    legend=dict(x=1.02, y=1.0, xanchor="left", yanchor="top"),
+    height=650, template="plotly_dark", xaxis_rangeslider_visible=False,
+    showlegend=True, legend=dict(x=1.02, y=1.0, xanchor="left", yanchor="top"),
     margin=dict(r=240)
 )
 st.plotly_chart(fig_main, use_container_width=True)
