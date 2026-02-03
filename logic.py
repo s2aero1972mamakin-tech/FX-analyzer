@@ -405,9 +405,6 @@ def get_ai_analysis(api_key, context_data):
 回答は親しみやすくも、プロの厳格さを感じる日本語でお願いします。
         """
 
-        response = model.generate_content(prompt)
-        return f"✅ 成功\n\n{response.text}"
-
     except Exception as e:
         return f"AI分析エラー: {str(e)}"
 
@@ -440,3 +437,41 @@ def get_ai_range(api_key, context_data):
         return [float(nums[0]), float(nums[1])] if len(nums) >= 2 else None
     except:
         return None
+
+# =====================================================
+# ✅ 新規追加: ロボ的注文戦略生成
+# =====================================================
+def get_ai_order_strategy(api_key, context_data):
+    try:
+        model = genai.GenerativeModel(get_active_model(api_key))
+        p = context_data.get('price', 0.0)
+        a = context_data.get('atr', 0.0)
+        r = context_data.get('rsi', 50.0)
+        s = context_data.get('sma25', 0.0)
+        
+        prompt = f"""
+あなたはFX投資ロボットの意思決定エンジンです。
+以下のデータに基づき、最も利益期待値の高い「具体的な注文票」を作成してください。
+
+【現在のデータ】
+- 現在価格: {p:.3f} 円
+- SMA25(25日線): {s:.3f} 円
+- ATR(ボラティリティ): {a:.3f} 円
+- RSI: {r:.1f}
+
+【出力ルール】
+1. 推奨注文方式を1つ選択（指値, IFD, OCO, IFDOCO）
+2. エントリー価格、利確価格、損切価格をすべて「円」で明示
+3. なぜその価格設定にしたのか、ATRやSMA25を引用して短く論理的に説明
+
+【出力フォーマット例】
+🤖 **ロボ指示：IFDOCO注文を推奨**
+- **ENTRY**: 150.120 円
+- **LIMIT (利確)**: 152.000 円
+- **STOP (損切)**: 149.500 円
+- **根拠**: 現在はSMA25を上抜けており、ATR1.5倍の幅を損切に設定。RSI過熱前までの上昇を狙います。
+"""
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        return f"注文戦略生成エラー: {str(e)}"
