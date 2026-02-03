@@ -169,8 +169,8 @@ current_rsi = float(df["RSI"].iloc[-1])
 st.subheader(f"📈 RSI（現在の過熱感: {current_rsi:.2f}）")
 fig_rsi = go.Figure()
 fig_rsi.add_trace(go.Scatter(x=df.index, y=df["RSI"], name=f"RSI(14): {current_rsi:.1f}", line=dict(color="#ff5722")))
-fig_rsi.add_hline(y=70, line=dict(color="red", dash="dash"), annotation_text="買われすぎ")
-fig_rsi.add_hline(y=30, line=dict(color="cyan", dash="dash"), annotation_text="売られすぎ")
+fig_rsi.add_hline(y=70, line=dict(color="red", dash="dash"), annotation_text="70：買われすぎ")
+fig_rsi.add_hline(y=30, line=dict(color="cyan", dash="dash"), annotation_text="30:売られすぎ")
 fig_rsi.update_xaxes(range=[start_view, last_date])
 fig_rsi.update_layout(height=250, template="plotly_dark", yaxis=dict(range=[0, 100]), showlegend=True, margin=dict(r=240))
 st.plotly_chart(fig_rsi, use_container_width=True)
@@ -206,3 +206,4 @@ if st.button("✨ Gemini AI 詳細レポート"):
             st.markdown(logic.get_ai_analysis(api_key, context))
     else:
         st.warning("Gemini API Key を入力してください。")
+
