@@ -10,6 +10,12 @@ import logic  # ← logic.pyが必要
 st.set_page_config(layout="wide", page_title="AI-FX Analyzer")
 st.title("🤖 AI連携型 USD/JPY 戦略分析ツール")
 
+# --- 修正点1: 状態保持の初期化 (最上部で実行) ---
+if "ai_range" not in st.session_state:
+    st.session_state.ai_range = None
+if "quote" not in st.session_state:
+    st.session_state.quote = (None, None)
+
 # --- APIキー取得（secretsまたは手入力） ---
 try:
     default_key = st.secrets.get("GEMINI_API_KEY", "")
@@ -24,12 +30,10 @@ entry_price = st.sidebar.number_input("エントリー価格 (円)", value=0.0, 
 trade_type = st.sidebar.radio("ポジション種別", ["買い（ロング）", "売り（ショート）"])
 
 # --- クオート更新はボタン押下時のみ（429回避） ---
-if "quote" not in st.session_state:
-    st.session_state.quote = (None, None)
-
 st.sidebar.markdown("---")
 if st.sidebar.button("🔄 最新クオート更新（429回避）"):
     st.session_state.quote = logic.get_latest_quote("JPY=X")
+    st.rerun() # 確実に反映させるため追加
 
 q_price, q_time = st.session_state.quote
 
@@ -48,6 +52,17 @@ if df is None or df.empty:
     st.stop()
 
 df.index = pd.to_datetime(df.index)
+
+# ✅ 修正点2: AI予想ライン反映ボタンの処理 (描画前に値を確定させる)
+if st.sidebar.button("📈 AI予想ライン反映"):
+    if api_key:
+        with st.spinner("AI予想を取得中..."):
+            last_row = df.iloc[-1]
+            context = {"price": last_row["Close"], "rsi": last_row["RSI"], "atr": last_row["ATR"]}
+            st.session_state.ai_range = logic.get_ai_range(api_key, context)
+            st.rerun() # これでグラフに即座に反映されます
+    else:
+        st.warning("Gemini API Key を入力してください。")
 
 # 診断(diag)生成
 try:
@@ -120,6 +135,20 @@ fig_main.add_trace(go.Scatter(x=df.index, y=df["SMA_5"], name="5日線", line=di
 fig_main.add_trace(go.Scatter(x=df.index, y=df["SMA_25"], name="25日線", line=dict(color="orange", width=2)), row=1, col=1)
 fig_main.add_trace(go.Scatter(x=df.index, y=df["SMA_75"], name="75日線", line=dict(color="gray", width=1, dash="dot")), row=1, col=1)
 
+# ✅ 修正点3: AI予想ラインの描画 (セッションに値があれば描画)
+if st.session_state.ai_range:
+    high, low = st.session_state.ai_range
+    fig_main.add_trace(go.Scatter(
+        x=[df.index[0], df.index[-1]], y=[high, high],
+        name=f"予想最高:{high:.2f}", line=dict(color="red", width=2, dash="dash"),
+        showlegend=True
+    ), row=1, col=1)
+    fig_main.add_trace(go.Scatter(
+        x=[df.index[0], df.index[-1]], y=[low, low],
+        name=f"予想最低:{low:.2f}", line=dict(color="green", width=2, dash="dash"),
+        showlegend=True
+    ), row=1, col=1)
+
 if entry_price > 0:
     fig_main.add_trace(go.Scatter(
         x=[df.index[0], df.index[-1]], y=[entry_price, entry_price],
@@ -135,31 +164,7 @@ if entry_price > 0:
         </div>
     """, unsafe_allow_html=True)
 
-# --- 修正点1: 状態保持の初期化 (コード上部へ) ---
-if "ai_range" not in st.session_state:
-    st.session_state.ai_range = None
-
-# --- 修正点2: AI予想ライン反映ボタンの処理 ---
-if st.sidebar.button("📈 AI予想ライン反映"):
-    with st.spinner("AI予想を取得中..."):
-        last_row = df.iloc[-1]
-        context = {"price": last_row["Close"], "rsi": last_row["RSI"], "atr": last_row["ATR"]}
-        # AIの結果をセッションに保存する
-        st.session_state.ai_range = logic.get_ai_range(api_key, context)
-
-# --- 修正点3: グラフ描画部分 (fig_main.add_traceのあたり) ---
-if st.session_state.ai_range:
-    high, low = st.session_state.ai_range
-    fig_main.add_trace(go.Scatter(
-        x=[df.index[0], df.index[-1]], y=[high, high],
-        name=f"予想最高:{high:.2f}", line=dict(color="red", dash="dash")
-    ), row=1, col=1)
-    fig_main.add_trace(go.Scatter(
-        x=[df.index[0], df.index[-1]], y=[low, low],
-        name=f"予想最低:{low:.2f}", line=dict(color="green", dash="dash")
-    ), row=1, col=1)
-
-# 米10年債の凡例修正（名前を明記し showlegend を強制）
+# ✅ 修正点4: 米10年債の凡例修正
 fig_main.add_trace(go.Scatter(
     x=df.index, y=df["US10Y"], name="米10年債", line=dict(color="cyan"), showlegend=True
 ), row=2, col=1)
@@ -175,30 +180,22 @@ fig_main.update_layout(
 )
 st.plotly_chart(fig_main, use_container_width=True)
 
-# --- 4. RSI（配色変更：上・緑、下・赤） ---
+# --- 4. RSI（修正点5：凡例位置 30をラインの下に） ---
 current_rsi = float(df["RSI"].iloc[-1])
 st.subheader(f"📈 RSI（現在の過熱感: {current_rsi:.2f}）")
 fig_rsi = go.Figure()
 fig_rsi.add_trace(go.Scatter(x=df.index, y=df["RSI"], name=f"RSI(14): {current_rsi:.1f}", line=dict(color="#ff5722")))
-# 修正：上（70）を緑、下（30）を赤に変更
-fig_rsi.add_hline(y=70, line=dict(color="#00ff00", dash="dash"), annotation_text="70：買われすぎ",annotation_position="top right")
-fig_rsi.add_hline(y=30, line=dict(color="#ff0000", dash="dash"), annotation_text="30:売られすぎ",annotation_position="bottom right")
+fig_rsi.add_hline(y=70, line=dict(color="#00ff00", dash="dash"), annotation_text="70：買われすぎ", annotation_position="top right")
+fig_rsi.add_hline(y=30, line=dict(color="#ff0000", dash="dash"), annotation_text="30:売られすぎ", annotation_position="bottom right") # 位置修正
 fig_rsi.update_xaxes(range=[start_view, last_date])
 fig_rsi.update_layout(height=250, template="plotly_dark", yaxis=dict(range=[0, 100]), showlegend=True, margin=dict(r=240))
 st.plotly_chart(fig_rsi, use_container_width=True)
 
-# --- 5. 通貨強弱（配色指定：日本円=赤、ユーロ=紫、英ポンド=薄灰色） ---
+# --- 5. 通貨強弱 ---
 if strength is not None and not strength.empty:
     st.subheader("📊 通貨強弱（1ヶ月）")
     fig_str = go.Figure()
-    # 色マッピング：日本円=赤、豪ドル=緑、ユーロ=紫、英ポンド=薄灰色(背景で見えるように)、米ドル=金
-    color_map = {
-        "日本円": "#ff0000", 
-        "豪ドル": "#00ff00", 
-        "ユーロ": "#a020f0", 
-        "英ポンド": "#c0c0c0", # 白ではなくシルバー
-        "米ドル": "#ffd700"
-    }
+    color_map = {"日本円": "#ff0000", "豪ドル": "#00ff00", "ユーロ": "#a020f0", "英ポンド": "#c0c0c0", "米ドル": "#ffd700"}
     for col in strength.columns:
         fig_str.add_trace(go.Scatter(x=strength.index, y=strength[col], name=col, line=dict(color=color_map.get(col))))
     fig_str.update_layout(height=400, template="plotly_dark", showlegend=True, margin=dict(r=240))
@@ -214,25 +211,20 @@ if col_rep.button("✨ Gemini AI 詳細レポート"):
             last_row = df.iloc[-1]
             jst = pytz.timezone("Asia/Tokyo")
             now_jst = datetime.now(jst)
-            current_time_str = now_jst.strftime("%H:%M")
-            is_gotobi = now_jst.day in [5, 10, 15, 20, 25, 30]
             context = {
                 "price": float(last_row["Close"]),
                 "us10y": float(last_row["US10Y"]) if pd.notna(last_row["US10Y"]) else 0.0,
                 "atr": float(last_row["ATR"]) if pd.notna(last_row["ATR"]) else 0.0,
                 "sma_diff": float(last_row["SMA_DIFF"]) if pd.notna(last_row["SMA_DIFF"]) else 0.0,
                 "rsi": float(last_row["RSI"]) if pd.notna(last_row["RSI"]) else 50.0,
-                "current_time": current_time_str,
-                "is_gotobi": is_gotobi,
+                "current_time": now_jst.strftime("%H:%M"),
+                "is_gotobi": now_jst.day in [5, 10, 15, 20, 25, 30],
             }
             st.markdown(logic.get_ai_analysis(api_key, context))
-    else:
-        st.warning("Gemini API Key を入力してください。")
+    else: st.warning("Gemini API Key を入力してください。")
 
 if col_port.button("💰 最適ポートフォリオ提示"):
     if api_key:
         with st.spinner("計算中..."):
             st.markdown(logic.get_ai_portfolio(api_key, {}))
-    else:
-        st.warning("Gemini API Key を入力してください。")
-
+    else: st.warning("Gemini API Key を入力してください。")
