@@ -314,7 +314,7 @@ def get_currency_strength():
             pass
 
     if not strength_data.empty:
-        strength_data["USD"] = strength_data.mean(axis=1) * -1
+        strength_data["米ドル"] = strength_data.mean(axis=1) * -1
         return strength_data.ffill().dropna()
 
     return strength_data
@@ -439,4 +439,5 @@ def get_ai_range(api_key, context_data):
         return [float(nums[0]), float(nums[1])] if len(nums) >= 2 else None
     except:
         return None
+
 
