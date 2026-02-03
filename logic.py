@@ -280,7 +280,7 @@ def calculate_indicators(df, us10y):
 
 
 # =====================================================
-# 通貨強弱（USD含む完成版）
+# 通貨強弱
 # =====================================================
 def get_currency_strength():
     pairs = {"EUR": "EURUSD=X", "GBP": "GBPUSD=X", "JPY": "JPY=X", "AUD": "AUDUSD=X"}
@@ -411,15 +411,9 @@ def get_ai_analysis(api_key, context_data):
         return f"AI分析エラー: {str(e)}"
 
 
-
 def get_ai_portfolio(api_key, context_data):
     try:
         model = genai.GenerativeModel(get_active_model(api_key))
-        p, u, s = (
-            context_data.get("price", 0.0),
-            context_data.get("us10y", 0.0),
-            context_data.get("sma_diff", 0.0),
-        )
         prompt = f"""
         あなたはFP1級技能士です。
         日本円、米ドル、ユーロ、豪ドル、英ポンドの
@@ -431,3 +425,16 @@ def get_ai_portfolio(api_key, context_data):
         return response.text
     except Exception:
         return "ポートフォリオ分析に失敗しました。"
+
+# main.pyで使用されているため維持
+def get_ai_range(api_key, context_data):
+    try:
+        model = genai.GenerativeModel(get_active_model(api_key))
+        p = context_data.get('price', 0.0)
+        prompt = f"現在のドル円は {p:.2f}円です。今後1週間の[最高値, 最安値]を半角数字のみで返してください。"
+        res = model.generate_content(prompt).text
+        import re
+        nums = re.findall(r"\d+\.\d+|\d+", res)
+        return [float(nums[0]), float(nums[1])] if len(nums) >= 2 else None
+    except:
+        return None
