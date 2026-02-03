@@ -52,7 +52,7 @@ if df is None or df.empty:
     st.error("データが取得できませんでした。")
     st.stop()
 
-# インデックスを同期用にDateTime型へ
+# 【修正】同期のためにインデックスを型変換
 df.index = pd.to_datetime(df.index)
 
 # AI予想ライン反映
@@ -73,9 +73,9 @@ except Exception as e:
     diag = None
     st.error(f"judge_conditionでエラー: {e}")
 
-# 【重要：ここをベースコード通りに固定】
+# 【45日表示設定】
 last_date = df.index[-1]
-start_view = last_date - timedelta(days=45) # ← 45日に固定
+start_view = last_date - timedelta(days=45)
 df_view = df.loc[df.index >= start_view]
 y_min_view = float(df_view["Low"].min())
 y_max_view = float(df_view["High"].max())
@@ -116,7 +116,7 @@ if diag is not None:
             st.warning("⚠️ **【警戒】ボラティリティ上昇中または重要局面です**")
     except Exception: pass
 
-# --- 3. メインチャート（修正：45日範囲を維持しつつ軸を同期） ---
+# --- 3. メインチャート（45日同期・完全版） ---
 fig_main = make_subplots(
     rows=2, cols=1, 
     shared_xaxes=True, 
@@ -125,6 +125,7 @@ fig_main = make_subplots(
     row_heights=[0.7, 0.3]
 )
 
+# 上段
 fig_main.add_trace(go.Candlestick(x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name="価格"), row=1, col=1)
 fig_main.add_trace(go.Scatter(x=df.index, y=df["SMA_5"], name="5日線", line=dict(color="#00ff00", width=1.5)), row=1, col=1)
 fig_main.add_trace(go.Scatter(x=df.index, y=df["SMA_25"], name="25日線", line=dict(color="orange", width=2)), row=1, col=1)
@@ -138,11 +139,13 @@ if st.session_state.ai_range:
 if entry_price > 0:
     fig_main.add_trace(go.Scatter(x=[df.index[0], df.index[-1]], y=[entry_price, entry_price], name=f"購入単価:{entry_price:.2f}", line=dict(color="yellow", width=2, dash="dot")), row=1, col=1)
 
+# 下段
 fig_main.add_trace(go.Scatter(x=df.index, y=df["US10Y"], name="米10年債", line=dict(color="cyan"), showlegend=True), row=2, col=1)
 
-# 同期設定：45日の範囲をrow=2にも適用
-fig_main.update_xaxes(range=[start_view, last_date], row=2, col=1) 
-fig_main.update_xaxes(matches='x') 
+# 【ここが修正の核心】
+# 上下のx軸を完全に同期させ、かつ45日の範囲を両方に強制適用します
+fig_main.update_xaxes(range=[start_view, last_date], row=1, col=1)
+fig_main.update_xaxes(range=[start_view, last_date], matches='x', row=2, col=1)
 
 fig_main.update_yaxes(range=[y_min_view * 0.998, y_max_view * 1.002], autorange=False, row=1, col=1)
 fig_main.update_layout(height=650, template="plotly_dark", xaxis_rangeslider_visible=False, showlegend=True, margin=dict(r=240))
@@ -197,7 +200,7 @@ if col_port.button("💰 最適ポートフォリオ提示"):
             st.markdown(logic.get_ai_portfolio(api_key, {}))
     else: st.warning("Gemini API Key を入力してください。")
 
-# --- 7. ロボ的注文戦略セクション ---
+# --- 7. ロボ的注文戦略セクション（連動版） ---
 st.divider()
 st.subheader("🤖 AIトレード命令書（診断連動型）")
 if st.button("📝 診断に基づいた注文価格を算出"):
@@ -205,7 +208,7 @@ if st.button("📝 診断に基づいた注文価格を算出"):
         if not st.session_state.last_ai_report:
             st.warning("先に『✨ Gemini AI 詳細レポート』を実行してください。")
         else:
-            with st.spinner("診断内容を読み込み、注文票を作成中..."):
+            with st.spinner("戦略構築中..."):
                 last_row = df.iloc[-1]
                 context = {
                     "price": float(last_row["Close"]),
