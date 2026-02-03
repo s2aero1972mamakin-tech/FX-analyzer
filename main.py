@@ -135,19 +135,29 @@ if entry_price > 0:
         </div>
     """, unsafe_allow_html=True)
 
-if api_key and st.sidebar.button("📈 AI予想ライン反映"):
-    last_row = df.iloc[-1]
-    context = {"price": last_row["Close"], "rsi": last_row["RSI"], "atr": last_row["ATR"]}
-    ai_range = logic.get_ai_range(api_key, context)
-    if ai_range:
-        fig_main.add_trace(go.Scatter(
-            x=[df.index[0], df.index[-1]], y=[ai_range[0], ai_range[0]],
-            name=f"予想最高:{ai_range[0]:.2f}", line=dict(color="red", dash="dash")
-        ), row=1, col=1)
-        fig_main.add_trace(go.Scatter(
-            x=[df.index[0], df.index[-1]], y=[ai_range[1], ai_range[1]],
-            name=f"予想最低:{ai_range[1]:.2f}", line=dict(color="green", dash="dash")
-        ), row=1, col=1)
+# --- 修正点1: 状態保持の初期化 (コード上部へ) ---
+if "ai_range" not in st.session_state:
+    st.session_state.ai_range = None
+
+# --- 修正点2: AI予想ライン反映ボタンの処理 ---
+if st.sidebar.button("📈 AI予想ライン反映"):
+    with st.spinner("AI予想を取得中..."):
+        last_row = df.iloc[-1]
+        context = {"price": last_row["Close"], "rsi": last_row["RSI"], "atr": last_row["ATR"]}
+        # AIの結果をセッションに保存する
+        st.session_state.ai_range = logic.get_ai_range(api_key, context)
+
+# --- 修正点3: グラフ描画部分 (fig_main.add_traceのあたり) ---
+if st.session_state.ai_range:
+    high, low = st.session_state.ai_range
+    fig_main.add_trace(go.Scatter(
+        x=[df.index[0], df.index[-1]], y=[high, high],
+        name=f"予想最高:{high:.2f}", line=dict(color="red", dash="dash")
+    ), row=1, col=1)
+    fig_main.add_trace(go.Scatter(
+        x=[df.index[0], df.index[-1]], y=[low, low],
+        name=f"予想最低:{low:.2f}", line=dict(color="green", dash="dash")
+    ), row=1, col=1)
 
 # 米10年債の凡例修正（名前を明記し showlegend を強制）
 fig_main.add_trace(go.Scatter(
@@ -171,8 +181,8 @@ st.subheader(f"📈 RSI（現在の過熱感: {current_rsi:.2f}）")
 fig_rsi = go.Figure()
 fig_rsi.add_trace(go.Scatter(x=df.index, y=df["RSI"], name=f"RSI(14): {current_rsi:.1f}", line=dict(color="#ff5722")))
 # 修正：上（70）を緑、下（30）を赤に変更
-fig_rsi.add_hline(y=70, line=dict(color="#00ff00", dash="dash"), annotation_text="70：買われすぎ(緑)")
-fig_rsi.add_hline(y=30, line=dict(color="#ff0000", dash="dash"), annotation_text="30:売られすぎ(赤)")
+fig_rsi.add_hline(y=70, line=dict(color="#00ff00", dash="dash"), annotation_text="70：買われすぎ",annotation_position="top right")
+fig_rsi.add_hline(y=30, line=dict(color="#ff0000", dash="dash"), annotation_text="30:売られすぎ",annotation_position="bottom right")
 fig_rsi.update_xaxes(range=[start_view, last_date])
 fig_rsi.update_layout(height=250, template="plotly_dark", yaxis=dict(range=[0, 100]), showlegend=True, margin=dict(r=240))
 st.plotly_chart(fig_rsi, use_container_width=True)
@@ -225,3 +235,4 @@ if col_port.button("💰 最適ポートフォリオ提示"):
             st.markdown(logic.get_ai_portfolio(api_key, {}))
     else:
         st.warning("Gemini API Key を入力してください。")
+
