@@ -181,7 +181,7 @@ if strength is not None and not strength.empty:
     st.subheader("📊 通貨強弱（1ヶ月推移）")
     fig_str = go.Figure()
     # 色指定マッピング
-    color_map = {"日本円": "#ff0000", "豪ドル": "#00ff00", "ユーロ": "#a020f0", "英ポンド": "#ffffff", "米ドル": "#ffd700"}
+    color_map = {"日本円": "#ff0000", "豪ドル": "#00ff00", "ユーロ": "#a020f0", "英ポンド": "#ee0fd0", "米ドル": "#ede218"}
     for col in strength.columns:
         fig_str.add_trace(go.Scatter(x=strength.index, y=strength[col], name=col, line=dict(color=color_map.get(col))))
     fig_str.update_layout(height=400, template="plotly_dark", showlegend=True,
@@ -210,11 +210,6 @@ if st.button("✨ Gemini AI 詳細レポート"):
             st.markdown(logic.get_ai_analysis(api_key, context))
     else:
         st.warning("Gemini API Key を入力してください。")
-        
-if col_btn2.button("💰 FP級ポートフォリオ診断"):
-    if api_key:
-        with st.spinner("資産配分を計算中..."):
-            st.info(logic.get_ai_portfolio(api_key, {}))
-    else: st.warning("APIキーを入力してください")
+
 
 
