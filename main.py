@@ -212,3 +212,22 @@ if col_port.button("💰 最適ポートフォリオ提示"):
         with st.spinner("計算中..."):
             st.markdown(logic.get_ai_portfolio(api_key, {}))
     else: st.warning("Gemini API Key を入力してください。")
+
+# --- 7. ロボ的注文戦略セクション (新規追加) ---
+st.divider()
+st.subheader("🤖 AIトレード命令書（自動オーダーシート）")
+if st.button("📝 最適な注文価格を算出"):
+    if api_key:
+        with st.spinner("ロボが計算中..."):
+            last_row = df.iloc[-1]
+            context = {
+                "price": float(last_row["Close"]),
+                "atr": float(last_row["ATR"]),
+                "rsi": float(last_row["RSI"]),
+                "sma25": float(last_row["SMA_25"])
+            }
+            strategy = logic.get_ai_order_strategy(api_key, context)
+            st.info("以下の指示に従って、取引アプリのボタンを押してください。")
+            st.markdown(strategy)
+    else:
+        st.warning("Gemini API Key を入力してください。")
