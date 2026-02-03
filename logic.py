@@ -1,219 +1,484 @@
-import streamlit as st
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+import yfinance as yf
 import pandas as pd
-from datetime import datetime, timedelta
+import google.generativeai as genai
 import pytz
-import logic  # ← logic.pyが必要
+import requests
+import time
+from datetime import datetime
 
-# --- ページ設定 ---
-st.set_page_config(layout="wide", page_title="AI-FX Analyzer")
-st.title("🤖 AI連携型 USD/JPY 戦略分析ツール")
+TOKYO = pytz.timezone("Asia/Tokyo")
 
-# --- 状態保持の初期化 ---
-if "ai_range" not in st.session_state:
-    st.session_state.ai_range = None
-if "quote" not in st.session_state:
-    st.session_state.quote = (None, None)
-if "last_ai_report" not in st.session_state:
-    st.session_state.last_ai_report = "" 
+# 取得失敗時の理由をここに残す（main.pyで表示できる）
+LAST_FETCH_ERROR = ""
 
-# --- APIキー取得 ---
-try:
-    default_key = st.secrets.get("GEMINI_API_KEY", "")
-except Exception:
-    default_key = ""
-api_key = st.sidebar.text_input("Gemini API Key", value=default_key, type="password")
+# -----------------------------
+# 超軽量TTLキャッシュ（Streamlit再実行対策）
+# -----------------------------
+# key -> (expire_epoch, value)
+_TTL_CACHE = {}
 
-# --- サイドバー設定 ---
-st.sidebar.markdown("---")
-st.sidebar.subheader("🎯 トレード設定")
-entry_price = st.sidebar.number_input("エントリー価格 (円)", value=0.0, format="%.3f")
-trade_type = st.sidebar.radio("ポジション種別", ["買い（ロング）", "売り（ショート）"])
 
-# --- クオート更新 ---
-st.sidebar.markdown("---")
-if st.sidebar.button("🔄 最新クオート更新（429回避）"):
-    st.session_state.quote = logic.get_latest_quote("JPY=X")
-    st.rerun()
-
-q_price, q_time = st.session_state.quote
-
-# --- データ取得と計算 ---
-usdjpy_raw, us10y_raw = logic.get_market_data()
-df = logic.calculate_indicators(usdjpy_raw, us10y_raw)
-strength = logic.get_currency_strength()
-
-if (q_price is None) and (df is not None) and (not df.empty):
-    q_price = float(df["Close"].iloc[-1])
-    q_time = pd.Timestamp(df.index[-1]).tz_localize("Asia/Tokyo")
-
-if df is None or df.empty:
-    st.error("データが取得できませんでした。")
-    st.stop()
-
-# 軸同期のためにインデックスを正規化
-df.index = pd.to_datetime(df.index)
-
-# AI予想ライン反映
-if st.sidebar.button("📈 AI予想ライン反映"):
-    if api_key:
-        with st.spinner("AI予想を取得中..."):
-            last_row = df.iloc[-1]
-            context = {"price": last_row["Close"], "rsi": last_row["RSI"], "atr": last_row["ATR"]}
-            st.session_state.ai_range = logic.get_ai_range(api_key, context)
-            st.rerun()
-    else:
-        st.warning("Gemini API Key を入力してください。")
-
-# 診断(diag)生成
-try:
-    diag = logic.judge_condition(df)
-except Exception as e:
-    diag = None
-    st.error(f"judge_conditionでエラー: {e}")
-
-# 45日表示設定
-last_date = df.index[-1]
-start_view = last_date - timedelta(days=45)
-df_view = df.loc[df.index >= start_view]
-y_min_view = float(df_view["Low"].min())
-y_max_view = float(df_view["High"].max())
-
-# 最新レート表示
-if q_price is not None:
-    st.markdown(
-        f"### 💱 最新USD/JPY: **{float(q_price):.3f} 円** "
-        f"<span style='color:#888; font-size:0.9em'>(更新: {(q_time.strftime('%Y-%m-%d %H:%M JST') if q_time else '時刻不明')})</span>",
-        unsafe_allow_html=True,
-    )
-
-# --- 1. 診断パネル ---
-if diag is not None:
-    col_short, col_mid = st.columns(2)
-    with col_short:
-        st.markdown(f"""
-            <div style="background-color:{diag['short']['color']}; padding:20px; border-radius:12px; border:1px solid #ddd; min-height:220px;">
-                <h3 style="color:#333; margin:0; font-size:16px;">📅 1週間スパン（短期勢い）</h3>
-                <h2 style="color:#333; margin:10px 0; font-size:24px;">{diag['short']['status']}</h2>
-                <p style="color:#555; font-size:14px; line-height:1.6;">{diag['short']['advice']}</p>
-                <p style="color:#666; font-size:14px; font-weight:bold; margin-top:10px;">現在値: {diag['price']:.3f} 円</p>
-            </div>
-        """, unsafe_allow_html=True)
-    with col_mid:
-        st.markdown(f"""
-            <div style="background-color:{diag['mid']['color']}; padding:20px; border-radius:12px; border:1px solid #ddd; min-height:220px;">
-                <h3 style="color:#333; margin:0; font-size:16px;">🗓️ 1ヶ月スパン（中期トレンド）</h3>
-                <h2 style="color:#333; margin:10px 0; font-size:24px;">{diag['mid']['status']}</h2>
-                <p style="color:#555; font-size:14px; line-height:1.6;">{diag['mid']['advice']}</p>
-            </div>
-        """, unsafe_allow_html=True)
-
-# --- 2. 経済アラート ---
-if diag is not None:
+def _cache_get(key):
     try:
-        if diag["short"]["status"] == "勢い鈍化・調整" or df["ATR"].iloc[-1] > df["ATR"].mean() * 1.5:
-            st.warning("⚠️ **【警戒】ボラティリティ上昇中または重要局面です**")
-    except Exception: pass
+        exp, val = _TTL_CACHE.get(key, (0, None))
+        if time.time() <= exp:
+            return val
+    except Exception:
+        pass
+    return None
 
-# --- 3. メインチャート（45日同期・完全修正） ---
-fig_main = make_subplots(
-    rows=2, cols=1, 
-    shared_xaxes=True, 
-    vertical_spacing=0.08, 
-    subplot_titles=("USD/JPY & AI予想", "米国債10年物利回り"),
-    row_heights=[0.7, 0.3]
-)
 
-fig_main.add_trace(go.Candlestick(x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name="価格"), row=1, col=1)
-fig_main.add_trace(go.Scatter(x=df.index, y=df["SMA_5"], name="5日線", line=dict(color="#00ff00", width=1.5)), row=1, col=1)
-fig_main.add_trace(go.Scatter(x=df.index, y=df["SMA_25"], name="25日線", line=dict(color="orange", width=2)), row=1, col=1)
-fig_main.add_trace(go.Scatter(x=df.index, y=df["SMA_75"], name="75日線", line=dict(color="gray", width=1, dash="dot")), row=1, col=1)
+def _cache_set(key, val, ttl_sec):
+    try:
+        _TTL_CACHE[key] = (time.time() + float(ttl_sec), val)
+    except Exception:
+        pass
 
-if st.session_state.ai_range:
-    high_val, low_val = st.session_state.ai_range
-    fig_main.add_trace(go.Scatter(x=[df.index[0], df.index[-1]], y=[high_val, high_val], name=f"予想最高:{high_val:.2f}", line=dict(color="red", width=2, dash="dash")), row=1, col=1)
-    fig_main.add_trace(go.Scatter(x=[df.index[0], df.index[-1]], y=[low_val, low_val], name=f"予想最低:{low_val:.2f}", line=dict(color="green", width=2, dash="dash")), row=1, col=1)
 
-if entry_price > 0:
-    fig_main.add_trace(go.Scatter(x=[df.index[0], df.index[-1]], y=[entry_price, entry_price], name=f"購入単価:{entry_price:.2f}", line=dict(color="yellow", width=2, dash="dot")), row=1, col=1)
+def _set_err(msg: str):
+    global LAST_FETCH_ERROR
+    LAST_FETCH_ERROR = msg
 
-fig_main.add_trace(go.Scatter(x=df.index, y=df["US10Y"], name="米10年債", line=dict(color="cyan"), showlegend=True), row=2, col=1)
 
-fig_main.update_xaxes(range=[start_view, last_date], row=1, col=1)
-fig_main.update_xaxes(range=[start_view, last_date], matches='x', row=2, col=1)
-fig_main.update_yaxes(range=[y_min_view * 0.998, y_max_view * 1.002], autorange=False, row=1, col=1)
-fig_main.update_layout(height=650, template="plotly_dark", xaxis_rangeslider_visible=False, showlegend=True, margin=dict(r=240))
-st.plotly_chart(fig_main, use_container_width=True)
+def _to_jst(ts):
+    if ts is None:
+        return None
+    try:
+        if getattr(ts, "tzinfo", None) is None:
+            ts = ts.tz_localize("UTC")
+        return ts.tz_convert(TOKYO)
+    except Exception:
+        return ts
 
-# --- 4. RSI ---
-st.subheader(f"📈 RSI（現在の過熱感: {float(df['RSI'].iloc[-1]):.2f}）")
-fig_rsi = go.Figure()
-fig_rsi.add_trace(go.Scatter(x=df.index, y=df["RSI"], name="RSI", line=dict(color="#ff5722")))
-fig_rsi.add_hline(y=70, line=dict(color="#00ff00", dash="dash"), annotation_text="70:買われすぎ")
-fig_rsi.add_hline(y=30, line=dict(color="#ff0000", dash="dash"), annotation_text="30:売られすぎ", annotation_position="bottom right")
-fig_rsi.update_xaxes(range=[start_view, last_date])
-fig_rsi.update_layout(height=250, template="plotly_dark", yaxis=dict(range=[0, 100]), margin=dict(r=240))
-st.plotly_chart(fig_rsi, use_container_width=True)
 
-# --- 5. 通貨強弱 ---
-if strength is not None and not strength.empty:
-    st.subheader("📊 通貨強弱（1ヶ月）")
-    fig_str = go.Figure()
-    color_map = {"日本円": "#ff0000", "豪ドル": "#00ff00", "ユーロ": "#a020f0", "英ポンド": "#c0c0c0", "米ドル": "#ffd700"}
-    for col in strength.columns:
-        fig_str.add_trace(go.Scatter(x=strength.index, y=strength[col], name=col, line=dict(color=color_map.get(col))))
-    fig_str.update_layout(height=400, template="plotly_dark", showlegend=True, margin=dict(r=240))
-    st.plotly_chart(fig_str, use_container_width=True)
+def _requests_get_json(url, params=None, timeout=15):
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        )
+    }
+    r = requests.get(url, params=params, headers=headers, timeout=timeout)
+    return r, r.json() if r.status_code == 200 else None
 
-# --- 6. AI詳細レポート & ポートフォリオ ---
-st.divider()
-col_rep, col_port = st.columns(2)
-if col_rep.button("✨ Gemini AI 詳細レポート"):
-    if api_key:
-        with st.spinner("分析中..."):
-            last_row = df.iloc[-1]
-            jst = pytz.timezone("Asia/Tokyo")
-            now_jst = datetime.now(jst)
-            context = {
-                "price": float(last_row["Close"]),
-                "us10y": float(last_row["US10Y"]) if pd.notna(last_row["US10Y"]) else 0.0,
-                "atr": float(last_row["ATR"]) if pd.notna(last_row["ATR"]) else 0.0,
-                "sma_diff": float(last_row["SMA_DIFF"]) if pd.notna(last_row["SMA_DIFF"]) else 0.0,
-                "rsi": float(last_row["RSI"]) if pd.notna(last_row["RSI"]) else 50.0,
-                "current_time": now_jst.strftime("%H:%M"),
-                "is_gotobi": now_jst.day in [5, 10, 15, 20, 25, 30],
-            }
-            report = logic.get_ai_analysis(api_key, context)
-            st.session_state.last_ai_report = report 
-            st.markdown(report)
-    else: st.warning("Gemini API Key を入力してください。")
 
-if col_port.button("💰 最適ポートフォリオ提示"):
-    if api_key:
-        with st.spinner("計算中..."):
-            st.markdown(logic.get_ai_portfolio(api_key, {}))
-    else: st.warning("Gemini API Key を入力してください。")
+# =====================================================
+# Yahoo Chart API 直叩きフォールバック（TTLキャッシュ付き）
+# =====================================================
+def _yahoo_chart(symbol: str, rng: str = "1y", interval: str = "1d", ttl_sec: int = 900):
+    cache_key = f"yahoo_chart::{symbol}::{rng}::{interval}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
 
-# --- 7. ロボ的注文戦略セクション（連動版） ---
-st.divider()
-st.subheader("🤖 AIトレード命令書（診断連動型）")
-if st.button("📝 診断に基づいた注文価格を算出"):
-    if api_key:
-        if not st.session_state.last_ai_report:
-            st.warning("先に『✨ Gemini AI 詳細レポート』を実行してください。")
-        else:
-            with st.spinner("診断連動中..."):
-                last_row = df.iloc[-1]
-                context = {
-                    "price": float(last_row["Close"]),
-                    "atr": float(last_row["ATR"]),
-                    "last_report": st.session_state.last_ai_report,
-                    "panel_short": diag['short']['status'] if diag else "不明",
-                    "panel_mid": diag['mid']['status'] if diag else "不明"
-                }
-                strategy = logic.get_ai_order_strategy(api_key, context)
-                st.info("AI診断およびパネル診断との整合性を確認しました。")
-                st.markdown(strategy)
+    try:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+        params = {"range": rng, "interval": interval}
+        r, j = _requests_get_json(url, params=params, timeout=15)
+
+        if r.status_code != 200 or j is None:
+            preview = ""
+            try:
+                preview = (r.text or "")[:120]
+            except Exception:
+                preview = ""
+            _set_err(f"Yahoo chart HTTP {r.status_code}: {preview}")
+            _cache_set(cache_key, None, 30)
+            return None
+
+        res = j.get("chart", {}).get("result", None)
+        if not res:
+            _set_err(f"Yahoo chart no result: {j.get('chart', {}).get('error')}")
+            _cache_set(cache_key, None, 30)
+            return None
+
+        res0 = res[0]
+        ts = res0.get("timestamp", [])
+        quote = res0.get("indicators", {}).get("quote", [{}])[0]
+        if not ts or not quote:
+            _set_err("Yahoo chart missing timestamp/quote")
+            _cache_set(cache_key, None, 30)
+            return None
+
+        idx = pd.to_datetime(ts, unit="s", utc=True).tz_convert(TOKYO).tz_localize(None)
+
+        df = pd.DataFrame(
+            {
+                "Open": quote.get("open", []),
+                "High": quote.get("high", []),
+                "Low": quote.get("low", []),
+                "Close": quote.get("close", []),
+                "Volume": quote.get("volume", []),
+            },
+            index=idx,
+        )
+
+        df = df.dropna(subset=["Close"])
+        if df.empty:
+            _set_err("Yahoo chart df empty after dropna")
+            _cache_set(cache_key, None, 30)
+            return None
+
+        _cache_set(cache_key, df, ttl_sec)
+        return df
+
+    except Exception as e:
+        _set_err(f"Yahoo chart exception: {e}")
+        _cache_set(cache_key, None, 30)
+        return None
+
+
+# =====================================================
+# 最新為替レート
+# =====================================================
+def get_latest_quote(symbol="JPY=X"):
+    df = _yahoo_chart(symbol, rng="1d", interval="1m", ttl_sec=60)
+    if df is not None and not df.empty:
+        price = float(df["Close"].iloc[-1])
+        qt = pd.Timestamp(df.index[-1]).tz_localize(TOKYO)
+        return price, _to_jst(qt)
+
+    try:
+        t = yf.Ticker(symbol)
+        fi = t.fast_info or {}
+        price = fi.get("last_price") or fi.get("lastPrice")
+        ts = fi.get("last_timestamp") or fi.get("lastTimestamp")
+        if price is not None and ts:
+            qt = pd.to_datetime(ts, unit="s", utc=True)
+            return float(price), _to_jst(qt)
+    except Exception:
+        pass
+
+    try:
+        r = requests.get("https://open.er-api.com/v6/latest/USD", timeout=10)
+        if r.status_code == 200:
+            rate = r.json()["rates"]["JPY"]
+            qt = pd.Timestamp.utcnow().tz_localize("UTC")
+            return float(rate), _to_jst(qt)
+    except Exception:
+        pass
+
+    return None, None
+
+
+# =====================================================
+# 市場データ取得
+# =====================================================
+def get_market_data(period="1y"):
+    usdjpy_df = None
+    us10y_df = None
+
+    try:
+        usdjpy_df = yf.Ticker("JPY=X").history(period=period)
+        if usdjpy_df is not None and not usdjpy_df.empty:
+            if getattr(usdjpy_df.index, "tz", None) is not None:
+                usdjpy_df.index = usdjpy_df.index.tz_localize(None)
+    except Exception:
+        usdjpy_df = None
+
+    try:
+        us10y_df = yf.Ticker("^TNX").history(period=period)
+        if us10y_df is not None and not us10y_df.empty:
+            if getattr(us10y_df.index, "tz", None) is not None:
+                us10y_df.index = us10y_df.index.tz_localize(None)
+    except Exception:
+        us10y_df = None
+
+    if usdjpy_df is None or getattr(usdjpy_df, "empty", True):
+        try:
+            usdjpy_df = yf.download("JPY=X", period=period, interval="1d", progress=False, threads=False)
+        except Exception:
+            usdjpy_df = None
+
+    if us10y_df is None or getattr(us10y_df, "empty", True):
+        try:
+            us10y_df = yf.download("^TNX", period=period, interval="1d", progress=False, threads=False)
+        except Exception:
+            us10y_df = None
+
+    if usdjpy_df is None or getattr(usdjpy_df, "empty", True):
+        usdjpy_df = _yahoo_chart("JPY=X", rng=period, interval="1d", ttl_sec=900)
+
+    if us10y_df is None or getattr(us10y_df, "empty", True):
+        us10y_df = _yahoo_chart("^TNX", rng=period, interval="1d", ttl_sec=900)
+
+    if usdjpy_df is None or getattr(usdjpy_df, "empty", True):
+        if not LAST_FETCH_ERROR:
+            _set_err("All sources failed for JPY=X")
+        return None, None
+
+    return usdjpy_df, us10y_df
+
+
+# =====================================================
+# 指標計算
+# =====================================================
+def calculate_indicators(df, us10y):
+    if df is None or getattr(df, "empty", True):
+        return None
+
+    try:
+        if isinstance(df.columns, pd.MultiIndex):
+            df = df.copy()
+            df.columns = [c[0] for c in df.columns]
+    except Exception:
+        pass
+
+    need_cols = ["Open", "High", "Low", "Close"]
+    for c in need_cols:
+        if c not in df.columns:
+            return None
+
+    new_df = df[need_cols].copy()
+
+    for c in need_cols:
+        if isinstance(new_df[c], pd.DataFrame):
+            new_df[c] = new_df[c].iloc[:, 0]
+        new_df[c] = pd.to_numeric(new_df[c], errors="coerce")
+
+    new_df = new_df.dropna(subset=["Close"])
+    if new_df.empty:
+        return None
+
+    new_df["SMA_5"] = new_df["Close"].rolling(5).mean()
+    new_df["SMA_25"] = new_df["Close"].rolling(25).mean()
+    new_df["SMA_75"] = new_df["Close"].rolling(75).mean()
+
+    delta = new_df["Close"].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+    new_df["RSI"] = 100 - (100 / (1 + (gain / loss)))
+
+    high_low = new_df["High"] - new_df["Low"]
+    high_close = (new_df["High"] - new_df["Close"].shift()).abs()
+    low_close = (new_df["Low"] - new_df["Close"].shift()).abs()
+    new_df["ATR"] = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1).rolling(14).mean()
+
+    new_df["SMA_DIFF"] = (new_df["Close"] - new_df["SMA_25"]) / new_df["SMA_25"] * 100
+
+    if us10y is not None and not getattr(us10y, "empty", True):
+        try:
+            if isinstance(us10y.columns, pd.MultiIndex):
+                us10y = us10y.copy()
+                us10y.columns = [c[0] for c in us10y.columns]
+
+            if "Close" in us10y.columns:
+                s = us10y["Close"]
+                if isinstance(s, pd.DataFrame):
+                    s = s.iloc[:, 0]
+                s = pd.to_numeric(s, errors="coerce")
+                new_df["US10Y"] = s.reindex(new_df.index).ffill()
+            else:
+                new_df["US10Y"] = float("nan")
+        except Exception:
+            new_df["US10Y"] = float("nan")
     else:
-        st.warning("Gemini API Key を入力してください。")
+        new_df["US10Y"] = float("nan")
+
+    return new_df
+
+
+# =====================================================
+# 通貨強弱
+# =====================================================
+def get_currency_strength():
+    pairs = {"日本円": "JPY=X", "ユーロ": "EURUSD=X", "英ポンド": "GBPUSD=X", "豪ドル": "AUDUSD=X"}
+    strength_data = pd.DataFrame()
+
+    for name, sym in pairs.items():
+        try:
+            d = None
+            try:
+                t = yf.Ticker(sym).history(period="1mo")
+                if t is not None and not t.empty:
+                    d = t["Close"]
+            except Exception:
+                d = None
+
+            if d is None or len(d) == 0:
+                tmp = _yahoo_chart(sym, rng="1mo", interval="1d", ttl_sec=900)
+                if tmp is not None and not tmp.empty:
+                    d = tmp["Close"]
+
+            if d is None or len(d) == 0:
+                continue
+
+            d.index = pd.to_datetime(d.index)
+            if name == "日本円":
+                strength_data[name] = (1 / d).pct_change().cumsum() * 100
+            else:
+                strength_data[name] = d.pct_change().cumsum() * 100
+        except Exception:
+            pass
+
+    if not strength_data.empty:
+        strength_data["米ドル"] = strength_data.mean(axis=1) * -1
+        return strength_data.ffill().dropna()
+
+    return strength_data
+
+
+# =====================================================
+# 判定ロジック
+# =====================================================
+def judge_condition(df):
+    if df is None or len(df) < 2:
+        return None
+    last, prev = df.iloc[-1], df.iloc[-2]
+    rsi, price = last["RSI"], last["Close"]
+    sma5, sma25, sma75 = last["SMA_5"], last["SMA_25"], last["SMA_75"]
+
+    if rsi > 70:
+        mid_s, mid_c, mid_a = "‼️ 利益確定検討", "#ffeb3b", f"RSI({rsi:.1f})が70超。中期的な買われすぎ局面です。"
+    elif rsi < 30:
+        mid_s, mid_c, mid_a = "押し目買い検討", "#00bcd4", f"RSI({rsi:.1f})が30以下。中期的な仕込みの好機です。"
+    elif sma25 > sma75 and prev["SMA_25"] <= prev["SMA_75"]:
+        mid_s, mid_c, mid_a = "強気・上昇開始", "#ccffcc", "ゴールデンクロス。中期トレンドが上向きに転換しました。"
+    else:
+        mid_s, mid_c, mid_a = "ステイ・静観", "#e0e0e0", "明確なシグナル待ち。FPの視点では無理なエントリーを避ける時期です。"
+
+    if price > sma5:
+        short_s, short_c, short_a = "上昇継続（短期）", "#e3f2fd", f"価格が5日線({sma5:.2f})の上を維持。勢いは強いです。"
+    else:
+        short_s, short_c, short_a = "勢い鈍化・調整", "#fce4ec", f"価格が5日線({sma5:.2f})を下回りました。短期的な調整局面です。"
+
+    return {
+        "short": {"status": short_s, "color": short_c, "advice": short_a},
+        "mid": {"status": mid_s, "color": mid_c, "advice": mid_a},
+        "price": price,
+    }
+
+
+# =====================================================
+# AI分析（FP1級・衆院選プロンプト完全版）
+# =====================================================
+def get_active_model(api_key):
+    genai.configure(api_key=api_key)
+    try:
+        for m in genai.list_models():
+            if "generateContent" in m.supported_generation_methods:
+                return m.name
+    except Exception:
+        pass
+    return "models/gemini-1.5-flash"
+
+
+def get_ai_analysis(api_key, context_data):
+    try:
+        model = genai.GenerativeModel(get_active_model(api_key))
+        p, u, a, s, r = (
+            context_data.get("price", 0.0),
+            context_data.get("us10y", 0.0),
+            context_data.get("atr", 0.0),
+            context_data.get("sma_diff", 0.0),
+            context_data.get("rsi", 50.0),
+        )
+
+        prompt = f"""
+あなたはFP1級を保持する、極めて優秀な為替戦略家です。
+特に今週は「衆議院選挙」を控えた極めて重要な1週間であることを強く認識してください。
+
+【市場データ】
+- ドル円価格: {p:.3f}円
+- 日米金利差(10年債): {u:.2f}%
+- ボラティリティ(ATR): {a:.3f}
+- SMA25乖離率: {s:.2f}%
+- RSI(14日): {r:.1f}
+
+【分析依頼：以下の4項目に沿ってFPに分かりやすく回答してください】
+1. 【ファンダメンタルズ】日米金利差の現状を「金融資産運用の利回り」の観点から解説
+2. 【地政学・外部要因】インフレや景気後退、政治リスクがどう影響しているか
+   （FPの景気サイクルに基づき解説）
+   特に今週は「衆議院選挙」を控えた極めて重要な1週間であることを強く認識してください。
+3. 【テクニカル】乖離率とRSI({r:.1f})から見て、今は「割安」か「割高」か。
+4. 【具体的戦略】NISAや外貨建資産のバランスを考える際のアアドバイスのように、
+   出口戦略（利確）を含めた今後1週間の戦略を提示
+
+【レポート構成：必ず以下の4項目に沿って記述してください】
+1. 現在の相場環境の要約
+2. 上記データ（特に金利差とボラティリティ）から読み解くリスク
+3. 具体的な戦略（エントリー・利確・損切の目安価格を具体的に提示）
+4. 経済カレンダーを踏まえた、今週の警戒イベントへの助言
+
+回答は親しみやすくも、プロの厳格さを感じる日本語でお願いします。
+        """
+
+        response = model.generate_content(prompt)
+        return response.text
+
+    except Exception as e:
+        return f"AI分析エラー: {str(e)}"
+
+
+def get_ai_portfolio(api_key, context_data):
+    try:
+        model = genai.GenerativeModel(get_active_model(api_key))
+        prompt = f"""
+        あなたはFP1級技能士です。
+        日本円, 米ドル, ユーロ, 豪ドル, 英ポンドの
+        最適配分（合計100%）を
+        [日本円, 米ドル, ユーロ, 豪ドル, 英ポンド]
+        形式で提示してください。
+        その際、各通貨の現状と今後の見通しを含めて解説してください。
+        """
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception:
+        return "ポートフォリオ分析に失敗しました。"
+
+
+def get_ai_range(api_key, context_data):
+    try:
+        model = genai.GenerativeModel(get_active_model(api_key))
+        p = context_data.get('price', 0.0)
+        prompt = f"現在のドル円は {p:.2f}円です。今後1週間の[最高値, 最安値]を半角数字のみで返してください。"
+        res = model.generate_content(prompt).text
+        import re
+        nums = re.findall(r"\d+\.\d+|\d+", res)
+        return [float(nums[0]), float(nums[1])] if len(nums) >= 2 else None
+    except:
+        return None
+
+# =====================================================
+# ✅ 新規追加: ロボ的注文戦略生成（全診断連動型）
+# =====================================================
+def get_ai_order_strategy(api_key, context_data):
+    try:
+        model = genai.GenerativeModel(get_active_model(api_key))
+        p = context_data.get('price', 0.0)
+        a = context_data.get('atr', 0.0)
+        report = context_data.get('last_report', "なし")
+        ps = context_data.get("panel_short", "不明")
+        pm = context_data.get("panel_mid", "不明")
+        
+        prompt = f"""
+あなたはFX投資ロボットの執行エンジンです。
+上部パネルの診断と、あなた自身が作成したレポートを完全遵守し、具体的な「注文票」を1つ作成してください。
+
+【1. 現在の市場診断（上部パネル連動）】
+- 短期診断: {ps}
+- 中期診断: {pm}
+
+【2. あなたの詳細分析レポート（思考プロセス）】
+{report}
+
+【3. 数値データ】
+- 現在価格: {p:.3f} 円
+- ATR(ボラティリティ): {a:.3f} 円
+
+【命令】
+診断結果と1ミリも矛盾しない注文票（指値, IFD, OCO, IFDOCOのいずれか）を提示してください。
+診断が「調整」や「静観」なら、現在の成行ではなく、有利な位置での指値待機を提案してください。
+
+出力フォーマット：
+🤖 **ロボ指示：[注文方式] を推奨（診断連動済み）**
+- **ENTRY**: [価格] 円
+- **LIMIT (利確)**: [価格] 円
+- **STOP (損切)**: [価格] 円
+- **診断との整合性**: [なぜこの価格か、パネル診断結果「{ps}/{pm}」をどう反映したか説明]
+"""
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        return f"注文戦略生成エラー: {str(e)}"
