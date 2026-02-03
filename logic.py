@@ -285,7 +285,6 @@ def calculate_indicators(df, us10y):
 def get_currency_strength():
     pairs = {"日本円": "JPY=X", "ユーロ": "EURUSD=X", "英ポンド": "GBPUSD=X", "豪ドル": "AUDUSD=X"}
     strength_data = pd.DataFrame()
-    strength_data = pd.DataFrame()
 
     for name, sym in pairs.items():
         try:
@@ -306,7 +305,7 @@ def get_currency_strength():
                 continue
 
             d.index = pd.to_datetime(d.index)
-            if name == "JPY":
+            if name == "日本円":
                 strength_data[name] = (1 / d).pct_change().cumsum() * 100
             else:
                 strength_data[name] = d.pct_change().cumsum() * 100
@@ -314,6 +313,7 @@ def get_currency_strength():
             pass
 
     if not strength_data.empty:
+        # 他のAIが指摘していた点を考慮しつつ、米ドル（USD）を追加
         strength_data["米ドル"] = strength_data.mean(axis=1) * -1
         return strength_data.ffill().dropna()
 
@@ -393,7 +393,7 @@ def get_ai_analysis(api_key, context_data):
    （FPの景気サイクルに基づき解説）
    特に今週は「衆議院選挙」を控えた極めて重要な1週間であることを強く認識してください。
 3. 【テクニカル】乖離率とRSI({r:.1f})から見て、今は「割安」か「割高」か。
-4. 【具体的戦略】NISAや外貨建資産のバランスを考える際のアドバイスのように、
+4. 【具体的戦略】NISAや外貨建資産のバランスを考える際のアアドバイスのように、
    出口戦略（利確）を含めた今後1週間の戦略を提示
 
 【レポート構成：必ず以下の4項目に沿って記述してください】
@@ -421,6 +421,7 @@ def get_ai_portfolio(api_key, context_data):
         最適配分（合計100%）を
         [日本円, 米ドル, ユーロ, 豪ドル, 英ポンド]
         形式で提示してください。
+        その際、各通貨の現状と今後の見通しを含めて解説してください。
         """
         response = model.generate_content(prompt)
         return response.text
@@ -439,5 +440,3 @@ def get_ai_range(api_key, context_data):
         return [float(nums[0]), float(nums[1])] if len(nums) >= 2 else None
     except:
         return None
-
-
