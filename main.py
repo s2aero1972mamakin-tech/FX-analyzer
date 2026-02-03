@@ -55,7 +55,7 @@ if df is None or df.empty:
 # 軸同期のためにインデックスを正規化
 df.index = pd.to_datetime(df.index)
 
-# AI予想ライン反映
+# AI予想ライン反映ボタン
 if st.sidebar.button("📈 AI予想ライン反映"):
     if api_key:
         with st.spinner("AI予想を取得中..."):
@@ -116,7 +116,7 @@ if diag is not None:
             st.warning("⚠️ **【警戒】ボラティリティ上昇中または重要局面です**")
     except Exception: pass
 
-# --- 3. メインチャート（45日同期・完全修正） ---
+# --- 3. メインチャート（同期 & 予想ライン） ---
 fig_main = make_subplots(
     rows=2, cols=1, 
     shared_xaxes=True, 
@@ -130,28 +130,29 @@ fig_main.add_trace(go.Scatter(x=df.index, y=df["SMA_5"], name="5日線", line=di
 fig_main.add_trace(go.Scatter(x=df.index, y=df["SMA_25"], name="25日線", line=dict(color="orange", width=2)), row=1, col=1)
 fig_main.add_trace(go.Scatter(x=df.index, y=df["SMA_75"], name="75日線", line=dict(color="gray", width=1, dash="dot")), row=1, col=1)
 
+# 予想ライン
 if st.session_state.ai_range:
-    high_val, low_val = st.session_state.ai_range
-    fig_main.add_trace(go.Scatter(x=[df.index[0], df.index[-1]], y=[high_val, high_val], name=f"予想最高:{high_val:.2f}", line=dict(color="red", width=2, dash="dash")), row=1, col=1)
-    fig_main.add_trace(go.Scatter(x=[df.index[0], df.index[-1]], y=[low_val, low_val], name=f"予想最低:{low_val:.2f}", line=dict(color="green", width=2, dash="dash")), row=1, col=1)
+    h_val, l_val = st.session_state.ai_range
+    fig_main.add_hline(y=h_val, line_dash="dash", line_color="red", annotation_text=f"上限:{h_val:.2f}", row=1, col=1)
+    fig_main.add_hline(y=l_val, line_dash="dash", line_color="green", annotation_text=f"下限:{l_val:.2f}", row=1, col=1)
 
 if entry_price > 0:
-    fig_main.add_trace(go.Scatter(x=[df.index[0], df.index[-1]], y=[entry_price, entry_price], name=f"購入単価:{entry_price:.2f}", line=dict(color="yellow", width=2, dash="dot")), row=1, col=1)
+    fig_main.add_hline(y=entry_price, line_dash="dot", line_color="yellow", annotation_text="購入単価", row=1, col=1)
 
-fig_main.add_trace(go.Scatter(x=df.index, y=df["US10Y"], name="米10年債", line=dict(color="cyan"), showlegend=True), row=2, col=1)
+fig_main.add_trace(go.Scatter(x=df.index, y=df["US10Y"], name="米10年債", line=dict(color="cyan")), row=2, col=1)
 
 fig_main.update_xaxes(range=[start_view, last_date], row=1, col=1)
 fig_main.update_xaxes(range=[start_view, last_date], matches='x', row=2, col=1)
 fig_main.update_yaxes(range=[y_min_view * 0.998, y_max_view * 1.002], autorange=False, row=1, col=1)
-fig_main.update_layout(height=650, template="plotly_dark", xaxis_rangeslider_visible=False, showlegend=True, margin=dict(r=240))
+fig_main.update_layout(height=650, template="plotly_dark", xaxis_rangeslider_visible=False, margin=dict(r=240))
 st.plotly_chart(fig_main, use_container_width=True)
 
 # --- 4. RSI ---
-st.subheader(f"📈 RSI（現在の過熱感: {float(df['RSI'].iloc[-1]):.2f}）")
+st.subheader(f"📈 RSI（過熱感: {float(df['RSI'].iloc[-1]):.2f}）")
 fig_rsi = go.Figure()
-fig_rsi.add_trace(go.Scatter(x=df.index, y=df["RSI"], name="RSI", line=dict(color="#ff5722")))
-fig_rsi.add_hline(y=70, line=dict(color="#00ff00", dash="dash"), annotation_text="70:買われすぎ")
-fig_rsi.add_hline(y=30, line=dict(color="#ff0000", dash="dash"), annotation_text="30:売られすぎ", annotation_position="bottom right")
+fig_rsi.add_trace(go.Scatter(x=df.index, y=df["RSI"], line=dict(color="#ff5722")))
+fig_rsi.add_hline(y=70, line_dash="dash", line_color="#00ff00")
+fig_rsi.add_hline(y=30, line_dash="dash", line_color="#ff0000")
 fig_rsi.update_xaxes(range=[start_view, last_date])
 fig_rsi.update_layout(height=250, template="plotly_dark", yaxis=dict(range=[0, 100]), margin=dict(r=240))
 st.plotly_chart(fig_rsi, use_container_width=True)
@@ -163,7 +164,7 @@ if strength is not None and not strength.empty:
     color_map = {"日本円": "#ff0000", "豪ドル": "#00ff00", "ユーロ": "#a020f0", "英ポンド": "#c0c0c0", "米ドル": "#ffd700"}
     for col in strength.columns:
         fig_str.add_trace(go.Scatter(x=strength.index, y=strength[col], name=col, line=dict(color=color_map.get(col))))
-    fig_str.update_layout(height=400, template="plotly_dark", showlegend=True, margin=dict(r=240))
+    fig_str.update_layout(height=400, template="plotly_dark", margin=dict(r=240))
     st.plotly_chart(fig_str, use_container_width=True)
 
 # --- 6. AI詳細レポート & ポートフォリオ ---
@@ -195,7 +196,7 @@ if col_port.button("💰 最適ポートフォリオ提示"):
             st.markdown(logic.get_ai_portfolio(api_key, {}))
     else: st.warning("Gemini API Key を入力してください。")
 
-# --- 7. ロボ的注文戦略セクション（連動版） ---
+# --- 7. ロボ的注文戦略セクション ---
 st.divider()
 st.subheader("🤖 AIトレード命令書（診断連動型）")
 if st.button("📝 診断に基づいた注文価格を算出"):
