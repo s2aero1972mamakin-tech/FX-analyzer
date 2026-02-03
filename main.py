@@ -2,6 +2,7 @@ import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import pandas as pd
+import numpy as np
 from datetime import datetime, timedelta
 import pytz
 import logic
@@ -10,7 +11,7 @@ import logic
 st.set_page_config(layout="wide", page_title="AI-FX Analyzer")
 st.title("🤖 AI診断・同期グラフ FXツール")
 
-# --- セッション状態の管理 ---
+# --- セッションステート保持 ---
 if "ai_range" not in st.session_state:
     st.session_state.ai_range = None
 if "quote" not in st.session_state:
@@ -18,7 +19,7 @@ if "quote" not in st.session_state:
 if "last_ai_report" not in st.session_state:
     st.session_state.last_ai_report = ""
 
-# --- サイドバー：設定エリア ---
+# --- サイドバー設定 ---
 st.sidebar.header("⚙️ 設定")
 api_key = st.sidebar.text_input("Gemini API Key", type="password")
 
@@ -28,26 +29,24 @@ entry_price = st.sidebar.number_input("エントリー価格 (円)", value=0.0, 
 trade_type = st.sidebar.radio("ポジション種別", ["買い（ロング）", "売り（ショート）"])
 
 if st.sidebar.button("🔄 最新クオート更新"):
-    with st.spinner("更新中..."):
-        st.session_state.quote = logic.get_latest_quote("JPY=X")
+    st.session_state.quote = logic.get_latest_quote("JPY=X")
     st.rerun()
 
-# --- データ取得・計算ロジック ---
-# logic.pyの全アルゴリズム（キャッシュ・FP1級・五十日等）をそのまま利用
+# --- データ取得・計算 ---
 usdjpy_raw, us10y_raw = logic.get_market_data()
 df = logic.calculate_indicators(usdjpy_raw, us10y_raw)
 
-# 【軸ズレ対策】インデックスを強制的に同期
+# 【修正：軸同期の要】インデックスの型を確実にDateTimeへ
 df.index = pd.to_datetime(df.index)
 strength = logic.get_currency_strength()
 
-# 最新価格の確定
+# 現在価格確定
 q_price, q_time = st.session_state.quote
 if q_price is None:
     q_price = float(df["Close"].iloc[-1])
     q_time = df.index[-1]
 
-# --- 1. 診断パネル (元の装飾・ロジックを維持) ---
+# --- 1. 診断パネル (元のHTML/CSS構成を維持) ---
 diag = logic.judge_condition(df)
 if diag:
     col_d1, col_d2 = st.columns(2)
@@ -74,7 +73,7 @@ st.subheader(f"📈 USD/JPY & 米金利 同期チャート (現在値: {q_price:
 last_date = df.index[-1]
 start_view = last_date - timedelta(days=45)
 
-# サブプロット構成：ここを厳密に定義
+# サブプロット作成：shared_xaxes を有効化
 fig = make_subplots(
     rows=2, cols=1, 
     shared_xaxes=True, 
@@ -83,34 +82,35 @@ fig = make_subplots(
     subplot_titles=("USD/JPY & AI予想", "米国債10年物利回り")
 )
 
-# グラフ1：メインチャート（ローソク足・移動平均）
+# グラフ1：メインチャート
 fig.add_trace(go.Candlestick(
     x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name="USD/JPY"
 ), row=1, col=1)
 
+# 各移動平均線
 fig.add_trace(go.Scatter(x=df.index, y=df["SMA_5"], name="5日線", line=dict(color="#00ff00")), row=1, col=1)
 fig.add_trace(go.Scatter(x=df.index, y=df["SMA_25"], name="25日線", line=dict(color="orange")), row=1, col=1)
 fig.add_trace(go.Scatter(x=df.index, y=df["SMA_75"], name="75日線", line=dict(color="purple")), row=1, col=1)
 
-# AI予想ラインの反映
+# AI予想レンジ (add_hline)
 if st.session_state.ai_range:
     h, l = st.session_state.ai_range
     fig.add_hline(y=h, line_dash="dash", line_color="red", annotation_text="予想上限", row=1, col=1)
     fig.add_hline(y=l, line_dash="dash", line_color="green", annotation_text="予想下限", row=1, col=1)
 
-# グラフ2：米国債利回り (ここを確実にrow=2へ)
+# グラフ2：米10年債
 fig.add_trace(go.Scatter(
     x=df.index, y=df["US10Y"], name="米10年債", line=dict(color="cyan")
 ), row=2, col=1)
 
-# 【重要】軸の同期設定
+# 【修正：軸の強制同期】 matches='x' で操作をリンク
 fig.update_xaxes(range=[start_view, last_date], row=2, col=1)
-fig.update_xaxes(matches='x') # これで上下が100%連動
+fig.update_xaxes(matches='x')
 fig.update_layout(height=700, template="plotly_dark", xaxis_rangeslider_visible=False, margin=dict(l=50, r=50, t=30, b=30))
 
 st.plotly_chart(fig, use_container_width=True)
 
-# --- 3. RSI & 通貨強弱 (元の配置) ---
+# --- 3. RSI & 通貨強弱 ---
 c_rsi, c_str = st.columns(2)
 with c_rsi:
     st.subheader("📈 RSI")
@@ -131,7 +131,7 @@ with c_str:
         fig_s.update_layout(height=250, template="plotly_dark")
         st.plotly_chart(fig_s, use_container_width=True)
 
-# --- 4. AIレポート・ロボ注文 (230行規模のロジック復元) ---
+# --- 4. AIレポート・ロボ注文 (元のロジックを復元) ---
 st.divider()
 col_rep, col_ord = st.columns(2)
 
@@ -160,12 +160,12 @@ with col_ord:
             st.warning("先にレポートを生成してください")
 
 # サイドバーへの予想反映ボタン
-if st.sidebar.button("📈 AI予想レンジをチャートに反映"):
+if st.sidebar.button("📈 AI予想レンジを反映"):
     if api_key:
         st.session_state.ai_range = logic.get_ai_range(api_key, {"price": q_price})
         st.rerun()
 
-# ポートフォリオ助言（隠し機能的配置）
+# --- 5. ポートフォリオ助言 ---
 with st.expander("💼 AI推奨アセットアロケーション"):
     if st.button("最適配分を計算"):
         if api_key:
