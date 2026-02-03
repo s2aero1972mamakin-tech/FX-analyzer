@@ -164,24 +164,28 @@ fig_main.update_layout(
 )
 st.plotly_chart(fig_main, use_container_width=True)
 
-# --- 4. RSI ---
-current_rsi = float(df["RSI"].iloc[-1])
-st.subheader(f"📈 RSI（現在の過熱感: {current_rsi:.2f}）")
+# --- 4. RSI（配色変更：上・緑 / 下・赤） ---
+st.subheader(f"📈 RSI (現在: {df['RSI'].iloc[-1]:.1f})")
 fig_rsi = go.Figure()
-fig_rsi.add_trace(go.Scatter(x=df.index, y=df["RSI"], name=f"RSI(14): {current_rsi:.1f}", line=dict(color="#ff5722")))
-fig_rsi.add_hline(y=70, line=dict(color="red", dash="dash"), annotation_text="70：買われすぎ")
-fig_rsi.add_hline(y=30, line=dict(color="cyan", dash="dash"), annotation_text="30:売られすぎ")
+fig_rsi.add_trace(go.Scatter(x=df.index, y=df["RSI"], name="RSI(14)", line=dict(color="#ff5722")))
+# 指示通り配色変更（上：緑、下：赤）
+fig_rsi.add_hline(y=70, line=dict(color="#00ff00", dash="dash"), annotation_text="70:買われすぎ(緑)")
+fig_rsi.add_hline(y=30, line=dict(color="#ff0000", dash="dash"), annotation_text="30:売られすぎ(赤)")
 fig_rsi.update_xaxes(range=[start_view, last_date])
-fig_rsi.update_layout(height=250, template="plotly_dark", yaxis=dict(range=[0, 100]), showlegend=True, margin=dict(r=240))
+fig_rsi.update_layout(height=250, template="plotly_dark", yaxis=dict(range=[0, 100]), showlegend=True,
+                       legend=dict(x=1.02, y=1, xanchor="left", yanchor="top"), margin=dict(r=240))
 st.plotly_chart(fig_rsi, use_container_width=True)
 
-# --- 5. 通貨強弱 ---
+# --- 5. 通貨強弱（特定の色指定：日本円=赤、ユーロ=紫など） ---
 if strength is not None and not strength.empty:
-    st.subheader("📊 通貨強弱（1ヶ月）")
+    st.subheader("📊 通貨強弱（1ヶ月推移）")
     fig_str = go.Figure()
+    # 色指定マッピング
+    color_map = {"日本円": "#ff0000", "豪ドル": "#00ff00", "ユーロ": "#a020f0", "英ポンド": "#ffffff", "米ドル": "#ffd700"}
     for col in strength.columns:
-        fig_str.add_trace(go.Scatter(x=strength.index, y=strength[col], name=col))
-    fig_str.update_layout(height=400, template="plotly_dark", showlegend=True, margin=dict(r=240))
+        fig_str.add_trace(go.Scatter(x=strength.index, y=strength[col], name=col, line=dict(color=color_map.get(col))))
+    fig_str.update_layout(height=400, template="plotly_dark", showlegend=True,
+                           legend=dict(x=1.02, y=1, xanchor="left", yanchor="top"), margin=dict(r=240))
     st.plotly_chart(fig_str, use_container_width=True)
 
 # --- 6. AI詳細レポート ---
@@ -206,4 +210,5 @@ if st.button("✨ Gemini AI 詳細レポート"):
             st.markdown(logic.get_ai_analysis(api_key, context))
     else:
         st.warning("Gemini API Key を入力してください。")
+
 
