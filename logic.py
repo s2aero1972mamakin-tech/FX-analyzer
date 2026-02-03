@@ -375,9 +375,16 @@ def get_ai_analysis(api_key, context_data):
             context_data.get("sma_diff", 0.0),
             context_data.get("rsi", 50.0),
         )
+        ps = context_data.get("panel_short", "不明")
+        pm = context_data.get("panel_mid", "不明")
 
         prompt = f"""
 あなたはFP1級を保持する、極めて優秀な為替戦略家です。
+現在、システムは以下のテクニカル診断を下しています。
+- 短期診断: {ps}
+- 中期診断: {pm}
+
+この診断結果を無視せず、ファンダメンタルズ（金利差、衆院選リスク等）と統合して、最終的な詳細レポートを作成してください。
 特に今週は「衆議院選挙」を控えた極めて重要な1週間であることを強く認識してください。
 
 【市場データ】
@@ -439,39 +446,49 @@ def get_ai_range(api_key, context_data):
         return None
 
 # =====================================================
-# ✅ 新規追加: ロボ的注文戦略生成
+# ✅ 改修版: 全診断データ連動型・ロボ的注文戦略生成
 # =====================================================
 def get_ai_order_strategy(api_key, context_data):
     try:
         model = genai.GenerativeModel(get_active_model(api_key))
+        
+        # 基本データの抽出
         p = context_data.get('price', 0.0)
         a = context_data.get('atr', 0.0)
-        r = context_data.get('rsi', 50.0)
-        s = context_data.get('sma25', 0.0)
+        
+        # ✅ 連動用データの抽出（main.pyから渡されるパネル情報とレポート）
+        ps = context_data.get("panel_short", "不明")  # 上部パネル：短期
+        pm = context_data.get("panel_mid", "不明")    # 上部パネル：中期
+        report = context_data.get('last_report', "なし") # 詳細レポート内容
         
         prompt = f"""
-あなたはFX投資ロボットの意思決定エンジンです。
-以下のデータに基づき、最も利益期待値の高い「具体的な注文票」を作成してください。
+あなたはFX投資ロボットの執行エンジンです。
+単なる数値計算だけでなく、上部パネルの診断結果と、あなた自身が作成した詳細レポートを「完全遵守」して注文票を作成してください。
 
-【現在のデータ】
+【1. 現在の市場ステータス（上部パネル連動）】
+- 短期診断（1週間）: {ps}
+- 中期診断（1ヶ月）: {pm}
+
+【2. あなたの直前の詳細レポート（思考プロセス）】
+{report}
+
+【3. 数値データ】
 - 現在価格: {p:.3f} 円
-- SMA25(25日線): {s:.3f} 円
 - ATR(ボラティリティ): {a:.3f} 円
-- RSI: {r:.1f}
 
-【出力ルール】
-1. 推奨注文方式を1つ選択（指値, IFD, OCO, IFDOCO）
-2. エントリー価格、利確価格、損切価格をすべて「円」で明示
-3. なぜその価格設定にしたのか、ATRやSMA25を引用して短く論理的に説明
+【タスク】
+上記の「診断の方向性」に100%合致する具体的な注文（指値, IFD, OCO, IFDOCO等）を作成してください。
+もし診断が「勢い鈍化・調整」なら、現在の成行買いは避け、ATRを考慮した深い位置での指値買い、あるいは戻り売りを提案してください。
 
-【出力フォーマット例】
-🤖 **ロボ指示：IFDOCO注文を推奨**
-- **ENTRY**: 150.120 円
-- **LIMIT (利確)**: 152.000 円
-- **STOP (損切)**: 149.500 円
-- **根拠**: 現在はSMA25を上抜けており、ATR1.5倍の幅を損切に設定。RSI過熱前までの上昇を狙います。
+【出力フォーマット】
+🤖 **ロボ指示：[注文方式] を推奨（診断連動済み）**
+- **ENTRY**: [価格] 円
+- **LIMIT (利確)**: [価格] 円
+- **STOP (損切)**: [価格] 円
+- **診断との整合性**: [なぜこの価格か、上部パネルの「{ps}/{pm}」という結果をどう反映したか説明してください]
 """
         response = model.generate_content(prompt)
         return response.text
     except Exception as e:
         return f"注文戦略生成エラー: {str(e)}"
+
