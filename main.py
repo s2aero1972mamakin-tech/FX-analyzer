@@ -2,171 +2,221 @@ import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import pandas as pd
-import numpy as np
 from datetime import datetime, timedelta
 import pytz
-import logic
+import logic  # ← logic.pyが必要
 
 # --- ページ設定 ---
 st.set_page_config(layout="wide", page_title="AI-FX Analyzer")
-st.title("🤖 AI診断・同期グラフ FXツール")
+st.title("🤖 AI連携型 USD/JPY 戦略分析ツール")
 
-# --- セッションステート保持 ---
+# --- 状態保持の初期化 ---
 if "ai_range" not in st.session_state:
     st.session_state.ai_range = None
 if "quote" not in st.session_state:
     st.session_state.quote = (None, None)
 if "last_ai_report" not in st.session_state:
-    st.session_state.last_ai_report = ""
+    st.session_state.last_ai_report = "" # ✅ 診断結果を保持する変数を追加
+
+# --- APIキー取得 ---
+try:
+    default_key = st.secrets.get("GEMINI_API_KEY", "")
+except Exception:
+    default_key = ""
+api_key = st.sidebar.text_input("Gemini API Key", value=default_key, type="password")
 
 # --- サイドバー設定 ---
-st.sidebar.header("⚙️ 設定")
-api_key = st.sidebar.text_input("Gemini API Key", type="password")
-
-st.sidebar.divider()
-st.sidebar.subheader("📈 トレード設定")
+st.sidebar.markdown("---")
+st.sidebar.subheader("🎯 トレード設定")
 entry_price = st.sidebar.number_input("エントリー価格 (円)", value=0.0, format="%.3f")
 trade_type = st.sidebar.radio("ポジション種別", ["買い（ロング）", "売り（ショート）"])
 
-if st.sidebar.button("🔄 最新クオート更新"):
+# --- クオート更新 ---
+st.sidebar.markdown("---")
+if st.sidebar.button("🔄 最新クオート更新（429回避）"):
     st.session_state.quote = logic.get_latest_quote("JPY=X")
     st.rerun()
 
-# --- データ取得・計算 ---
+q_price, q_time = st.session_state.quote
+
+# --- データ取得と計算 ---
 usdjpy_raw, us10y_raw = logic.get_market_data()
 df = logic.calculate_indicators(usdjpy_raw, us10y_raw)
-
-# 【修正：軸同期の要】インデックスの型を確実にDateTimeへ
-df.index = pd.to_datetime(df.index)
 strength = logic.get_currency_strength()
 
-# 現在価格確定
-q_price, q_time = st.session_state.quote
-if q_price is None:
+if (q_price is None) and (df is not None) and (not df.empty):
     q_price = float(df["Close"].iloc[-1])
-    q_time = df.index[-1]
+    q_time = pd.Timestamp(df.index[-1]).tz_localize("Asia/Tokyo")
 
-# --- 1. 診断パネル (元のHTML/CSS構成を維持) ---
-diag = logic.judge_condition(df)
-if diag:
-    col_d1, col_d2 = st.columns(2)
-    with col_d1:
-        st.markdown(f"""
-            <div style="background:{diag['short']['color']}; padding:20px; border-radius:12px; border:1px solid #ccc;">
-                <h3>📅 短期診断</h3>
-                <h2>{diag['short']['status']}</h2>
-                <p>{diag['short']['advice']}</p>
-            </div>
-        """, unsafe_allow_html=True)
-    with col_d2:
-        st.markdown(f"""
-            <div style="background:{diag['mid']['color']}; padding:20px; border-radius:12px; border:1px solid #ccc;">
-                <h3>🗓️ 中期診断 (FP1級ロジック)</h3>
-                <h2>{diag['mid']['status']}</h2>
-                <p>{diag['mid']['advice']}</p>
-            </div>
-        """, unsafe_allow_html=True)
+if df is None or df.empty:
+    st.error("データが取得できませんでした。")
+    st.stop()
 
-# --- 2. 同期メインチャート (横軸崩れ修正版) ---
-st.subheader(f"📈 USD/JPY & 米金利 同期チャート (現在値: {q_price:.3f}円)")
+# 【重要：軸ズレ防止】インデックスをDateTime型に強制統一
+df.index = pd.to_datetime(df.index)
+
+# AI予想ライン反映
+if st.sidebar.button("📈 AI予想ライン反映"):
+    if api_key:
+        with st.spinner("AI予想を取得中..."):
+            last_row = df.iloc[-1]
+            context = {"price": last_row["Close"], "rsi": last_row["RSI"], "atr": last_row["ATR"]}
+            st.session_state.ai_range = logic.get_ai_range(api_key, context)
+            st.rerun()
+    else:
+        st.warning("Gemini API Key を入力してください。")
+
+# 診断(diag)生成
+try:
+    diag = logic.judge_condition(df)
+except Exception as e:
+    diag = None
+    st.error(f"judge_conditionでエラー: {e}")
 
 last_date = df.index[-1]
 start_view = last_date - timedelta(days=45)
+df_view = df.loc[df.index >= start_view]
+y_min_view = float(df_view["Low"].min())
+y_max_view = float(df_view["High"].max())
 
-# サブプロット作成：shared_xaxes を有効化
-fig = make_subplots(
+# 最新レート表示
+if q_price is not None:
+    st.markdown(
+        f"### 💱 最新USD/JPY: **{float(q_price):.3f} 円** "
+        f"<span style='color:#888; font-size:0.9em'>(更新: {(q_time.strftime('%Y-%m-%d %H:%M JST') if q_time else '時刻不明')})</span>",
+        unsafe_allow_html=True,
+    )
+
+# --- 1. 診断パネル ---
+if diag is not None:
+    col_short, col_mid = st.columns(2)
+    with col_short:
+        st.markdown(f"""
+            <div style="background-color:{diag['short']['color']}; padding:20px; border-radius:12px; border:1px solid #ddd; min-height:220px;">
+                <h3 style="color:#333; margin:0; font-size:16px;">📅 1週間スパン（短期勢い）</h3>
+                <h2 style="color:#333; margin:10px 0; font-size:24px;">{diag['short']['status']}</h2>
+                <p style="color:#555; font-size:14px; line-height:1.6;">{diag['short']['advice']}</p>
+                <p style="color:#666; font-size:14px; font-weight:bold; margin-top:10px;">現在値: {diag['price']:.3f} 円</p>
+            </div>
+        """, unsafe_allow_html=True)
+    with col_mid:
+        st.markdown(f"""
+            <div style="background-color:{diag['mid']['color']}; padding:20px; border-radius:12px; border:1px solid #ddd; min-height:220px;">
+                <h3 style="color:#333; margin:0; font-size:16px;">🗓️ 1ヶ月スパン（中期トレンド）</h3>
+                <h2 style="color:#333; margin:10px 0; font-size:24px;">{diag['mid']['status']}</h2>
+                <p style="color:#555; font-size:14px; line-height:1.6;">{diag['mid']['advice']}</p>
+            </div>
+        """, unsafe_allow_html=True)
+
+# --- 2. 経済アラート ---
+if diag is not None:
+    try:
+        if diag["short"]["status"] == "勢い鈍化・調整" or df["ATR"].iloc[-1] > df["ATR"].mean() * 1.5:
+            st.warning("⚠️ **【警戒】ボラティリティ上昇中または重要局面です**")
+    except Exception: pass
+
+# --- 3. メインチャート（改修：上下の横軸を完全同期） ---
+# shared_xaxes=True で軸を共有設定
+fig_main = make_subplots(
     rows=2, cols=1, 
     shared_xaxes=True, 
-    vertical_spacing=0.05, 
-    row_heights=[0.7, 0.3],
-    subplot_titles=("USD/JPY & AI予想", "米国債10年物利回り")
+    vertical_spacing=0.08, 
+    subplot_titles=("USD/JPY & AI予想", "米国債10年物利回り"),
+    row_heights=[0.7, 0.3]
 )
 
-# グラフ1：メインチャート
-fig.add_trace(go.Candlestick(
-    x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name="USD/JPY"
-), row=1, col=1)
+# 【上段】
+fig_main.add_trace(go.Candlestick(x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name="価格"), row=1, col=1)
+fig_main.add_trace(go.Scatter(x=df.index, y=df["SMA_5"], name="5日線", line=dict(color="#00ff00", width=1.5)), row=1, col=1)
+fig_main.add_trace(go.Scatter(x=df.index, y=df["SMA_25"], name="25日線", line=dict(color="orange", width=2)), row=1, col=1)
+fig_main.add_trace(go.Scatter(x=df.index, y=df["SMA_75"], name="75日線", line=dict(color="gray", width=1, dash="dot")), row=1, col=1)
 
-# 各移動平均線
-fig.add_trace(go.Scatter(x=df.index, y=df["SMA_5"], name="5日線", line=dict(color="#00ff00")), row=1, col=1)
-fig.add_trace(go.Scatter(x=df.index, y=df["SMA_25"], name="25日線", line=dict(color="orange")), row=1, col=1)
-fig.add_trace(go.Scatter(x=df.index, y=df["SMA_75"], name="75日線", line=dict(color="purple")), row=1, col=1)
-
-# AI予想レンジ (add_hline)
 if st.session_state.ai_range:
-    h, l = st.session_state.ai_range
-    fig.add_hline(y=h, line_dash="dash", line_color="red", annotation_text="予想上限", row=1, col=1)
-    fig.add_hline(y=l, line_dash="dash", line_color="green", annotation_text="予想下限", row=1, col=1)
+    high_val, low_val = st.session_state.ai_range
+    fig_main.add_trace(go.Scatter(x=[df.index[0], df.index[-1]], y=[high_val, high_val], name=f"予想最高:{high_val:.2f}", line=dict(color="red", width=2, dash="dash")), row=1, col=1)
+    fig_main.add_trace(go.Scatter(x=[df.index[0], df.index[-1]], y=[low_val, low_val], name=f"予想最低:{low_val:.2f}", line=dict(color="green", width=2, dash="dash")), row=1, col=1)
 
-# グラフ2：米10年債
-fig.add_trace(go.Scatter(
-    x=df.index, y=df["US10Y"], name="米10年債", line=dict(color="cyan")
-), row=2, col=1)
+if entry_price > 0:
+    fig_main.add_trace(go.Scatter(x=[df.index[0], df.index[-1]], y=[entry_price, entry_price], name=f"購入単価:{entry_price:.2f}", line=dict(color="yellow", width=2, dash="dot")), row=1, col=1)
 
-# 【修正：軸の強制同期】 matches='x' で操作をリンク
-fig.update_xaxes(range=[start_view, last_date], row=2, col=1)
-fig.update_xaxes(matches='x')
-fig.update_layout(height=700, template="plotly_dark", xaxis_rangeslider_visible=False, margin=dict(l=50, r=50, t=30, b=30))
+# 【下段】
+fig_main.add_trace(go.Scatter(x=df.index, y=df["US10Y"], name="米10年債", line=dict(color="cyan"), showlegend=True), row=2, col=1)
 
-st.plotly_chart(fig, use_container_width=True)
+# 【最重要：軸の同期と範囲設定】
+# matches='x' を指定することでズーム操作も完全に連動させます
+fig_main.update_xaxes(range=[start_view, last_date], row=2, col=1) 
+fig_main.update_xaxes(matches='x') 
 
-# --- 3. RSI & 通貨強弱 ---
-c_rsi, c_str = st.columns(2)
-with c_rsi:
-    st.subheader("📈 RSI")
-    fig_rsi = go.Figure()
-    fig_rsi.add_trace(go.Scatter(x=df.index, y=df["RSI"], line=dict(color="orange")))
-    fig_rsi.add_hline(y=70, line_dash="dot", line_color="red")
-    fig_rsi.add_hline(y=30, line_dash="dot", line_color="green")
-    fig_rsi.update_xaxes(range=[start_view, last_date])
-    fig_rsi.update_layout(height=250, template="plotly_dark")
-    st.plotly_chart(fig_rsi, use_container_width=True)
+fig_main.update_yaxes(range=[y_min_view * 0.998, y_max_view * 1.002], autorange=False, row=1, col=1)
+fig_main.update_layout(height=700, template="plotly_dark", xaxis_rangeslider_visible=False, showlegend=True, margin=dict(r=240))
+st.plotly_chart(fig_main, use_container_width=True)
 
-with c_str:
-    st.subheader("📊 通貨強弱")
-    if not strength.empty:
-        fig_s = go.Figure()
-        for c in strength.columns:
-            fig_s.add_trace(go.Scatter(x=strength.index, y=strength[c], name=c))
-        fig_s.update_layout(height=250, template="plotly_dark")
-        st.plotly_chart(fig_s, use_container_width=True)
+# --- 4. RSI ---
+st.subheader(f"📈 RSI（現在の過熱感: {float(df['RSI'].iloc[-1]):.2f}）")
+fig_rsi = go.Figure()
+fig_rsi.add_trace(go.Scatter(x=df.index, y=df["RSI"], name="RSI", line=dict(color="#ff5722")))
+fig_rsi.add_hline(y=70, line=dict(color="#00ff00", dash="dash"), annotation_text="70:買われすぎ")
+fig_rsi.add_hline(y=30, line=dict(color="#ff0000", dash="dash"), annotation_text="30:売られすぎ", annotation_position="bottom right")
+fig_rsi.update_xaxes(range=[start_view, last_date])
+fig_rsi.update_layout(height=250, template="plotly_dark", yaxis=dict(range=[0, 100]), margin=dict(r=240))
+st.plotly_chart(fig_rsi, use_container_width=True)
 
-# --- 4. AIレポート・ロボ注文 (元のロジックを復元) ---
+# --- 5. 通貨強弱 ---
+if strength is not None and not strength.empty:
+    st.subheader("📊 通貨強弱（1ヶ月）")
+    fig_str = go.Figure()
+    color_map = {"日本円": "#ff0000", "豪ドル": "#00ff00", "ユーロ": "#a020f0", "英ポンド": "#c0c0c0", "米ドル": "#ffd700"}
+    for col in strength.columns:
+        fig_str.add_trace(go.Scatter(x=strength.index, y=strength[col], name=col, line=dict(color=color_map.get(col))))
+    fig_str.update_layout(height=400, template="plotly_dark", showlegend=True, margin=dict(r=240))
+    st.plotly_chart(fig_str, use_container_width=True)
+
+# --- 6. AI詳細レポート & ポートフォリオ ---
 st.divider()
-col_rep, col_ord = st.columns(2)
-
-with col_rep:
-    if st.button("✨ AI詳細レポート生成", use_container_width=True):
-        if api_key:
-            with st.spinner("分析中..."):
-                ctx = {"price": q_price, "us10y": df["US10Y"].iloc[-1], "rsi": df["RSI"].iloc[-1], "atr": df["ATR"].iloc[-1], "sma_diff": df["SMA_DIFF"].iloc[-1]}
-                st.session_state.last_ai_report = logic.get_ai_analysis(api_key, ctx)
-        else:
-            st.warning("APIキーを入力してください")
-    
-    if st.session_state.last_ai_report:
-        st.markdown("### 📝 AI市場分析")
-        st.info(st.session_state.last_ai_report)
-
-with col_ord:
-    if st.button("🤖 ロボ注文票を生成", use_container_width=True):
-        if st.session_state.last_ai_report:
-            with st.spinner("注文構築中..."):
-                ctx = {"price": q_price, "atr": df["ATR"].iloc[-1], "last_report": st.session_state.last_ai_report, "panel_short": diag['short']['status'], "panel_mid": diag['mid']['status']}
-                order_txt = logic.get_ai_order_strategy(api_key, ctx)
-                st.markdown("### 📋 推奨IFDOCO注文")
-                st.success(order_txt)
-        else:
-            st.warning("先にレポートを生成してください")
-
-# サイドバーへの予想反映ボタン
-if st.sidebar.button("📈 AI予想レンジを反映"):
+col_rep, col_port = st.columns(2)
+if col_rep.button("✨ Gemini AI 詳細レポート"):
     if api_key:
-        st.session_state.ai_range = logic.get_ai_range(api_key, {"price": q_price})
-        st.rerun()
+        with st.spinner("分析中..."):
+            last_row = df.iloc[-1]
+            jst = pytz.timezone("Asia/Tokyo")
+            now_jst = datetime.now(jst)
+            context = {
+                "price": float(last_row["Close"]),
+                "us10y": float(last_row["US10Y"]) if pd.notna(last_row["US10Y"]) else 0.0,
+                "atr": float(last_row["ATR"]) if pd.notna(last_row["ATR"]) else 0.0,
+                "sma_diff": float(last_row["SMA_DIFF"]) if pd.notna(last_row["SMA_DIFF"]) else 0.0,
+                "rsi": float(last_row["RSI"]) if pd.notna(last_row["RSI"]) else 50.0,
+                "current_time": now_jst.strftime("%H:%M"),
+                "is_gotobi": now_jst.day in [5, 10, 15, 20, 25, 30],
+            }
+            report = logic.get_ai_analysis(api_key, context)
+            st.session_state.last_ai_report = report 
+            st.markdown(report)
+    else: st.warning("Gemini API Key を入力してください。")
 
-# --- 5. ポートフォリオ助言 ---
-with st.expander("💼 AI推奨アセットアロケーション"):
-    if st.button("最適配分を計算"):
-        if api_key:
-            st.write(logic.get_ai_portfolio(api_key, {}))
+if col_port.button("💰 最適ポートフォリオ提示"):
+    if api_key:
+        with st.spinner("計算中..."):
+            st.markdown(logic.get_ai_portfolio(api_key, {}))
+    else: st.warning("Gemini API Key を入力してください。")
+
+# --- 7. ロボ的注文戦略セクション（連動版） ---
+st.divider()
+st.subheader("🤖 AIトレード命令書（診断連動型）")
+if st.button("📝 診断に基づいた注文価格を算出"):
+    if api_key:
+        if not st.session_state.last_ai_report:
+            st.warning("先に『✨ Gemini AI 詳細レポート』を実行してください。診断結果に基づいて注文を生成します。")
+        else:
+            with st.spinner("診断内容を読み込み、注文票を作成中..."):
+                last_row = df.iloc[-1]
+                context = {
+                    "price": float(last_row["Close"]),
+                    "atr": float(last_row["ATR"]),
+                    "last_report": st.session_state.last_ai_report
+                }
+                strategy = logic.get_ai_order_strategy(api_key, context)
+                st.info("AI診断との整合性を確認しました。以下の指示でエントリー準備をしてください。")
+                st.markdown(strategy)
+    else:
+        st.warning("Gemini API Key を入力してください。")
