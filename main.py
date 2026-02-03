@@ -55,7 +55,7 @@ if df is None or df.empty:
 # 軸同期のためにインデックスを正規化
 df.index = pd.to_datetime(df.index)
 
-# AI予想ライン反映ボタン
+# AI予想ライン反映
 if st.sidebar.button("📈 AI予想ライン反映"):
     if api_key:
         with st.spinner("AI予想を取得中..."):
@@ -116,7 +116,7 @@ if diag is not None:
             st.warning("⚠️ **【警戒】ボラティリティ上昇中または重要局面です**")
     except Exception: pass
 
-# --- 3. メインチャート（同期 & 予想ライン） ---
+# --- 3. メインチャート ---
 fig_main = make_subplots(
     rows=2, cols=1, 
     shared_xaxes=True, 
@@ -128,16 +128,17 @@ fig_main = make_subplots(
 fig_main.add_trace(go.Candlestick(x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name="価格"), row=1, col=1)
 fig_main.add_trace(go.Scatter(x=df.index, y=df["SMA_5"], name="5日線", line=dict(color="#00ff00", width=1.5)), row=1, col=1)
 fig_main.add_trace(go.Scatter(x=df.index, y=df["SMA_25"], name="25日線", line=dict(color="orange", width=2)), row=1, col=1)
-fig_main.add_trace(go.Scatter(x=df.index, y=df["SMA_75"], name="75日線", line=dict(color="gray", width=1, dash="dot")), row=1, col=1)
+fig_main.add_trace(go.Scatter(x=df.index, y=df["SMA_75"], name="75日線", line=dict(color="gray", width=1, dash="dot")), row=1, col=1) # 復元
 
-# 予想ライン
+# 予想ラインの描画（Scatterで最初から最後まで指定することで表示を確実に）
 if st.session_state.ai_range:
-    h_val, l_val = st.session_state.ai_range
-    fig_main.add_hline(y=h_val, line_dash="dash", line_color="red", annotation_text=f"上限:{h_val:.2f}", row=1, col=1)
-    fig_main.add_hline(y=l_val, line_dash="dash", line_color="green", annotation_text=f"下限:{l_val:.2f}", row=1, col=1)
+    high_val, low_val = st.session_state.ai_range
+    line_x = [df.index[0], df.index[-1]]
+    fig_main.add_trace(go.Scatter(x=line_x, y=[high_val, high_val], name=f"予想最高:{high_val:.2f}", line=dict(color="red", width=2, dash="dash")), row=1, col=1)
+    fig_main.add_trace(go.Scatter(x=line_x, y=[low_val, low_val], name=f"予想最低:{low_val:.2f}", line=dict(color="green", width=2, dash="dash")), row=1, col=1)
 
 if entry_price > 0:
-    fig_main.add_hline(y=entry_price, line_dash="dot", line_color="yellow", annotation_text="購入単価", row=1, col=1)
+    fig_main.add_trace(go.Scatter(x=[df.index[0], df.index[-1]], y=[entry_price, entry_price], name=f"購入単価:{entry_price:.2f}", line=dict(color="yellow", width=2, dash="dot")), row=1, col=1)
 
 fig_main.add_trace(go.Scatter(x=df.index, y=df["US10Y"], name="米10年債", line=dict(color="cyan")), row=2, col=1)
 
@@ -148,11 +149,11 @@ fig_main.update_layout(height=650, template="plotly_dark", xaxis_rangeslider_vis
 st.plotly_chart(fig_main, use_container_width=True)
 
 # --- 4. RSI ---
-st.subheader(f"📈 RSI（過熱感: {float(df['RSI'].iloc[-1]):.2f}）")
+st.subheader(f"📈 RSI（現在の過熱感: {float(df['RSI'].iloc[-1]):.2f}）")
 fig_rsi = go.Figure()
-fig_rsi.add_trace(go.Scatter(x=df.index, y=df["RSI"], line=dict(color="#ff5722")))
-fig_rsi.add_hline(y=70, line_dash="dash", line_color="#00ff00")
-fig_rsi.add_hline(y=30, line_dash="dash", line_color="#ff0000")
+fig_rsi.add_trace(go.Scatter(x=df.index, y=df["RSI"], name="RSI", line=dict(color="#ff5722")))
+fig_rsi.add_hline(y=70, line=dict(color="#00ff00", dash="dash"), annotation_text="70:買われすぎ")
+fig_rsi.add_hline(y=30, line=dict(color="#ff0000", dash="dash"), annotation_text="30:売られすぎ")
 fig_rsi.update_xaxes(range=[start_view, last_date])
 fig_rsi.update_layout(height=250, template="plotly_dark", yaxis=dict(range=[0, 100]), margin=dict(r=240))
 st.plotly_chart(fig_rsi, use_container_width=True)
@@ -163,11 +164,11 @@ if strength is not None and not strength.empty:
     fig_str = go.Figure()
     color_map = {"日本円": "#ff0000", "豪ドル": "#00ff00", "ユーロ": "#a020f0", "英ポンド": "#c0c0c0", "米ドル": "#ffd700"}
     for col in strength.columns:
-        fig_str.add_trace(go.Scatter(x=strength.index, y=strength[col], name=col, line=dict(color=color_map.get(col))))
+        fig_str.add_trace(go.Scatter(x=strength.index, y=strength[col], name=col, line=dict(color=color_map.get(col, None))))
     fig_str.update_layout(height=400, template="plotly_dark", margin=dict(r=240))
     st.plotly_chart(fig_str, use_container_width=True)
 
-# --- 6. AI詳細レポート & ポートフォリオ ---
+# --- 6. AI詳細レポート & ポートフォリオ (コンテキスト復元) ---
 st.divider()
 col_rep, col_port = st.columns(2)
 if col_rep.button("✨ Gemini AI 詳細レポート"):
@@ -176,6 +177,7 @@ if col_rep.button("✨ Gemini AI 詳細レポート"):
             last_row = df.iloc[-1]
             jst = pytz.timezone("Asia/Tokyo")
             now_jst = datetime.now(jst)
+            # コンテキスト情報をすべて復元
             context = {
                 "price": float(last_row["Close"]),
                 "us10y": float(last_row["US10Y"]) if pd.notna(last_row["US10Y"]) else 0.0,
