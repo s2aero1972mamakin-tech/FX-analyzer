@@ -210,5 +210,11 @@ if st.button("✨ Gemini AI 詳細レポート"):
             st.markdown(logic.get_ai_analysis(api_key, context))
     else:
         st.warning("Gemini API Key を入力してください。")
+        
+if col_btn2.button("💰 FP級ポートフォリオ診断"):
+    if api_key:
+        with st.spinner("資産配分を計算中..."):
+            st.info(logic.get_ai_portfolio(api_key, {}))
+    else: st.warning("APIキーを入力してください")
 
 
