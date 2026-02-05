@@ -5,7 +5,7 @@ import pytz
 import requests
 import time
 from datetime import datetime
-import re  # ✅ 追加: 予想ラインの数値抽出に必須
+import re  # ✅ 【必須】AI予想ラインの数値抽出用
 
 TOKYO = pytz.timezone("Asia/Tokyo")
 
@@ -339,10 +339,15 @@ def judge_condition(df):
     else:
         mid_s, mid_c, mid_a = "ステイ・静観", "#e0e0e0", "明確なシグナル待ち。FPの視点では無理なエントリーを避ける時期です。"
 
+    # ✅ 5日線との距離・関係性を重視したロジック
     if price > sma5:
-        short_s, short_c, short_a = "上昇継続（短期）", "#e3f2fd", f"現在値は<b>5日線 ({sma5:.2f})</b> の上を推移中。<br>短期的な上昇圧力は維持されています。"
+        short_s = "上昇継続（短期）"
+        short_c = "#e3f2fd"
+        short_a = f"現在値は<b>5日線 ({sma5:.2f})</b> の上を推移中。<br>短期的な上昇圧力は維持されています。"
     else:
-        short_s, short_c, short_a = "勢い鈍化・調整", "#fce4ec", f"現在値は<b>5日線 ({sma5:.2f})</b> を下回りました。<br>短期的な調整（下落）局面に注意。"
+        short_s = "勢い鈍化・調整"
+        short_c = "#fce4ec"
+        short_a = f"現在値は<b>5日線 ({sma5:.2f})</b> を下回りました。<br>短期的な調整（下落）局面に注意。"
 
     return {
         "short": {"status": short_s, "color": short_c, "advice": short_a},
@@ -352,7 +357,7 @@ def judge_condition(df):
 
 
 # =====================================================
-# AI分析（FP1級・衆院選プロンプト・厳守 + ポジション連動版）
+# AI分析（FP1級・衆院選【後】・実戦運用版）
 # =====================================================
 def get_active_model(api_key):
     genai.configure(api_key=api_key)
@@ -377,18 +382,16 @@ def get_ai_analysis(api_key, context_data):
         )
         capital = context_data.get("capital", 300000)
         
-        # 以前削除してしまった「五十日」チェックを復元
         is_gotobi = context_data.get("is_gotobi", False)
         gotobi_text = "今日は五十日(ゴトウビ)です。実需のドル買いフローに注意してください。" if is_gotobi else "今日は五十日ではありません。"
 
-        # ポジション情報の取得 (main.pyから渡される)
         ep = context_data.get("entry_price", 0.0)
         tt = context_data.get("trade_type", "なし")
 
-        # ▼▼▼ 以前のFP1級・衆議院選挙プロンプト（完全復元） ▼▼▼
+        # ✅ プロンプト修正：選挙「後」の本格運用フェーズに対応
         base_prompt = f"""
 あなたはFP1級を保持する、極めて優秀な為替戦略家です。
-特に今週は「衆議院選挙」を控えた極めて重要な1週間であることを強く認識してください。
+特に現在は「衆議院選挙の結果」を受けた直後の、極めて重要な局面であることを強く認識してください。
 
 【市場データ】
 - ドル円価格: {p:.3f}円
@@ -399,33 +402,29 @@ def get_ai_analysis(api_key, context_data):
 - 五十日判定: {gotobi_text}
 
 【分析依頼：以下の4項目に沿ってFPに分かりやすく回答してください】
-1. 【ファンダメンタルズ】日米金利差の現状を「金融資産運用の利回り」の観点から解説
-2. 【地政学・外部要因】インフレや景気後退、政治リスクがどう影響しているか
-   （FPの景気サイクルに基づき解説）
-   特に今週は「衆議院選挙」を控えた極めて重要な1週間であることを強く認識してください。
-3. 【テクニカル】乖離率とRSI({r:.1f})から見て、今は「割安」か「割高」か。
+1. 【ファンダメンタルズ】日米金利差の現状と、選挙結果（市場の織り込み状況）を踏まえて解説
+2. 【地政学・外部要因】選挙後の政治的安定性や、インフレ・景気後退への影響を分析
+   特に「選挙結果」が市場にサプライズを与えたか、安定をもたらしたかを判断してください。
+3. 【テクニカル】乖離率とRSI({r:.1f})、および「窓開け」の状況から見て、今は「割安」か「割高」か。
 4. 【具体的戦略】NISAや外貨建資産のバランスを考える際のアアドバイスのように、
    出口戦略（利確）を含めた今後1週間の戦略を提示
 
 【レポート構成：必ず以下の4項目に沿って記述してください】
-1. 現在の相場環境の要約
+1. 現在の相場環境の要約（選挙結果の影響含む）
 2. 上記データ（特に金利差とボラティリティ）から読み解くリスク
 3. 具体的な戦略（エントリー・利確・損切の目安価格を具体的に提示）
 4. 経済カレンダーを踏まえた、今週の警戒イベントへの助言
 
 回答は親しみやすくも、プロの厳格さを感じる日本語でお願いします。
         """
-        # ▲▲▲ ここまで復元 ▲▲▲
 
-        # ▼▼▼ 追加機能：ポジション連動 & 資金管理 ▼▼▼
         add_prompt = f"""
-        
         【追加コンテキスト：ユーザーの実戦運用情報】
         ユーザーは現在、軍資金{capital}円（SBI FX/レバレッジ25倍）で運用中です。
         保有ポジション: {f"{ep}円で{tt}" if ep > 0 else "現在なし"}
 
         もしポジションがある場合、上記3の「具体的戦略」内で、
-        この保有建玉に対する「週末/選挙リスク回避のための決済判断」を具体的に助言してください。
+        この保有建玉に対する「選挙後の処理（ホールド/決済）」を具体的に助言してください。
         
         また、以下の2点を必ず追記してください。
         - **推奨スリップロス**: 現在のボラティリティ(ATR)に基づいた、注文を通すための許容値（pips）。
@@ -475,7 +474,6 @@ def get_ai_order_strategy(api_key, context_data):
         pm = context_data.get("panel_mid", "不明")
         capital = context_data.get("capital", 300000)
         
-        # ポジション連動
         ep = context_data.get("entry_price", 0.0)
         tt = context_data.get("trade_type", "なし")
         pos_instr = f"ユーザーは既に {ep}円で{tt}を持っています。これを考慮し、『ナンピン』『増し玉』『決済』のいずれが適切かも思考に含めてください。" if ep > 0 else ""
@@ -514,7 +512,7 @@ def get_ai_order_strategy(api_key, context_data):
     except Exception as e:
         return f"注文戦略生成エラー: {str(e)}"
 
-# ✅✅✅ 追加: 予想ライン生成関数（main.pyのボタン動作に必須） ✅✅✅
+# ✅✅✅ 追加: 予想ライン生成関数（前回欠落していた箇所） ✅✅✅
 def get_ai_range(api_key, context_data):
     try:
         model = genai.GenerativeModel(get_active_model(api_key))
