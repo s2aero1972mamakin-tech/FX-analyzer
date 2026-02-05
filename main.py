@@ -7,8 +7,8 @@ import pytz
 import logic  # ← logic.pyが必要
 
 # --- ページ設定 ---
-st.set_page_config(layout="wide", page_title="AI-FX Analyzer")
-st.title("🤖 AI連携型 USD/JPY 戦略分析ツール")
+st.set_page_config(layout="wide", page_title="AI-FX Analyzer 2026")
+st.title("🤖 AI連携型 USD/JPY 戦略分析ツール (実戦運用版)")
 
 # --- 状態保持の初期化 ---
 if "ai_range" not in st.session_state:
@@ -25,9 +25,16 @@ except Exception:
     default_key = ""
 api_key = st.sidebar.text_input("Gemini API Key", value=default_key, type="password")
 
-# --- サイドバー設定 ---
+# --- サイドバー設定 (資金管理機能追加) ---
 st.sidebar.markdown("---")
-st.sidebar.subheader("🎯 トレード設定")
+st.sidebar.subheader("💰 資金管理 & トレード設定")
+
+# 1. 資金管理入力
+capital = st.sidebar.number_input("軍資金 (JPY)", value=300000, step=10000)
+risk_percent = st.sidebar.slider("1トレード許容損失 (%)", 1.0, 5.0, 2.0)
+leverage = 25  # 固定
+
+st.sidebar.markdown("---")
 entry_price = st.sidebar.number_input("エントリー価格 (円)", value=0.0, format="%.3f")
 trade_type = st.sidebar.radio("ポジション種別", ["買い（ロング）", "売り（ショート）"])
 
@@ -109,21 +116,27 @@ if diag is not None:
             </div>
         """, unsafe_allow_html=True)
 
-# --- 2. 経済アラート ---
-if diag is not None:
-    try:
-        if diag["short"]["status"] == "勢い鈍化・調整" or df["ATR"].iloc[-1] > df["ATR"].mean() * 1.5:
-            st.warning("⚠️ **【警戒】ボラティリティ上昇中または重要局面です**")
-    except Exception: pass
+# --- 2. 経済アラート & スリップロス推奨 ---
+col_alert, col_slip = st.columns(2)
+with col_alert:
+    if diag is not None:
+        try:
+            if diag["short"]["status"] == "勢い鈍化・調整" or df["ATR"].iloc[-1] > df["ATR"].mean() * 1.5:
+                st.warning("⚠️ **【警戒】ボラティリティ上昇中**")
+        except Exception: pass
+with col_slip:
+    # ATRに基づく推奨スリップロス計算 (ATRの10%程度をpips換算など)
+    current_atr = df["ATR"].iloc[-1]
+    rec_slip = max(3, int(current_atr * 10))  # 最低3pips、ATRが高いときは広げる
+    st.info(f"🛡️ 現在の推奨スリップロス: **{rec_slip} pips** (ATR:{current_atr:.3f})")
 
-# --- 3. メインチャート（同期 & 予想ライン復元） ---
+# --- 3. メインチャート ---
 fig_main = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08, subplot_titles=("USD/JPY & AI予想", "米国債10年物利回り"), row_heights=[0.7, 0.3])
 fig_main.add_trace(go.Candlestick(x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name="価格"), row=1, col=1)
 fig_main.add_trace(go.Scatter(x=df.index, y=df["SMA_5"], name="5日線", line=dict(color="#00ff00", width=1.5)), row=1, col=1)
 fig_main.add_trace(go.Scatter(x=df.index, y=df["SMA_25"], name="25日線", line=dict(color="orange", width=2)), row=1, col=1)
 fig_main.add_trace(go.Scatter(x=df.index, y=df["SMA_75"], name="75日線", line=dict(color="gray", width=1, dash="dot")), row=1, col=1)
 
-# 【修正】予想ライン：表示範囲（start_view〜last_date）に限定して描画することで確実に表示
 if st.session_state.ai_range:
     high_val, low_val = st.session_state.ai_range
     view_x = [start_view, last_date]
@@ -141,15 +154,32 @@ fig_main.update_yaxes(range=[y_min_view * 0.998, y_max_view * 1.002], autorange=
 fig_main.update_layout(height=650, template="plotly_dark", xaxis_rangeslider_visible=False, showlegend=True, margin=dict(r=240))
 st.plotly_chart(fig_main, use_container_width=True)
 
-# --- 4. RSI ---
-st.subheader(f"📈 RSI（現在の過熱感: {float(df['RSI'].iloc[-1]):.2f}）")
-fig_rsi = go.Figure()
-fig_rsi.add_trace(go.Scatter(x=df.index, y=df["RSI"], name="RSI", line=dict(color="#ff5722")))
-fig_rsi.add_hline(y=70, line=dict(color="#00ff00", dash="dash"), annotation_text="70:買われすぎ")
-fig_rsi.add_hline(y=30, line=dict(color="#ff0000", dash="dash"), annotation_text="30:売られすぎ", annotation_position="bottom right")
-fig_rsi.update_xaxes(range=[start_view, last_date])
-fig_rsi.update_layout(height=250, template="plotly_dark", yaxis=dict(range=[0, 100]), margin=dict(r=240))
-st.plotly_chart(fig_rsi, use_container_width=True)
+# --- 4. RSI & 資金管理計算機 ---
+st.subheader("🛠️ 実戦エントリー補助 & 指標")
+col_rsi, col_calc = st.columns([1, 1])
+
+with col_rsi:
+    st.markdown(f"**📉 RSI（過熱感）: {float(df['RSI'].iloc[-1]):.2f}**")
+    fig_rsi = go.Figure()
+    fig_rsi.add_trace(go.Scatter(x=df.index, y=df["RSI"], name="RSI", line=dict(color="#ff5722")))
+    fig_rsi.add_hline(y=70, line=dict(color="#00ff00", dash="dash"))
+    fig_rsi.add_hline(y=30, line=dict(color="#ff0000", dash="dash"))
+    fig_rsi.update_xaxes(range=[start_view, last_date])
+    fig_rsi.update_layout(height=200, template="plotly_dark", yaxis=dict(range=[0, 100]), margin=dict(l=20, r=20, t=20, b=20))
+    st.plotly_chart(fig_rsi, use_container_width=True)
+
+with col_calc:
+    st.markdown("#### 🧮 推奨ロット計算機")
+    stop_p = st.number_input("想定損切幅 (円) ※例: 0.5円下で損切", value=0.5, step=0.1)
+    if stop_p > 0:
+        risk_amount = capital * (risk_percent / 100)
+        # ロット数 = 許容損失額 / 損切幅
+        lot = risk_amount / stop_p
+        st.success(f"""
+        - 許容損失額: **{risk_amount:,.0f} 円** ({risk_percent}%)
+        - 推奨発注数量: **{lot:,.0f} 通貨**
+        - (SBI FX 1通貨単位対応)
+        """)
 
 # --- 5. 通貨強弱 ---
 if strength is not None and not strength.empty:
@@ -161,54 +191,61 @@ if strength is not None and not strength.empty:
     fig_str.update_layout(height=400, template="plotly_dark", showlegend=True, margin=dict(r=240))
     st.plotly_chart(fig_str, use_container_width=True)
 
-# --- 6. AI詳細レポート & ポートフォリオ ---
+# --- 6. AI実戦運用エリア (タブ化) ---
 st.divider()
-col_rep, col_port = st.columns(2)
-if col_rep.button("✨ Gemini AI 詳細レポート"):
-    if api_key:
-        with st.spinner("分析中..."):
-            last_row = df.iloc[-1]
-            jst = pytz.timezone("Asia/Tokyo")
-            now_jst = datetime.now(jst)
-            context = {
-                "price": float(last_row["Close"]),
-                "us10y": float(last_row["US10Y"]) if pd.notna(last_row["US10Y"]) else 0.0,
-                "atr": float(last_row["ATR"]) if pd.notna(last_row["ATR"]) else 0.0,
-                "sma_diff": float(last_row["SMA_DIFF"]) if pd.notna(last_row["SMA_DIFF"]) else 0.0,
-                "rsi": float(last_row["RSI"]) if pd.notna(last_row["RSI"]) else 50.0,
-                "current_time": now_jst.strftime("%H:%M"),
-                "is_gotobi": now_jst.day in [5, 10, 15, 20, 25, 30],
-            }
-            report = logic.get_ai_analysis(api_key, context)
-            st.session_state.last_ai_report = report 
-            st.markdown(report)
-    else: st.warning("Gemini API Key を入力してください。")
+st.subheader("🤖 AI軍師・実戦運用本部")
 
-if col_port.button("💰 最適ポートフォリオ提示"):
-    if api_key:
-        with st.spinner("計算中..."):
-            st.markdown(logic.get_ai_portfolio(api_key, {}))
-    else: st.warning("Gemini API Key を入力してください。")
+tab1, tab2, tab3 = st.tabs(["📊 詳細レポート", "📝 注文戦略(日/週)", "💰 長期/ポートフォリオ"])
 
-# --- 7. ロボ的注文戦略セクション ---
-st.divider()
-st.subheader("🤖 AIトレード命令書（診断連動型）")
-if st.button("📝 診断に基づいた注文価格を算出"):
-    if api_key:
-        if not st.session_state.last_ai_report:
-            st.warning("先に『✨ Gemini AI 詳細レポート』を実行してください。")
-        else:
-            with st.spinner("診断連動中..."):
+with tab1:
+    if st.button("✨ レポート生成 (五十日/選挙対応)"):
+        if api_key:
+            with st.spinner("FP1級AIが分析中..."):
                 last_row = df.iloc[-1]
+                jst = pytz.timezone("Asia/Tokyo")
+                now_jst = datetime.now(jst)
                 context = {
                     "price": float(last_row["Close"]),
-                    "atr": float(last_row["ATR"]),
-                    "last_report": st.session_state.last_ai_report,
-                    "panel_short": diag['short']['status'] if diag else "不明",
-                    "panel_mid": diag['mid']['status'] if diag else "不明"
+                    "us10y": float(last_row["US10Y"]) if pd.notna(last_row["US10Y"]) else 0.0,
+                    "atr": float(last_row["ATR"]) if pd.notna(last_row["ATR"]) else 0.0,
+                    "sma_diff": float(last_row["SMA_DIFF"]) if pd.notna(last_row["SMA_DIFF"]) else 0.0,
+                    "rsi": float(last_row["RSI"]) if pd.notna(last_row["RSI"]) else 50.0,
+                    "current_time": now_jst.strftime("%H:%M"),
+                    "is_gotobi": now_jst.day in [5, 10, 15, 20, 25, 30],
+                    "capital": capital, # 資金情報も渡す
+                    "risk_percent": risk_percent
                 }
-                strategy = logic.get_ai_order_strategy(api_key, context)
-                st.info("AI診断およびパネル診断との整合性を確認しました。")
-                st.markdown(strategy)
-    else:
-        st.warning("Gemini API Key を入力してください。")
+                report = logic.get_ai_analysis(api_key, context)
+                st.session_state.last_ai_report = report 
+                st.markdown(report)
+        else: st.warning("Gemini API Key を入力してください。")
+
+with tab2:
+    if st.button("📝 注文命令書作成"):
+        if api_key:
+            if not st.session_state.last_ai_report:
+                st.warning("先に『詳細レポート』を生成してください。")
+            else:
+                with st.spinner("資金管理・スリップロス計算中..."):
+                    last_row = df.iloc[-1]
+                    context = {
+                        "price": float(last_row["Close"]),
+                        "atr": float(last_row["ATR"]),
+                        "last_report": st.session_state.last_ai_report,
+                        "panel_short": diag['short']['status'] if diag else "不明",
+                        "panel_mid": diag['mid']['status'] if diag else "不明",
+                        "capital": capital
+                    }
+                    strategy = logic.get_ai_order_strategy(api_key, context)
+                    st.info("AI診断およびパネル診断との整合性を確認しました。")
+                    st.markdown(strategy)
+        else:
+            st.warning("Gemini API Key を入力してください。")
+
+with tab3:
+    st.markdown("##### 週末・月末判断 & スワップ運用")
+    if st.button("💰 長期ポートフォリオ＆週末診断"):
+        if api_key:
+            with st.spinner("スワップ・金利分析中..."):
+                st.markdown(logic.get_ai_portfolio(api_key, {}))
+        else: st.warning("Gemini API Key を入力してください。")
