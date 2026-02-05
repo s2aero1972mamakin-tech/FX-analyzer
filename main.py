@@ -113,7 +113,7 @@ if q_price is not None:
         unsafe_allow_html=True,
     )
 
-# --- 1. 診断パネル ---
+# --- 1. 診断パネル (修正：重複価格表示を削除) ---
 if diag is not None:
     col_short, col_mid = st.columns(2)
     with col_short:
@@ -122,7 +122,6 @@ if diag is not None:
                 <h3 style="color:#333; margin:0; font-size:16px;">📅 1週間スパン（短期勢い）</h3>
                 <h2 style="color:#333; margin:5px 0; font-size:22px;">{diag['short']['status']}</h2>
                 <p style="color:#555; font-size:13px; line-height:1.5;">{diag['short']['advice']}</p>
-                <p style="color:#666; font-size:13px; font-weight:bold; margin-top:5px;">現在値: {diag['price']:.3f} 円</p>
             </div>
         """, unsafe_allow_html=True)
     with col_mid:
