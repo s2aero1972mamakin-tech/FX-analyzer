@@ -320,7 +320,7 @@ def get_currency_strength():
 
 
 # =====================================================
-# 判定ロジック
+# 判定ロジック（修正済み）
 # =====================================================
 def judge_condition(df):
     if df is None or len(df) < 2:
@@ -338,10 +338,18 @@ def judge_condition(df):
     else:
         mid_s, mid_c, mid_a = "ステイ・静観", "#e0e0e0", "明確なシグナル待ち。FPの視点では無理なエントリーを避ける時期です。"
 
+    # --- 修正箇所：5日線との距離・関係性を強調 ---
     if price > sma5:
-        short_s, short_c, short_a = "上昇継続（短期）", "#e3f2fd", f"価格が5日線({sma5:.2f})の上を維持。勢いは強いです。"
+        short_s = "上昇継続（短期）"
+        short_c = "#e3f2fd"
+        # 以前: 価格が5日線(xxx)の上を維持...
+        # 変更: 5日線との距離・強さにフォーカス
+        short_a = f"現在値は<b>5日線 ({sma5:.2f})</b> の上を推移中。<br>短期的な上昇圧力は維持されています。"
     else:
-        short_s, short_c, short_a = "勢い鈍化・調整", "#fce4ec", f"価格が5日線({sma5:.2f})を下回りました。短期的な調整局面です。"
+        short_s = "勢い鈍化・調整"
+        short_c = "#fce4ec"
+        # 変更: 5日線との距離・強さにフォーカス
+        short_a = f"現在値は<b>5日線 ({sma5:.2f})</b> を下回りました。<br>短期的な調整（下落）局面に注意。"
 
     return {
         "short": {"status": short_s, "color": short_c, "advice": short_a},
