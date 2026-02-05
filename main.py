@@ -42,7 +42,7 @@ trade_type = st.sidebar.radio("保有タイプ", ["買い (Long)", "売り (Shor
 
 # --- クオート更新 ---
 st.sidebar.markdown("---")
-if st.sidebar.button("🔄 最新クオート更新（429回避）"):
+if st.sidebar.button("🔄 最新クオート更新"):
     st.session_state.quote = logic.get_latest_quote("JPY=X")
     st.rerun()
 
@@ -289,3 +289,4 @@ with tab3:
             with st.spinner("スワップ・金利分析中..."):
                 st.markdown(logic.get_ai_portfolio(api_key, ctx)) # ctxを渡してポジション連動させる
         else: st.warning("Gemini API Key を入力してください。")
+
