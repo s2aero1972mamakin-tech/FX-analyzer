@@ -5,6 +5,7 @@ import pytz
 import requests
 import time
 from datetime import datetime
+import re  # ✅ 追加: AI予想ラインの数値抽出用
 
 TOKYO = pytz.timezone("Asia/Tokyo")
 
@@ -472,18 +473,6 @@ def get_ai_portfolio(api_key, context_data):
         return "ポートフォリオ分析に失敗しました。"
 
 
-def get_ai_range(api_key, context_data):
-    try:
-        model = genai.GenerativeModel(get_active_model(api_key))
-        p = context_data.get('price', 0.0)
-        prompt = f"現在のドル円は {p:.2f}円です。今後1週間の[最高値, 最安値]を半角数字のみで返してください。"
-        res = model.generate_content(prompt).text
-        import re
-        nums = re.findall(r"\d+\.\d+|\d+", res)
-        return [float(nums[0]), float(nums[1])] if len(nums) >= 2 else None
-    except:
-        return None
-
 # =====================================================
 # ✅ 新規追加: ロボ的注文戦略生成（全診断連動型）
 # =====================================================
@@ -535,3 +524,17 @@ def get_ai_order_strategy(api_key, context_data):
         return response.text
     except Exception as e:
         return f"注文戦略生成エラー: {str(e)}"
+
+# =====================================================
+# ✅ 追加: AI予想ライン生成機能 (main.pyで呼び出し)
+# =====================================================
+def get_ai_range(api_key, context_data):
+    try:
+        model = genai.GenerativeModel(get_active_model(api_key))
+        p = context_data.get('price', 0.0)
+        prompt = f"現在のドル円は {p:.2f}円です。今後1週間の[最高値, 最安値]を半角数字のみで返してください。"
+        res = model.generate_content(prompt).text
+        nums = re.findall(r"\d+\.\d+|\d+", res)
+        return [float(nums[0]), float(nums[1])] if len(nums) >= 2 else None
+    except:
+        return None
