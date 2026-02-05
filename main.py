@@ -8,7 +8,7 @@ import logic  # ← logic.pyが必要
 
 # --- ページ設定 ---
 st.set_page_config(layout="wide", page_title="AI-FX Analyzer 2026")
-st.title("🤖 AI連携型 USD/JPY 戦略分析ツール (実戦運用版)")
+st.title("🤖 AI連携型 USD/JPY 戦略分析ツール (SBI仕様)")
 
 # --- 状態保持の初期化 ---
 if "ai_range" not in st.session_state:
@@ -27,16 +27,15 @@ api_key = st.sidebar.text_input("Gemini API Key", value=default_key, type="passw
 
 # --- サイドバー設定 (資金管理機能追加) ---
 st.sidebar.markdown("---")
-st.sidebar.subheader("💰 資金管理 & トレード設定")
+st.sidebar.subheader("💰 SBI FX 資金管理")
 
 # 1. 資金管理入力
 capital = st.sidebar.number_input("軍資金 (JPY)", value=300000, step=10000)
-risk_percent = st.sidebar.slider("1トレード許容損失 (%)", 1.0, 5.0, 2.0)
+risk_percent = st.sidebar.slider("1トレード許容損失 (%)", 1.0, 10.0, 2.0, help="負けた時に資金の何%を失う覚悟があるか。プロは2%推奨。")
 leverage = 25  # 固定
 
 st.sidebar.markdown("---")
 entry_price = st.sidebar.number_input("エントリー価格 (円)", value=0.0, format="%.3f")
-trade_type = st.sidebar.radio("ポジション種別", ["買い（ロング）", "売り（ショート）"])
 
 # --- クオート更新 ---
 st.sidebar.markdown("---")
@@ -58,6 +57,9 @@ if (q_price is None) and (df is not None) and (not df.empty):
 if df is None or df.empty:
     st.error("データが取得できませんでした。")
     st.stop()
+
+# 最新レートが取得できない場合のバックアップ
+current_rate = q_price if q_price else df["Close"].iloc[-1]
 
 # 軸同期のためにインデックスを正規化
 df.index = pd.to_datetime(df.index)
@@ -104,7 +106,6 @@ if diag is not None:
                 <h3 style="color:#333; margin:0; font-size:16px;">📅 1週間スパン（短期勢い）</h3>
                 <h2 style="color:#333; margin:10px 0; font-size:24px;">{diag['short']['status']}</h2>
                 <p style="color:#555; font-size:14px; line-height:1.6;">{diag['short']['advice']}</p>
-                <p style="color:#666; font-size:14px; font-weight:bold; margin-top:10px;">現在値: {diag['price']:.3f} 円</p>
             </div>
         """, unsafe_allow_html=True)
     with col_mid:
@@ -125,10 +126,10 @@ with col_alert:
                 st.warning("⚠️ **【警戒】ボラティリティ上昇中**")
         except Exception: pass
 with col_slip:
-    # ATRに基づく推奨スリップロス計算 (ATRの10%程度をpips換算など)
+    # ATRに基づく推奨スリップロス計算
     current_atr = df["ATR"].iloc[-1]
-    rec_slip = max(3, int(current_atr * 10))  # 最低3pips、ATRが高いときは広げる
-    st.info(f"🛡️ 現在の推奨スリップロス: **{rec_slip} pips** (ATR:{current_atr:.3f})")
+    rec_slip = max(3, int(current_atr * 10)) 
+    st.info(f"🛡️ 現在の推奨スリップロス: **{rec_slip} pips (銭)** (ATR:{current_atr:.3f})")
 
 # --- 3. メインチャート ---
 fig_main = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08, subplot_titles=("USD/JPY & AI予想", "米国債10年物利回り"), row_heights=[0.7, 0.3])
@@ -154,9 +155,9 @@ fig_main.update_yaxes(range=[y_min_view * 0.998, y_max_view * 1.002], autorange=
 fig_main.update_layout(height=650, template="plotly_dark", xaxis_rangeslider_visible=False, showlegend=True, margin=dict(r=240))
 st.plotly_chart(fig_main, use_container_width=True)
 
-# --- 4. RSI & 資金管理計算機 ---
-st.subheader("🛠️ 実戦エントリー補助 & 指標")
-col_rsi, col_calc = st.columns([1, 1])
+# --- 4. RSI & SBI仕様ロット計算機 ---
+st.subheader("🛠️ SBI FX ロット計算機 (1万通貨単位)")
+col_rsi, col_calc = st.columns([1, 1.5])
 
 with col_rsi:
     st.markdown(f"**📉 RSI（過熱感）: {float(df['RSI'].iloc[-1]):.2f}**")
@@ -169,17 +170,40 @@ with col_rsi:
     st.plotly_chart(fig_rsi, use_container_width=True)
 
 with col_calc:
-    st.markdown("#### 🧮 推奨ロット計算機")
-    stop_p = st.number_input("想定損切幅 (円) ※例: 0.5円下で損切", value=0.5, step=0.1)
+    # SBI仕様の証拠金計算
+    one_lot_units = 10000  # 1万通貨
+    required_margin_per_lot = (current_rate * one_lot_units) / leverage # 1万通貨あたりの必要証拠金
+    max_lots = int(capital / required_margin_per_lot) # 全力で買える枚数
+
+    st.markdown("#### 🧮 リスク管理 vs 全力シミュレーション")
+    
+    # 損切幅の入力
+    stop_p = st.number_input("想定損切幅 (円) ※例: 0.5円逆行で損切", value=0.5, step=0.1)
+    
     if stop_p > 0:
+        # リスク許容額に基づく推奨ロット
         risk_amount = capital * (risk_percent / 100)
-        # ロット数 = 許容損失額 / 損切幅
-        lot = risk_amount / stop_p
-        st.success(f"""
-        - 許容損失額: **{risk_amount:,.0f} 円** ({risk_percent}%)
-        - 推奨発注数量: **{lot:,.0f} 通貨**
-        - (SBI FX 1通貨単位対応)
-        """)
+        safe_lots = risk_amount / (stop_p * one_lot_units) # 推奨ロット数(小数)
+        
+        # 表示用整形
+        c1, c2 = st.columns(2)
+        with c1:
+            st.error(f"""
+            **💀 限界 (レバレッジ25倍)**
+            - 必要証拠金(1万通貨): ¥{required_margin_per_lot:,.0f}
+            - **最大発注可能数: {max_lots} 枚** (万通貨)
+            """)
+        with c2:
+            st.success(f"""
+            **🛡️ 推奨 (安全重視)**
+            - 許容損失額: ¥{risk_amount:,.0f} ({risk_percent}%)
+            - **推奨発注数量: {safe_lots:.1f} 枚** (万通貨)
+            """)
+            
+        if safe_lots > max_lots:
+            st.warning("⚠️ 注意：リスク許容範囲内ですが、証拠金不足で発注できない可能性があります。")
+        elif safe_lots < 0.1:
+            st.warning("⚠️ 注意：損切幅が広すぎるか資金不足のため、1000通貨単位(0.1枚)での取引を推奨します。")
 
 # --- 5. 通貨強弱 ---
 if strength is not None and not strength.empty:
@@ -212,8 +236,7 @@ with tab1:
                     "rsi": float(last_row["RSI"]) if pd.notna(last_row["RSI"]) else 50.0,
                     "current_time": now_jst.strftime("%H:%M"),
                     "is_gotobi": now_jst.day in [5, 10, 15, 20, 25, 30],
-                    "capital": capital, # 資金情報も渡す
-                    "risk_percent": risk_percent
+                    "capital": capital
                 }
                 report = logic.get_ai_analysis(api_key, context)
                 st.session_state.last_ai_report = report 
@@ -249,3 +272,4 @@ with tab3:
             with st.spinner("スワップ・金利分析中..."):
                 st.markdown(logic.get_ai_portfolio(api_key, {}))
         else: st.warning("Gemini API Key を入力してください。")
+
