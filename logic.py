@@ -5,7 +5,7 @@ import pytz
 import requests
 import time
 from datetime import datetime
-import re  # ✅ 追加: AI予想ラインの数値抽出用
+import re  # ✅ 追加: 予想ラインの数値抽出に必須
 
 TOKYO = pytz.timezone("Asia/Tokyo")
 
@@ -321,7 +321,7 @@ def get_currency_strength():
 
 
 # =====================================================
-# 判定ロジック（修正済み）
+# 判定ロジック
 # =====================================================
 def judge_condition(df):
     if df is None or len(df) < 2:
@@ -339,18 +339,10 @@ def judge_condition(df):
     else:
         mid_s, mid_c, mid_a = "ステイ・静観", "#e0e0e0", "明確なシグナル待ち。FPの視点では無理なエントリーを避ける時期です。"
 
-    # --- 修正箇所：5日線との距離・関係性を強調 ---
     if price > sma5:
-        short_s = "上昇継続（短期）"
-        short_c = "#e3f2fd"
-        # 以前: 価格が5日線(xxx)の上を維持...
-        # 変更: 5日線との距離・強さにフォーカス
-        short_a = f"現在値は<b>5日線 ({sma5:.2f})</b> の上を推移中。<br>短期的な上昇圧力は維持されています。"
+        short_s, short_c, short_a = "上昇継続（短期）", "#e3f2fd", f"現在値は<b>5日線 ({sma5:.2f})</b> の上を推移中。<br>短期的な上昇圧力は維持されています。"
     else:
-        short_s = "勢い鈍化・調整"
-        short_c = "#fce4ec"
-        # 変更: 5日線との距離・強さにフォーカス
-        short_a = f"現在値は<b>5日線 ({sma5:.2f})</b> を下回りました。<br>短期的な調整（下落）局面に注意。"
+        short_s, short_c, short_a = "勢い鈍化・調整", "#fce4ec", f"現在値は<b>5日線 ({sma5:.2f})</b> を下回りました。<br>短期的な調整（下落）局面に注意。"
 
     return {
         "short": {"status": short_s, "color": short_c, "advice": short_a},
@@ -473,9 +465,6 @@ def get_ai_portfolio(api_key, context_data):
         return "ポートフォリオ分析に失敗しました。"
 
 
-# =====================================================
-# ✅ 新規追加: ロボ的注文戦略生成（全診断連動型）
-# =====================================================
 def get_ai_order_strategy(api_key, context_data):
     try:
         model = genai.GenerativeModel(get_active_model(api_key))
@@ -525,9 +514,7 @@ def get_ai_order_strategy(api_key, context_data):
     except Exception as e:
         return f"注文戦略生成エラー: {str(e)}"
 
-# =====================================================
-# ✅ 追加: AI予想ライン生成機能 (main.pyで呼び出し)
-# =====================================================
+# ✅✅✅ 追加: 予想ライン生成関数（main.pyのボタン動作に必須） ✅✅✅
 def get_ai_range(api_key, context_data):
     try:
         model = genai.GenerativeModel(get_active_model(api_key))
