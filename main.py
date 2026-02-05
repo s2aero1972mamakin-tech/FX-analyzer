@@ -42,7 +42,7 @@ trade_type = st.sidebar.radio("保有タイプ", ["買い (Long)", "売り (Shor
 
 # --- クオート更新 ---
 st.sidebar.markdown("---")
-if st.sidebar.button("🔄 最新クオート更新"):
+if st.sidebar.button("🔄 最新クオート更新（429回避）"):
     st.session_state.quote = logic.get_latest_quote("JPY=X")
     st.rerun()
 
@@ -113,10 +113,11 @@ if q_price is not None:
         unsafe_allow_html=True,
     )
 
-# --- 1. 診断パネル (修正：重複価格表示を削除) ---
+# --- 1. 診断パネル ---
 if diag is not None:
     col_short, col_mid = st.columns(2)
     with col_short:
+        # 重複していた価格表示の行を削除しました
         st.markdown(f"""
             <div style="background-color:{diag['short']['color']}; padding:15px; border-radius:12px; border:1px solid #ddd; min-height:180px;">
                 <h3 style="color:#333; margin:0; font-size:16px;">📅 1週間スパン（短期勢い）</h3>
@@ -288,4 +289,3 @@ with tab3:
             with st.spinner("スワップ・金利分析中..."):
                 st.markdown(logic.get_ai_portfolio(api_key, ctx)) # ctxを渡してポジション連動させる
         else: st.warning("Gemini API Key を入力してください。")
-
