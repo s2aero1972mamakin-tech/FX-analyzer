@@ -262,10 +262,10 @@ fig_main.add_trace(go.Scatter(x=df.index, y=df["SMA_5"], name="5日線", line=di
 fig_main.add_trace(go.Scatter(x=df.index, y=df["SMA_25"], name="25日線", line=dict(color="orange", width=2)), row=1, col=1)
 fig_main.add_trace(go.Scatter(x=df.index, y=df["SMA_75"], name="75日線", line=dict(color="gray", width=1, dash="dot")), row=1, col=1)
 
-# ★ AI予想ライン表示機能 (赤・緑点線)
-if st.session_state.get("ai_range"):
-    ai_rng = st.session_state.get("ai_range")
+# ★ AI予想ライン表示機能（点線）
+ai_rng = st.session_state.get("ai_range")
 high_val = low_val = None
+
 if isinstance(ai_rng, dict):
     # 標準形式: {"low":..., "high":...}
     low_val = ai_rng.get("low")
@@ -273,13 +273,22 @@ if isinstance(ai_rng, dict):
 elif isinstance(ai_rng, (list, tuple)) and len(ai_rng) >= 2:
     # 旧形式: (high, low) or (low, high) どちらでも耐える
     a, b = ai_rng[0], ai_rng[1]
-    # 通常 high > low のはず
     if a is not None and b is not None:
         try:
             a = float(a); b = float(b)
             high_val, low_val = (a, b) if a >= b else (b, a)
         except Exception:
-            pass
+            high_val = low_val = None
+
+# 値が揃った時だけ描画
+try:
+    if high_val is not None and low_val is not None:
+        high_val = float(high_val); low_val = float(low_val)
+        fig_main.add_hline(y=high_val, line_dash="dot", line_color="red", annotation_text="AI高値", row=1, col=1)
+        fig_main.add_hline(y=low_val, line_dash="dot", line_color="lime", annotation_text="AI安値", row=1, col=1)
+except Exception:
+    pass
+
 
     view_x = [start_view, last_date]
     fig_main.add_trace(go.Scatter(x=view_x, y=[high_val, high_val], name=f"予想最高:{high_val:.2f}", line=dict(color="red", width=2, dash="dash")), row=1, col=1)
