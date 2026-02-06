@@ -77,6 +77,54 @@ def render_weekend_summary(wj: dict):
             f"Trail={_fmt_price(lv.get('trail'))}"
         )
 
+
+def inject_ai_range_into_ctx(api_key: str, df, current_rate: float, ctx: dict, purpose: str = "decision"):
+    """AI予想レンジをボタン不要で自動取得し、ctxへ注入する。
+    - 注文命令/週末判断の実行時に必ず呼ぶ（人間操作で分岐しない）
+    - TTLキャッシュで429を抑制（logic.ensure_ai_range）
+    """
+    try:
+        # 既にセッションにあればそれを優先（手動更新ボタン結果も自然に利用）
+        ai = st.session_state.get("ai_range")
+        if not (isinstance(ai, dict) and ai.get("low") is not None and ai.get("high") is not None):
+            last_row = df.iloc[-1]
+            base_ctx = {
+                "price": float(last_row["Close"]),
+                "rsi": float(last_row.get("RSI", 0.0) or 0.0),
+                "atr": float(last_row.get("ATR", 0.0) or 0.0),
+            }
+            ai = logic.ensure_ai_range(api_key, base_ctx, force=False)
+            if isinstance(ai, dict):
+                st.session_state.ai_range = {
+                    "low": float(ai["low"]),
+                    "high": float(ai["high"]),
+                    "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "why": str(ai.get("why", "")),
+                }
+                ai = st.session_state.ai_range
+
+        if isinstance(ai, dict) and ai.get("low") is not None and ai.get("high") is not None:
+            low = float(ai["low"]); high = float(ai["high"])
+            if low > high:
+                low, high = high, low
+            mid = (low + high) / 2.0
+            width_pct = (high - low) / max(float(current_rate), 1e-6) * 100.0
+            pos = (float(current_rate) - low) / max((high - low), 1e-6)
+
+            ctx.update({
+                "ai_range_low": low,
+                "ai_range_high": high,
+                "ai_range_mid": mid,
+                "ai_range_width_pct": width_pct,
+                "ai_range_pos": pos,
+                "ai_range_why": str(ai.get("why", "")),
+                "ai_range_ts": str(ai.get("ts", "")),
+            })
+            return True
+    except Exception:
+        pass
+    return False
+
     ov = (wj.get("override") or {}).get("mode")
     if ov and ov != "AUTO":
         st.warning(f"オーバーライド：{LABEL_OVERRIDE.get(ov, ov)} / {(wj.get('override') or {}).get('reason','')}".strip())
@@ -192,7 +240,8 @@ if st.sidebar.button("📈 AI予想ライン反映"):
         with st.spinner("AI予想を取得中..."):
             last_row = df.iloc[-1]
             context = {"price": last_row["Close"], "rsi": last_row["RSI"], "atr": last_row["ATR"]}
-            st.session_state.ai_range = logic.get_ai_range(api_key, context)
+            ai_r = logic.ensure_ai_range(api_key, context, force=True)
+            st.session_state.ai_range = {"low": float(ai_r["low"]), "high": float(ai_r["high"]), "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "why": ai_r.get("why","")} if isinstance(ai_r, dict) else None
             st.rerun()
     else:
         st.warning("Gemini API Key を入力してください。")
@@ -383,9 +432,10 @@ with tab2:
                     ctx["last_report"] = st.session_state.last_ai_report
                     ctx["panel_short"] = diag['short']['status'] if diag else "不明"
                     ctx["panel_mid"] = diag['mid']['status'] if diag else "不明"
+                    inject_ai_range_into_ctx(api_key, df, float(current_rate), ctx, purpose="order")
                     strategy = logic.get_ai_order_strategy(api_key, ctx, override_mode=override_mode, override_reason=override_reason)
                     st.info("AI診断およびパネル診断との整合性を確認しました。")
-                    st.markdown(strategy)
+                    render_order_summary(strategy)
         else:
             st.warning("Gemini API Key を入力してください。")
 
@@ -417,6 +467,8 @@ with tab4:
             ctx_w["panel_short"] = diag["short"]["status"] if diag else "不明"
             ctx_w["panel_mid"] = diag["mid"]["status"] if diag else "不明"
 
+            inject_ai_range_into_ctx(api_key, df, float(current_rate), ctx_w, purpose="weekend")
+
             weekend = logic.get_ai_weekend_decision(
                 api_key,
                 ctx_w,
@@ -427,4 +479,3 @@ with tab4:
 
     if st.session_state.get("last_weekend_json"):
         render_weekend_summary(st.session_state["last_weekend_json"])
-
