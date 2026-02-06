@@ -213,13 +213,13 @@ with col_calc:
             st.error(f"""
             **💀 限界 (レバレッジ25倍)**
             - 必要証拠金/枚: ¥{required_margin_per_lot:,.0f}
-            - **最大発注可能数: {max_lots} 枚**
+            - **最大発注可能数: {max_lots} 建**
             """)
         with c2:
             st.success(f"""
             **🛡️ 推奨 (安全重視)**
             - 許容損失額: ¥{risk_amount:,.0f}
-            - **推奨発注数量: {safe_lots:.1f} 枚**
+            - **推奨発注数量: {safe_lots:.1f} 建**
             """)
             
         if safe_lots > max_lots:
@@ -289,5 +289,6 @@ with tab3:
             with st.spinner("スワップ・金利分析中..."):
                 st.markdown(logic.get_ai_portfolio(api_key, ctx)) # ctxを渡してポジション連動させる
         else: st.warning("Gemini API Key を入力してください。")
+
 
 
