@@ -99,7 +99,13 @@ def inject_ai_range_into_ctx(api_key: str, ctx: dict, force: bool = False):
     except Exception:
         base = {"price": ctx.get("price", 0.0), "rsi": ctx.get("rsi", 50.0), "atr": ctx.get("atr", 0.0)}
 
-    rng = logic.ensure_ai_range(api_key, base, force=force)
+    ensure = getattr(logic, "ensure_ai_range", None)
+    if callable(ensure):
+        rng = ensure(api_key, base, force=force)
+    else:
+        # 旧logic互換: get_ai_range を直接呼ぶ（キャッシュ無し）
+        getrng = getattr(logic, "get_ai_range", None)
+        rng = getrng(api_key, base) if callable(getrng) else None
     if isinstance(rng, dict) and rng.get("low") is not None and rng.get("high") is not None:
         low = float(rng["low"]); high = float(rng["high"])
         if low > high:
