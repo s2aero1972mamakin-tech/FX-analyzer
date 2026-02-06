@@ -6,11 +6,209 @@ import requests
 import time
 from datetime import datetime
 import re  # ✅ 【必須】AI予想ラインの数値抽出用
+import json  # ✅ JSON固定出力のため
 
 TOKYO = pytz.timezone("Asia/Tokyo")
 
 # 取得失敗時の理由をここに残す（main.pyで表示できる）
 LAST_FETCH_ERROR = ""
+
+
+# -----------------------------
+# JSON固定出力: パース/検証ヘルパ
+# -----------------------------
+def _extract_json_block(text: str) -> str:
+    """LLM出力から最初のJSONオブジェクト({..})を抽出。見つからなければ空文字。"""
+    if not text:
+        return ""
+    s = text.strip()
+    # そのままJSONの場合
+    if s.startswith("{") and s.endswith("}"):
+        return s
+    # 文字列内の { ... } を最短〜最長で探索（簡易）
+    start = s.find("{")
+    end = s.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return s[start:end+1]
+    return ""
+
+def _safe_float(x, default=None):
+    try:
+        if x is None:
+            return default
+        if isinstance(x, (int, float)):
+            return float(x)
+        # "155.20" / "155,20" など
+        s = str(x).strip().replace(",", "")
+        return float(s)
+    except Exception:
+        return default
+
+def _clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
+def _validate_order_json(obj: dict, ctx: dict) -> (bool, list):
+    """注文JSONの必須/整合性チェック。NGなら理由リストを返す。"""
+    reasons = []
+    if not isinstance(obj, dict):
+        return False, ["order_json_not_object"]
+
+    decision = obj.get("decision")
+    if decision not in ("TRADE", "NO_TRADE"):
+        reasons.append("decision_invalid")
+
+    # NO_TRADEなら最低限でOK
+    if decision == "NO_TRADE":
+        return True, reasons
+
+    side = obj.get("side")
+    if side not in ("LONG", "SHORT"):
+        reasons.append("side_invalid")
+
+    entry = _safe_float(obj.get("entry"))
+    tp = _safe_float(obj.get("take_profit"))
+    sl = _safe_float(obj.get("stop_loss"))
+    if entry is None: reasons.append("entry_missing")
+    if tp is None: reasons.append("take_profit_missing")
+    if sl is None: reasons.append("stop_loss_missing")
+
+    horizon = obj.get("horizon")
+    if horizon not in ("WEEK", "MONTH"):
+        reasons.append("horizon_invalid")
+
+    conf = _safe_float(obj.get("confidence"), default=0.0)
+    if conf is None:
+        reasons.append("confidence_missing")
+    else:
+        obj["confidence"] = _clamp(conf, 0.0, 1.0)
+
+    if entry is not None and tp is not None and sl is not None and side in ("LONG","SHORT"):
+        # 方向整合
+        if side == "LONG":
+            if not (sl < entry < tp):
+                reasons.append("levels_inconsistent_long")
+        else:
+            if not (tp < entry < sl):
+                reasons.append("levels_inconsistent_short")
+
+        # RR最低ライン（例: 1.1）
+        risk = abs(entry - sl)
+        reward = abs(tp - entry)
+        if risk <= 0:
+            reasons.append("risk_nonpositive")
+        else:
+            rr = reward / risk
+            obj["rr_ratio"] = rr
+            if rr < 1.1:
+                reasons.append("rr_too_low")
+
+        # 異常値ガード（現値から極端に遠い等）
+        p = _safe_float(ctx.get("price"), default=entry)
+        if p is not None:
+            if abs(entry - p) / max(p, 1e-6) > 0.03:  # 3%超乖離は異常
+                reasons.append("entry_too_far_from_price")
+
+    # why/notes は任意（あると良い）
+    if "why" not in obj:
+        obj["why"] = ""
+    if "notes" not in obj or not isinstance(obj.get("notes"), list):
+        obj["notes"] = []
+
+    return (len(reasons) == 0), reasons
+
+def _validate_regime_json(obj: dict) -> (bool, list):
+    reasons = []
+    if not isinstance(obj, dict):
+        return False, ["regime_json_not_object"]
+    regime = obj.get("market_regime")
+    if regime not in ("DEFENSIVE", "OPPORTUNITY"):
+        reasons.append("market_regime_invalid")
+    conf = _safe_float(obj.get("confidence"), default=0.0)
+    obj["confidence"] = _clamp(conf, 0.0, 1.0)
+    if "why" not in obj:
+        obj["why"] = ""
+    if "notes" not in obj or not isinstance(obj.get("notes"), list):
+        obj["notes"] = []
+    return (len(reasons) == 0), reasons
+
+def _validate_weekend_json(obj: dict) -> (bool, list):
+    reasons = []
+    if not isinstance(obj, dict):
+        return False, ["weekend_json_not_object"]
+    action = obj.get("action")
+    if action not in ("TAKE_PROFIT","CUT_LOSS","HOLD_WEEK","HOLD_MONTH","NO_POSITION"):
+        reasons.append("action_invalid")
+    if "why" not in obj:
+        obj["why"] = ""
+    if "notes" not in obj or not isinstance(obj.get("notes"), list):
+        obj["notes"] = []
+    if "levels" not in obj or not isinstance(obj.get("levels"), dict):
+        obj["levels"] = {"take_profit": 0, "stop_loss": 0, "trail": 0}
+    return (len(reasons) == 0), reasons
+
+# -----------------------------
+# NO_TRADEゲート（守り/攻め）
+# -----------------------------
+_NO_TRADE_THRESHOLDS = {
+    # 守り型
+    "DEFENSIVE": {
+        "sma_diff_pct": 0.20,  # 0.20%
+        "rsi_lo": 45.0,
+        "rsi_hi": 55.0,
+        "atr_mult": 1.6,
+        "ma_close_pct": 0.10,  # MA25とMA75が0.10%以内
+    },
+    # 攻め型
+    "OPPORTUNITY": {
+        "sma_diff_pct": 0.15,  # 0.15%
+        "rsi_lo": 48.0,
+        "rsi_hi": 52.0,
+        "atr_mult": 1.9,
+        "ma_close_pct": 0.08,
+    },
+}
+
+def no_trade_gate(context_data: dict, market_regime: str, force_defensive: bool = False):
+    """数値条件でNO_TRADE判定。TrueならNO_TRADE理由リストを返す。"""
+    reasons = []
+    regime = "DEFENSIVE" if force_defensive else (market_regime if market_regime in _NO_TRADE_THRESHOLDS else "DEFENSIVE")
+    th = _NO_TRADE_THRESHOLDS[regime]
+
+    ps = str(context_data.get("panel_short",""))
+    pm = str(context_data.get("panel_mid",""))
+    if "静観" in pm:
+        reasons.append("panel_mid_says_wait")
+
+    price = _safe_float(context_data.get("price"))
+    sma25 = _safe_float(context_data.get("sma25"))
+    sma75 = _safe_float(context_data.get("sma75"))
+    rsi = _safe_float(context_data.get("rsi"))
+    atr = _safe_float(context_data.get("atr"))
+    atr_avg60 = _safe_float(context_data.get("atr_avg60"))
+
+    # データ不備
+    for k,v in [("price",price),("sma25",sma25),("sma75",sma75),("rsi",rsi),("atr",atr)]:
+        if v is None or v != v:  # NaN
+            reasons.append(f"data_invalid_{k}")
+
+    if reasons:
+        return True, regime, reasons
+
+    # 方向感なし（MA収束＆RSI中立）
+    sma_diff_pct = abs(sma25 - sma75) / max(price, 1e-6) * 100.0
+    if sma_diff_pct < th["sma_diff_pct"] and (th["rsi_lo"] <= rsi <= th["rsi_hi"]):
+        reasons.append("no_direction_ma_converge_and_rsi_neutral")
+
+    # MA同士の接近（さらに厳しめ）
+    if sma_diff_pct < th["ma_close_pct"]:
+        reasons.append("ma25_ma75_too_close")
+
+    # 荒れすぎ
+    if atr_avg60 is not None and atr_avg60 > 0:
+        if atr > atr_avg60 * th["atr_mult"]:
+            reasons.append("volatility_too_high_atr_spike")
+
+    return (len(reasons) > 0), regime, reasons
 
 # -----------------------------
 # 超軽量TTLキャッシュ（Streamlit再実行対策）
@@ -370,6 +568,73 @@ def get_active_model(api_key):
     return "models/gemini-1.5-flash"
 
 
+def get_ai_market_regime(api_key, context_data):
+    """
+    market_regime を AI に出させる（DEFENSIVE / OPPORTUNITY）。
+    ここでの出力は「NO_TRADEゲートの厳しさ」を切替える目的（裁量介入を減らす）。
+    JSONのみ返す。
+    """
+    try:
+        model = genai.GenerativeModel(get_active_model(api_key))
+        p = context_data.get("price", 0.0)
+        rsi = context_data.get("rsi", 0.0)
+        sma25 = context_data.get("sma25", 0.0)
+        sma75 = context_data.get("sma75", 0.0)
+        atr = context_data.get("atr", 0.0)
+        atr_avg60 = context_data.get("atr_avg60", 0.0)
+        ps = context_data.get("panel_short", "不明")
+        pm = context_data.get("panel_mid", "不明")
+        report = context_data.get("last_report", "なし")
+
+        prompt = f"""
+あなたはFX運用の市場環境判定エンジンです。
+目的：今週の市場環境を「守り(DEFENSIVE)」か「機会(OPPORTUNITY)」のどちらかに分類し、
+NO_TRADEゲートの厳しさを切り替えるための判定を出してください。
+
+【入力（USD/JPY）】
+price={p}
+rsi={rsi}
+sma25={sma25}
+sma75={sma75}
+atr={atr}
+atr_avg60={atr_avg60}
+panel_short={ps}
+panel_mid={pm}
+last_report_summary={report[:700]}
+
+【出力ルール】
+- 出力はJSONオブジェクトのみ（前後に文章を付けない）
+- 次のキーを必ず含める：
+  market_regime: "DEFENSIVE" または "OPPORTUNITY"
+  confidence: 0.0〜1.0
+  why: 1〜3文の理由（日本語）
+  notes: 箇条書き配列（0〜6個）
+
+【判定の目安】
+- DEFENSIVE: 方向感が弱い/レンジ/ボラが荒い/中期が静観など、期待値が低い
+- OPPORTUNITY: 週足で方向感が比較的明確で、継続/伸びが期待できる
+"""
+        resp = model.generate_content(prompt)
+        raw = getattr(resp, "text", "") or ""
+        j = _extract_json_block(raw)
+        obj = json.loads(j) if j else {}
+        ok, reasons = _validate_regime_json(obj)
+        if not ok:
+            return {
+                "market_regime": "DEFENSIVE",
+                "confidence": 0.0,
+                "why": "market_regime JSONが不正のため保守的にDEFENSIVEへ。",
+                "notes": ["parse_or_validation_failed", *reasons]
+            }
+        return obj
+    except Exception as e:
+        return {
+            "market_regime": "DEFENSIVE",
+            "confidence": 0.0,
+            "why": f"market_regime 判定で例外。保守的にDEFENSIVEへ。({type(e).__name__})",
+            "notes": []
+        }
+
 def get_ai_analysis(api_key, context_data):
     try:
         model = genai.GenerativeModel(get_active_model(api_key))
@@ -440,6 +705,88 @@ def get_ai_analysis(api_key, context_data):
         return f"AI分析エラー: {str(e)}"
 
 
+def get_ai_weekend_decision(api_key, context_data, override_mode="AUTO", override_reason=""):
+    """
+    週末判断（利確/損切/継続/1か月継続）をJSON命令で返す。
+    """
+    # 緊急停止：週末も「取引しない/新規しない」に固定
+    if override_mode == "FORCE_NO_TRADE":
+        why = "緊急停止（FORCE_NO_TRADE）。"
+        if override_reason and override_reason.strip():
+            why += f" 理由: {override_reason.strip()}"
+        return {
+            "action": "NO_POSITION",
+            "why": why,
+            "levels": {"take_profit": 0, "stop_loss": 0, "trail": 0},
+            "notes": ["human_override=true"],
+            "override": {"mode": override_mode, "reason": override_reason.strip()}
+        }
+
+    try:
+        model = genai.GenerativeModel(get_active_model(api_key))
+
+        p = context_data.get("price", 0.0)
+        ps = context_data.get("panel_short", "不明")
+        pm = context_data.get("panel_mid", "不明")
+        report = context_data.get("last_report", "なし")
+
+        ep = context_data.get("entry_price", 0.0)
+        tt = context_data.get("trade_type", "なし")
+        pos = f"現在ポジション: entry_price={ep}, trade_type={tt}" if ep and ep > 0 else "現在ポジション: なし"
+
+        prompt = f"""
+あなたはFX運用の週末判断エンジンです。出力はJSON命令のみ。
+
+【前提（運用ルール）】
+- 月曜にエントリー、週末に「利確/損切/継続/1か月継続」を判断する。
+- 人間は判断せず、数値入力のみ行う。
+- あいまい表現は禁止。必ず action を選ぶ。
+
+【入力】
+price={p}
+panel_short={ps}
+panel_mid={pm}
+{pos}
+last_report_summary={report[:900]}
+
+【出力(JSONのみ)】
+- action: "TAKE_PROFIT" | "CUT_LOSS" | "HOLD_WEEK" | "HOLD_MONTH" | "NO_POSITION"
+- why: 1〜3文の理由（日本語）
+- levels: {{ take_profit: number, stop_loss: number, trail: number }}  (該当が無ければ0)
+- notes: string配列（0〜6）
+
+【判定のガイド】
+- 週末時点で構造が壊れている/損切基準に抵触 -> CUT_LOSS
+- 週内目標達成/上限到達 -> TAKE_PROFIT（必要ならtrailも）
+- 構造維持で週跨ぎ -> HOLD_WEEK
+- 月足方向が明確で伸びしろあり -> HOLD_MONTH
+"""
+        resp = model.generate_content(prompt)
+        raw = getattr(resp, "text", "") or ""
+        j = _extract_json_block(raw)
+        obj = json.loads(j) if j else {}
+        ok, reasons = _validate_weekend_json(obj)
+        if not ok:
+            return {
+                "action": "NO_POSITION",
+                "why": "週末判断JSONが不正のため保守的にNO_POSITIONへ。",
+                "levels": {"take_profit": 0, "stop_loss": 0, "trail": 0},
+                "notes": ["parse_or_validation_failed", *reasons],
+                "override": {"mode": override_mode, "reason": override_reason.strip()} if override_mode != "AUTO" else {"mode":"AUTO","reason":""}
+            }
+        if override_mode != "AUTO":
+            obj["override"] = {"mode": override_mode, "reason": override_reason.strip()}
+            obj.setdefault("notes", []).append("human_override=true")
+        return obj
+    except Exception as e:
+        return {
+            "action": "NO_POSITION",
+            "why": f"週末判断で例外。保守的にNO_POSITIONへ。({type(e).__name__})",
+            "levels": {"take_profit": 0, "stop_loss": 0, "trail": 0},
+            "notes": [],
+            "override": {"mode": override_mode, "reason": override_reason.strip()} if override_mode != "AUTO" else {"mode":"AUTO","reason":""}
+        }
+
 def get_ai_portfolio(api_key, context_data):
     try:
         model = genai.GenerativeModel(get_active_model(api_key))
@@ -464,7 +811,72 @@ def get_ai_portfolio(api_key, context_data):
         return "ポートフォリオ分析に失敗しました。"
 
 
-def get_ai_order_strategy(api_key, context_data):
+def get_ai_order_strategy(api_key, context_data, override_mode="AUTO", override_reason=""):
+    """
+    注文命令書をJSON固定で返す（命令 + why/notes解説）。
+    さらに market_regime をAIが判定し、守り/攻めのNO_TRADEゲートを自動切替する。
+    """
+    # --- 緊急停止 ---
+    if override_mode == "FORCE_NO_TRADE":
+        why = "緊急停止（FORCE_NO_TRADE）。"
+        if override_reason and override_reason.strip():
+            why += f" 理由: {override_reason.strip()}"
+        return {
+            "decision": "NO_TRADE",
+            "side": "NONE",
+            "entry": 0,
+            "take_profit": 0,
+            "stop_loss": 0,
+            "horizon": "WEEK",
+            "confidence": 0.0,
+            "why": why,
+            "notes": ["human_override=true"],
+            "market_regime": "DEFENSIVE",
+            "regime_why": "FORCE_NO_TRADEのため市場判定は省略。",
+            "override": {"mode": override_mode, "reason": override_reason.strip()}
+        }
+
+    # --- market_regime（AUTO/縮退） ---
+    if override_mode == "FORCE_DEFENSIVE":
+        regime_obj = {
+            "market_regime": "DEFENSIVE",
+            "confidence": 0.0,
+            "why": "緊急縮退（FORCE_DEFENSIVE）のため、守り型として判定。",
+            "notes": ["human_override=true"]
+        }
+        force_def = True
+    else:
+        regime_obj = get_ai_market_regime(api_key, context_data)
+        force_def = False
+
+    market_regime = regime_obj.get("market_regime", "DEFENSIVE")
+    regime_why = regime_obj.get("why", "")
+
+    # --- NO_TRADEゲート（先に数値ルールで弾く） ---
+    is_no, regime_used, gate_reasons = no_trade_gate(context_data, market_regime, force_defensive=force_def)
+    if is_no:
+        why = "NO_TRADEゲートにより取引停止。"
+        if gate_reasons:
+            why += " / " + ", ".join(gate_reasons[:6])
+        out = {
+            "decision": "NO_TRADE",
+            "side": "NONE",
+            "entry": 0,
+            "take_profit": 0,
+            "stop_loss": 0,
+            "horizon": "WEEK",
+            "confidence": 0.0,
+            "why": why,
+            "notes": gate_reasons[:12],
+            "market_regime": regime_used,
+            "regime_why": regime_why,
+        }
+        if override_mode != "AUTO":
+            out["override"] = {"mode": override_mode, "reason": override_reason.strip()}
+            out["notes"].append("human_override=true")
+        return out
+
+    # --- AI注文生成（JSON固定） ---
     try:
         model = genai.GenerativeModel(get_active_model(api_key))
         p = context_data.get('price', 0.0)
@@ -473,46 +885,95 @@ def get_ai_order_strategy(api_key, context_data):
         ps = context_data.get("panel_short", "不明")
         pm = context_data.get("panel_mid", "不明")
         capital = context_data.get("capital", 300000)
-        
+
         ep = context_data.get("entry_price", 0.0)
         tt = context_data.get("trade_type", "なし")
-        pos_instr = f"ユーザーは既に {ep}円で{tt}を持っています。これを考慮し、『ナンピン』『増し玉』『決済』のいずれが適切かも思考に含めてください。" if ep > 0 else ""
+        pos_instr = f"ユーザーは既に {ep}円で{tt} を保有中。新規/増し玉/決済も含め最適な1つの行動に統合せよ。" if ep and ep > 0 else "ユーザーの保有ポジションはなし（新規判断）。"
 
         prompt = f"""
-あなたはFX投資ロボットの執行エンジンです。軍資金{capital}円、レバレッジ25倍での運用を前提とします。
-上部パネルの診断と、あなた自身が作成したレポートを完全遵守し、具体的な「注文票」を1つ作成してください。
+あなたはFX投資ロボットの執行エンジンです。軍資金{capital}円、レバレッジ25倍。
+上部パネル診断とレポートを尊重し、今週の具体的な「注文命令」を1つだけ出してください。
 
-【1. 現在の市場診断（上部パネル連動）】
-- 短期診断: {ps}
-- 中期診断: {pm}
+【市場環境モード（自動判定）】
+market_regime={market_regime}
+regime_why={regime_why}
 
-【2. あなたの詳細分析レポート（思考プロセス）】
-{report}
-
-【3. 数値データ】
-- 現在価格: {p:.3f} 円
-- ATR(ボラティリティ): {a:.3f} 円
+【入力】
+price={p}
+atr={a}
+panel_short={ps}
+panel_mid={pm}
 {pos_instr}
+last_report_summary={report[:1200]}
 
-【命令】
-診断結果と1ミリも矛盾しない注文票（指値, IFD, OCO, IFDOCOのいずれか）を提示してください。
-「利大損小」を徹底するため、必ず「損切（STOP）」を明記してください。
-また、現在のボラティリティに基づいた「推奨スリップロス（許容スリッページ）」をpips単位で指定してください。
-
-出力フォーマット：
-🤖 **ロボ指示：[注文方式] を推奨（診断連動済み）**
-- **ENTRY**: [価格] 円
-- **LIMIT (利確)**: [価格] 円
-- **STOP (損切)**: [価格] 円
-- **推奨スリップロス**: [数値] pips
-- **診断との整合性**: [なぜこの価格か、パネル診断結果「{ps}/{pm}」をどう反映したか説明]
+【出力ルール（最重要）】
+- 出力はJSONオブジェクトのみ（前後に文章を付けない）
+- 必須キー：
+  decision: "TRADE" または "NO_TRADE"
+  side: "LONG" | "SHORT" | "NONE"
+  entry: number
+  take_profit: number
+  stop_loss: number
+  horizon: "WEEK" | "MONTH"
+  confidence: 0.0〜1.0
+  why: 1〜3文（日本語）
+  notes: 0〜6個の配列（日本語）
+- decision="TRADE" の場合、必ず stop_loss を含める（欠落禁止）
+- 数値は小数OK、USD/JPYなので 2〜3桁小数で良い
+- あいまい表現で行動を濁さない。TRADE/NO_TRADEどちらかに決める。
 """
-        response = model.generate_content(prompt)
-        return response.text
-    except Exception as e:
-        return f"注文戦略生成エラー: {str(e)}"
+        resp = model.generate_content(prompt)
+        raw = getattr(resp, "text", "") or ""
+        j = _extract_json_block(raw)
+        obj = json.loads(j) if j else {"decision":"NO_TRADE","side":"NONE","why":"JSON抽出失敗","notes":["json_extract_failed"]}
+        ok, reasons = _validate_order_json(obj, context_data)
 
-# ✅✅✅ 追加: 予想ライン生成関数（前回欠落していた箇所） ✅✅✅
+        # バリデーションNG → 強制NO_TRADE
+        if not ok:
+            out = {
+                "decision": "NO_TRADE",
+                "side": "NONE",
+                "entry": 0,
+                "take_profit": 0,
+                "stop_loss": 0,
+                "horizon": "WEEK",
+                "confidence": 0.0,
+                "why": "注文JSONの検証に失敗したため取引停止。",
+                "notes": ["parse_or_validation_failed", *reasons][:12],
+                "market_regime": market_regime,
+                "regime_why": regime_why,
+            }
+            if override_mode != "AUTO":
+                out["override"] = {"mode": override_mode, "reason": override_reason.strip()}
+                out["notes"].append("human_override=true")
+            return out
+
+        # 正常時：regimeを付与
+        obj["market_regime"] = market_regime
+        obj["regime_why"] = regime_why
+        if override_mode != "AUTO":
+            obj["override"] = {"mode": override_mode, "reason": override_reason.strip()}
+            obj.setdefault("notes", []).append("human_override=true")
+        return obj
+    except Exception as e:
+        out = {
+            "decision": "NO_TRADE",
+            "side": "NONE",
+            "entry": 0,
+            "take_profit": 0,
+            "stop_loss": 0,
+            "horizon": "WEEK",
+            "confidence": 0.0,
+            "why": f"注文生成で例外。保守的に取引停止。({type(e).__name__})",
+            "notes": [],
+            "market_regime": market_regime,
+            "regime_why": regime_why,
+        }
+        if override_mode != "AUTO":
+            out["override"] = {"mode": override_mode, "reason": override_reason.strip()}
+            out["notes"].append("human_override=true")
+        return out
+
 def get_ai_range(api_key, context_data):
     try:
         model = genai.GenerativeModel(get_active_model(api_key))
