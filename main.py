@@ -176,7 +176,7 @@ st.sidebar.subheader("💰 SBI FX 資金管理")
 
 # 1. 資金管理入力
 capital = st.sidebar.number_input("軍資金 (JPY)", value=300000, step=10000)
-risk_percent = st.sidebar.slider("1トレード許容損失 (%)", 1.0, 10.0, 2.0, help="負けた時に資金の何%を失う覚悟があるか。プロは2%推奨。")
+risk_percent = st.sidebar.slider("1トレード許容損失 (%)", 1.0, 10.0, 2.0, step=0.1,help="負けた時に資金の何%を失う覚悟があるか。プロは2%推奨。")
 leverage = 25  # 固定
 
 # 2. ポジション情報 (AI連動 & チャート表示用)
@@ -476,4 +476,5 @@ with tab4:
 
     if st.session_state.get("last_weekend_json"):
         render_weekend_summary(st.session_state["last_weekend_json"])
+
 
