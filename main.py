@@ -85,6 +85,38 @@ def render_weekend_summary(wj: dict):
         st.json(wj)
 
 
+
+def inject_ai_range_into_ctx(api_key: str, ctx: dict, force: bool = False):
+    """AI予想レンジを（未取得/期限切れなら）自動取得して ctx に注入する。
+    ボタン不要で意思決定に組み込むための前処理。
+    """
+    try:
+        base = {
+            "price": float(ctx.get("price", 0.0) or 0.0),
+            "rsi": float(ctx.get("rsi", 50.0) or 50.0),
+            "atr": float(ctx.get("atr", 0.0) or 0.0),
+        }
+    except Exception:
+        base = {"price": ctx.get("price", 0.0), "rsi": ctx.get("rsi", 50.0), "atr": ctx.get("atr", 0.0)}
+
+    rng = logic.ensure_ai_range(api_key, base, force=force)
+    if isinstance(rng, dict) and rng.get("low") is not None and rng.get("high") is not None:
+        low = float(rng["low"]); high = float(rng["high"])
+        if low > high:
+            low, high = high, low
+        price = float(ctx.get("price", base.get("price") or 0.0) or 0.0)
+        width_pct = (high - low) / max(price, 1e-6) * 100.0 if price else None
+        pos = (price - low) / max((high - low), 1e-6) if price else None
+        ctx.update({
+            "ai_range_low": low,
+            "ai_range_high": high,
+            "ai_range_mid": (low + high) / 2.0,
+            "ai_range_width_pct": width_pct,
+            "ai_range_pos": pos,
+            "ai_range_why": rng.get("why", ""),
+        })
+    return ctx
+
 # --- session state (extended) ---
 if "last_order_json" not in st.session_state:
     st.session_state["last_order_json"] = None
@@ -192,7 +224,11 @@ if st.sidebar.button("📈 AI予想ライン反映"):
         with st.spinner("AI予想を取得中..."):
             last_row = df.iloc[-1]
             context = {"price": last_row["Close"], "rsi": last_row["RSI"], "atr": last_row["ATR"]}
-            st.session_state.ai_range = logic.get_ai_range(api_key, context)
+            rng = logic.ensure_ai_range(api_key, context, force=True)
+            if rng:
+                st.session_state.ai_range = {"low": rng.get("low"), "high": rng.get("high"), "why": rng.get("why",""), "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+            else:
+                st.session_state.ai_range = None
             st.rerun()
     else:
         st.warning("Gemini API Key を入力してください。")
@@ -262,37 +298,12 @@ fig_main.add_trace(go.Scatter(x=df.index, y=df["SMA_5"], name="5日線", line=di
 fig_main.add_trace(go.Scatter(x=df.index, y=df["SMA_25"], name="25日線", line=dict(color="orange", width=2)), row=1, col=1)
 fig_main.add_trace(go.Scatter(x=df.index, y=df["SMA_75"], name="75日線", line=dict(color="gray", width=1, dash="dot")), row=1, col=1)
 
-# ★ AI予想ライン表示機能（点線）
-ai_rng = st.session_state.get("ai_range")
-high_val = low_val = None
-
-if isinstance(ai_rng, dict):
-    # 標準形式: {"low":..., "high":...}
-    low_val = ai_rng.get("low")
-    high_val = ai_rng.get("high")
-elif isinstance(ai_rng, (list, tuple)) and len(ai_rng) >= 2:
-    # 旧形式: (high, low) or (low, high) どちらでも耐える
-    a, b = ai_rng[0], ai_rng[1]
-    if a is not None and b is not None:
-        try:
-            a = float(a); b = float(b)
-            high_val, low_val = (a, b) if a >= b else (b, a)
-        except Exception:
-            high_val = low_val = None
-
-# 値が揃った時だけ描画
-try:
-    if high_val is not None and low_val is not None:
-        high_val = float(high_val); low_val = float(low_val)
-        fig_main.add_hline(y=high_val, line_dash="dot", line_color="red", annotation_text=f"AI上限 {high_val:.2f}", row=1, col=1)
-        fig_main.add_hline(y=low_val, line_dash="dot", line_color="blue", annotation_text=f"AI下限 {low_val:.2f}", row=1, col=1)
-except Exception:
-    pass
-
-
+# ★ AI予想ライン表示機能 (赤・緑点線)
+if st.session_state.ai_range:
+    high_val, low_val = st.session_state.ai_range
     view_x = [start_view, last_date]
-    fig_main.add_trace(go.Scatter(x=view_x, y=[high_val, high_val], name=f"AI予想上限: {high_val:.2f}", line=dict(color="red", width=2, dash="dash")), row=1, col=1)
-    fig_main.add_trace(go.Scatter(x=view_x, y=[low_val, low_val], name=f"AI予想下限: {low_val:.2f}", line=dict(color="blue", width=2, dash="dash")), row=1, col=1)
+    fig_main.add_trace(go.Scatter(x=view_x, y=[high_val, high_val], name=f"予想最高:{high_val:.2f}", line=dict(color="red", width=2, dash="dash")), row=1, col=1)
+    fig_main.add_trace(go.Scatter(x=view_x, y=[low_val, low_val], name=f"予想最低:{low_val:.2f}", line=dict(color="green", width=2, dash="dash")), row=1, col=1)
 
 # ★ ポジション連動表示機能 (青・ピンク線)
 if entry_price > 0:
@@ -379,6 +390,9 @@ ctx = {
     "us10y": float(df["US10Y"].iloc[-1]) if pd.notna(df["US10Y"].iloc[-1]) else 0.0,
     "atr": float(df["ATR"].iloc[-1]) if pd.notna(df["ATR"].iloc[-1]) else 0.0,
     "sma_diff": float(df["SMA_DIFF"].iloc[-1]) if pd.notna(df["SMA_DIFF"].iloc[-1]) else 0.0,
+    "sma25": float(df["SMA_25"].iloc[-1]) if pd.notna(df["SMA_25"].iloc[-1]) else float("nan"),
+    "sma75": float(df["SMA_75"].iloc[-1]) if pd.notna(df["SMA_75"].iloc[-1]) else float("nan"),
+    "atr_avg60": float(df["ATR"].rolling(60).mean().iloc[-1]) if pd.notna(df["ATR"].rolling(60).mean().iloc[-1]) else float("nan"),
     "rsi": float(df["RSI"].iloc[-1]) if pd.notna(df["RSI"].iloc[-1]) else 50.0,
     "current_time": q_time.strftime("%H:%M") if q_time else "不明",
     "is_gotobi": datetime.now(pytz.timezone("Asia/Tokyo")).day in [5, 10, 15, 20, 25, 30],
@@ -408,9 +422,11 @@ with tab2:
                     ctx["last_report"] = st.session_state.last_ai_report
                     ctx["panel_short"] = diag['short']['status'] if diag else "不明"
                     ctx["panel_mid"] = diag['mid']['status'] if diag else "不明"
+                    ctx = inject_ai_range_into_ctx(api_key, ctx, force=False)
                     strategy = logic.get_ai_order_strategy(api_key, ctx, override_mode=override_mode, override_reason=override_reason)
                     st.info("AI診断およびパネル診断との整合性を確認しました。")
-                    st.markdown(strategy)
+                    st.session_state['last_order_json'] = strategy
+                    render_order_summary(strategy)
         else:
             st.warning("Gemini API Key を入力してください。")
 
@@ -441,6 +457,8 @@ with tab4:
             ctx_w["last_report"] = st.session_state.last_ai_report if st.session_state.last_ai_report else "なし"
             ctx_w["panel_short"] = diag["short"]["status"] if diag else "不明"
             ctx_w["panel_mid"] = diag["mid"]["status"] if diag else "不明"
+
+            ctx_w = inject_ai_range_into_ctx(api_key, ctx_w, force=False)
 
             weekend = logic.get_ai_weekend_decision(
                 api_key,
