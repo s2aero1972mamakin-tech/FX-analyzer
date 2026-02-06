@@ -16,6 +16,42 @@ LAST_FETCH_ERROR = ""
 
 
 # -----------------------------
+# AI予想レンジ 自動取得キャッシュ（意思決定に必須で連携）
+# -----------------------------
+AI_RANGE_TTL_SEC = 60 * 60 * 72  # 72時間（週2回運用なら十分）
+_AI_RANGE_CACHE = {"expire": 0.0, "value": None}
+
+def ensure_ai_range(api_key: str, context_data: dict, force: bool = False):
+    """意思決定（注文命令/週末判断）の直前に必ず呼ぶ。
+    - ボタン不要: 取引判断の導線で自動取得する
+    - TTL内はキャッシュを返す（429対策）
+    - 失敗時は None を返す（後段で守りに倒す/ゲートで弾く）
+    """
+    now = time.time()
+    if (not force) and _AI_RANGE_CACHE.get("value") and now <= float(_AI_RANGE_CACHE.get("expire", 0.0) or 0.0):
+        return _AI_RANGE_CACHE["value"]
+
+    getrng = globals().get("get_ai_range")
+    if not callable(getrng):
+        return None
+
+    rng = getrng(api_key, context_data)
+    if isinstance(rng, dict) and rng.get("low") is not None and rng.get("high") is not None:
+        try:
+            low = float(rng["low"]); high = float(rng["high"])
+        except Exception:
+            return None
+        if low > high:
+            low, high = high, low
+        out = {"low": low, "high": high, "why": str(rng.get("why", ""))}
+        _AI_RANGE_CACHE["value"] = out
+        _AI_RANGE_CACHE["expire"] = now + AI_RANGE_TTL_SEC
+        return out
+
+    return None
+
+
+# -----------------------------
 # JSON固定出力: パース/検証ヘルパ
 # -----------------------------
 def _extract_json_block(text: str) -> str:
