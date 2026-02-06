@@ -185,8 +185,8 @@ with col_rsi:
     st.markdown(f"**📉 RSI: {float(df['RSI'].iloc[-1]):.2f}**")
     fig_rsi = go.Figure()
     fig_rsi.add_trace(go.Scatter(x=df.index, y=df["RSI"], name="RSI", line=dict(color="#ff5722")))
-    fig_rsi.add_hline(y=70, line=dict(color="#00ff00", dash="dash"))
-    fig_rsi.add_hline(y=30, line=dict(color="#ff0000", dash="dash"))
+    fig_rsi.add_hline(y=70, line=dict(color="#00ff00", dash="dash"), annotation_text="70 (買われすぎ)", annotation_position="top left")
+    fig_rsi.add_hline(y=30, line=dict(color="#ff0000", dash="dash"), annotation_text="30 (売られすぎ)", annotation_position="bottom left")
     fig_rsi.update_xaxes(range=[start_view, last_date])
     fig_rsi.update_layout(height=200, template="plotly_dark", yaxis=dict(range=[0, 100]), margin=dict(l=10, r=10, t=20, b=20))
     st.plotly_chart(fig_rsi, use_container_width=True)
@@ -289,4 +289,5 @@ with tab3:
             with st.spinner("スワップ・金利分析中..."):
                 st.markdown(logic.get_ai_portfolio(api_key, ctx)) # ctxを渡してポジション連動させる
         else: st.warning("Gemini API Key を入力してください。")
+
 
