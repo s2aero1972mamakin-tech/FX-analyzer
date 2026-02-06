@@ -284,15 +284,15 @@ elif isinstance(ai_rng, (list, tuple)) and len(ai_rng) >= 2:
 try:
     if high_val is not None and low_val is not None:
         high_val = float(high_val); low_val = float(low_val)
-        fig_main.add_hline(y=high_val, line_dash="dot", line_color="red", annotation_text="AI高値", row=1, col=1)
-        fig_main.add_hline(y=low_val, line_dash="dot", line_color="lime", annotation_text="AI安値", row=1, col=1)
+        fig_main.add_hline(y=high_val, line_dash="dot", line_color="red", annotation_text=f"AI上限 {high_val:.2f}", row=1, col=1)
+        fig_main.add_hline(y=low_val, line_dash="dot", line_color="blue", annotation_text=f"AI下限 {low_val:.2f}", row=1, col=1)
 except Exception:
     pass
 
 
     view_x = [start_view, last_date]
-    fig_main.add_trace(go.Scatter(x=view_x, y=[high_val, high_val], name=f"予想最高:{high_val:.2f}", line=dict(color="red", width=2, dash="dash")), row=1, col=1)
-    fig_main.add_trace(go.Scatter(x=view_x, y=[low_val, low_val], name=f"予想最低:{low_val:.2f}", line=dict(color="green", width=2, dash="dash")), row=1, col=1)
+    fig_main.add_trace(go.Scatter(x=view_x, y=[high_val, high_val], name=f"AI予想上限: {high_val:.2f}", line=dict(color="red", width=2, dash="dash")), row=1, col=1)
+    fig_main.add_trace(go.Scatter(x=view_x, y=[low_val, low_val], name=f"AI予想下限: {low_val:.2f}", line=dict(color="blue", width=2, dash="dash")), row=1, col=1)
 
 # ★ ポジション連動表示機能 (青・ピンク線)
 if entry_price > 0:
