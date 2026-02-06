@@ -410,7 +410,7 @@ ctx = {
 tab1, tab2, tab3, tab4 = st.tabs(["📊 詳細レポート", "📝 注文戦略(日/週)", "💰 長期/ポートフォリオ", "🗓 週末判断"])
 
 with tab1:
-    if st.button("✨ レポート生成 (五十日/選挙対応)"):
+    if st.button("✨ レポート生成"):
         if api_key:
             with st.spinner("FP1級AIが分析中..."):
                 report = logic.get_ai_analysis(api_key, ctx)
@@ -476,3 +476,4 @@ with tab4:
 
     if st.session_state.get("last_weekend_json"):
         render_weekend_summary(st.session_state["last_weekend_json"])
+
