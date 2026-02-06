@@ -20,7 +20,6 @@ LABEL_OVERRIDE = {
     "FORCE_DEFENSIVE": "緊急縮退（守り固定）",
 }
 
-
 def _fmt_price(x):
     try:
         v = float(x)
@@ -30,27 +29,32 @@ def _fmt_price(x):
 
 def render_order_summary(order_json: dict):
     decision = order_json.get("decision")
-    st.markdown(f"### 🧾 注文命令（要約）")
+    st.markdown("### 🧾 注文命令（要約）")
     st.markdown(f"**判断：** {LABEL_DECISION.get(decision, decision)}")
     if decision == "TRADE":
         st.markdown(f"**方向：** {LABEL_SIDE.get(order_json.get('side'), order_json.get('side'))}")
         st.markdown(f"**保有想定：** {LABEL_HORIZON.get(order_json.get('horizon'), order_json.get('horizon'))}")
-        st.markdown(f"**Entry：** {_fmt_price(order_json.get('entry'))} / **TP：** {_fmt_price(order_json.get('take_profit'))} / **SL：** {_fmt_price(order_json.get('stop_loss'))}")
+        st.markdown(
+            f"**Entry：** {_fmt_price(order_json.get('entry'))} / "
+            f"**TP：** {_fmt_price(order_json.get('take_profit'))} / "
+            f"**SL：** {_fmt_price(order_json.get('stop_loss'))}"
+        )
         rr = order_json.get("rr_ratio")
         if rr is not None:
             try:
                 st.markdown(f"**RR：** {float(rr):.2f}")
             except Exception:
                 pass
+
     st.markdown(f"**市場モード：** {LABEL_REGIME.get(order_json.get('market_regime'), order_json.get('market_regime'))}")
-    if order_json.get("why"):
-        st.markdown(f"**理由（AI）：** {order_json.get('why')}")
     if order_json.get("regime_why"):
         st.markdown(f"**モード理由：** {order_json.get('regime_why')}")
+    if order_json.get("why"):
+        st.markdown(f"**理由（AI）：** {order_json.get('why')}")
 
-    ov = order_json.get("override", {}).get("mode")
+    ov = (order_json.get("override") or {}).get("mode")
     if ov and ov != "AUTO":
-        st.warning(f"オーバーライド：{LABEL_OVERRIDE.get(ov, ov)} / {order_json.get('override', {}).get('reason','')}".strip())
+        st.warning(f"オーバーライド：{LABEL_OVERRIDE.get(ov, ov)} / {(order_json.get('override') or {}).get('reason','')}".strip())
 
     with st.expander("🔎 詳細JSON（内部用）"):
         st.json(order_json)
@@ -62,16 +66,23 @@ def render_weekend_summary(wj: dict):
     if wj.get("why"):
         st.markdown(f"**理由（AI）：** {wj.get('why')}")
     lv = wj.get("levels") or {}
-    if any(float(lv.get(k,0) or 0) != 0 for k in ("take_profit","stop_loss","trail")):
-        st.markdown(f"**参考レベル：** TP={_fmt_price(lv.get('take_profit'))} / SL={_fmt_price(lv.get('stop_loss'))} / Trail={_fmt_price(lv.get('trail'))}")
+    try:
+        nonzero = any(float(lv.get(k, 0) or 0) != 0 for k in ("take_profit", "stop_loss", "trail"))
+    except Exception:
+        nonzero = False
+    if nonzero:
+        st.markdown(
+            f"**参考レベル：** TP={_fmt_price(lv.get('take_profit'))} / "
+            f"SL={_fmt_price(lv.get('stop_loss'))} / "
+            f"Trail={_fmt_price(lv.get('trail'))}"
+        )
 
-    ov = wj.get("override", {}).get("mode")
+    ov = (wj.get("override") or {}).get("mode")
     if ov and ov != "AUTO":
-        st.warning(f"オーバーライド：{LABEL_OVERRIDE.get(ov, ov)} / {wj.get('override', {}).get('reason','')}".strip())
+        st.warning(f"オーバーライド：{LABEL_OVERRIDE.get(ov, ov)} / {(wj.get('override') or {}).get('reason','')}".strip())
 
     with st.expander("🔎 詳細JSON（内部用）"):
-        render_weekend_summary(wj)
-
+        st.json(wj)
 
 
 # --- session state (extended) ---
@@ -95,7 +106,7 @@ st.title("🤖 AI連携型 USD/JPY 戦略分析ツール (SBI仕様)")
 # --- 緊急時オーバーライド（通常はAUTOのまま） ---
 st.sidebar.markdown("### 🧯 緊急時オーバーライド")
 override_mode = st.sidebar.selectbox(
-    "モード（通常は自動）",
+    "モード（通常はAUTO）",
     ["AUTO", "FORCE_NO_TRADE", "FORCE_DEFENSIVE"],
     index=0,
     help="相場判断ではなく、データ異常・システム不調など“土俵が壊れている”場合だけ使用"
@@ -390,25 +401,30 @@ with tab3:
 
 
 
+
 with tab4:
-    st.subheader("🗓 週末判断（AI命令 / JSON固定）")
-    st.caption("週末（金曜〜土曜）に起動し、利確・損切・継続（週/1か月）をAIが命令として返します。人間は入力のみ。")
+    st.subheader("🗓 週末判断（AI命令 / 日本語表示）")
+    st.caption("週末（金〜土）に起動し、利確・損切・継続（週/1か月）をAIが命令として返します。人間は入力のみ。")
 
     if st.button("🗓 週末判断を生成"):
         if not api_key:
             st.error("Gemini APIキーを入力してください。")
         else:
+            # 月曜と同じデータ源に統一（0.0事故防止）
             ctx_w = dict(ctx)
-            # 週末判断も「月曜と同じデータ源」に統一（0.0事故防止）
             ctx_w["price"] = float(current_rate)
             ctx_w["last_report"] = st.session_state.last_ai_report if st.session_state.last_ai_report else "なし"
-            ctx_w["panel_short"] = diag['short']['status'] if diag else "不明"
-            ctx_w["panel_mid"] = diag['mid']['status'] if diag else "不明"
-weekend = logic.get_ai_weekend_decision(api_key, ctx_w, override_mode=override_mode, override_reason=override_reason)
+            ctx_w["panel_short"] = diag["short"]["status"] if diag else "不明"
+            ctx_w["panel_mid"] = diag["mid"]["status"] if diag else "不明"
+
+            weekend = logic.get_ai_weekend_decision(
+                api_key,
+                ctx_w,
+                override_mode=override_mode,
+                override_reason=override_reason
+            )
             st.session_state["last_weekend_json"] = weekend
 
     if st.session_state.get("last_weekend_json"):
-        wj = st.session_state["last_weekend_json"]
-        render_weekend_summary(wj)
-        if wj.get("override", {}).get("mode") and wj["override"]["mode"] != "AUTO":
-            st.warning(f"Human override: {wj['override']['mode']} / {wj['override'].get('reason','')}")
+        render_weekend_summary(st.session_state["last_weekend_json"])
+
