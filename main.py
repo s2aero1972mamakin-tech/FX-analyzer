@@ -1,10 +1,11 @@
+import streamlit as st
 
+# --- session state (extended) ---
 if "last_order_json" not in st.session_state:
     st.session_state["last_order_json"] = None
 if "last_weekend_json" not in st.session_state:
     st.session_state["last_weekend_json"] = None
 
-import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import pandas as pd
