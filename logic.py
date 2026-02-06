@@ -16,38 +16,6 @@ LAST_FETCH_ERROR = ""
 
 
 # -----------------------------
-# AI予想レンジ 自動取得キャッシュ（意思決定に必須で連携）
-# -----------------------------
-AI_RANGE_TTL_SEC = 60 * 60 * 72  # 72時間（週2回運用なら十分）
-_AI_RANGE_CACHE = {"expire": 0.0, "value": None}
-
-def ensure_ai_range(api_key: str, context_data: dict, force: bool = False):
-    """意思決定（注文命令/週末判断）の直前に必ず呼ぶ。
-    - ボタン不要: 取引判断の導線で自動取得する
-    - TTL内はキャッシュを返す（429対策）
-    - 失敗時は None を返す（後段で守りに倒す/ゲートで弾く）
-    """
-    now = time.time()
-    if (not force) and _AI_RANGE_CACHE.get("value") and now <= float(_AI_RANGE_CACHE.get("expire", 0.0) or 0.0):
-        return _AI_RANGE_CACHE["value"]
-
-    rng = get_ai_range(api_key, context_data)
-    if isinstance(rng, dict) and rng.get("low") is not None and rng.get("high") is not None:
-        try:
-            low = float(rng["low"]); high = float(rng["high"])
-        except Exception:
-            return None
-        if low > high:
-            low, high = high, low
-        out = {"low": low, "high": high, "why": str(rng.get("why", ""))}
-        _AI_RANGE_CACHE["value"] = out
-        _AI_RANGE_CACHE["expire"] = now + AI_RANGE_TTL_SEC
-        return out
-
-    return None
-
-
-# -----------------------------
 # JSON固定出力: パース/検証ヘルパ
 # -----------------------------
 def _extract_json_block(text: str) -> str:
@@ -209,9 +177,7 @@ def no_trade_gate(context_data: dict, market_regime: str, force_defensive: bool 
 
     ps = str(context_data.get("panel_short",""))
     pm = str(context_data.get("panel_mid",""))
-    if "静観" in pm:
-        reasons.append("panel_mid_says_wait")
-
+    mid_wait = ("静観" in pm)
     price = _safe_float(context_data.get("price"))
     sma25 = _safe_float(context_data.get("sma25"))
     sma75 = _safe_float(context_data.get("sma75"))
@@ -240,19 +206,6 @@ def no_trade_gate(context_data: dict, market_regime: str, force_defensive: bool 
     if atr_avg60 is not None and atr_avg60 > 0:
         if atr > atr_avg60 * th["atr_mult"]:
             reasons.append("volatility_too_high_atr_spike")
-
-    # --- AI予想レンジ（任意連携）---
-    # main.py側で ai_range_* が ctx に入っていれば活用する
-    ai_w = _safe_float(context_data.get("ai_range_width_pct"))  # 予想レンジ幅（%）
-    ai_pos = _safe_float(context_data.get("ai_range_pos"))      # 予想レンジ内の位置（0〜1）
-    if ai_w is not None:
-        narrow_th = 0.55 if regime == "DEFENSIVE" else 0.35
-        if ai_w < narrow_th:
-            reasons.append("ai_range_too_narrow_range_market")
-    if ai_pos is not None:
-        mid_band = 0.18 if regime == "DEFENSIVE" else 0.12
-        if abs(ai_pos - 0.5) < mid_band:
-            reasons.append("ai_range_middle_no_edge")
 
     return (len(reasons) > 0), regime, reasons
 
@@ -1021,48 +974,12 @@ last_report_summary={report[:1200]}
         return out
 
 def get_ai_range(api_key, context_data):
-    """AI予想レンジ（1週間の高値/安値）を取得して {low, high, why} を返す。
-    返り値:
-      - 成功: {"low": float, "high": float, "why": str}
-      - 失敗: None
-    """
     try:
         model = genai.GenerativeModel(get_active_model(api_key))
-        p = float(context_data.get("price", 0.0) or 0.0)
-
-        prompt = (
-            "あなたはFXレンジ予測エンジンです。\n"
-            f"現在のUSD/JPYは {p:.3f} です。\n"
-            "今後1週間の想定レンジの『高値(high)』と『安値(low)』を、次のJSONだけで返してください。\n"
-            "余計な文章は不要です。\n"
-            "{\n"
-            "  \"high\": 0.0,\n"
-            "  \"low\": 0.0,\n"
-            "  \"why\": \"短い理由（日本語）\"\n"
-            "}\n"
-        )
-        res = (model.generate_content(prompt).text or "").strip()
-
-        # JSON抽出（最初の {...}）
-        m = re.search(r"\{[\s\S]*\}", res)
-        if m:
-            obj = json.loads(m.group(0))
-            high = float(obj.get("high"))
-            low = float(obj.get("low"))
-            if low > high:
-                low, high = high, low
-            return {"low": low, "high": high, "why": str(obj.get("why", ""))}
-
-        # 数字だけ返ってきた場合の救済（高値→安値の順を期待）
+        p = context_data.get('price', 0.0)
+        prompt = f"現在のドル円は {p:.2f}円です。今後1週間の[最高値, 最安値]を半角数字のみで返してください。"
+        res = model.generate_content(prompt).text
         nums = re.findall(r"\d+\.\d+|\d+", res)
-        if len(nums) >= 2:
-            high = float(nums[0]); low = float(nums[1])
-            if low > high:
-                low, high = high, low
-            return {"low": low, "high": high, "why": "JSON以外で返答された場合の救済抽出"}
-
+        return [float(nums[0]), float(nums[1])] if len(nums) >= 2 else None
+    except:
         return None
-    except Exception:
-        return None
-
-
