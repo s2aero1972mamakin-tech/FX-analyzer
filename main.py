@@ -1,3 +1,9 @@
+
+if "last_order_json" not in st.session_state:
+    st.session_state["last_order_json"] = None
+if "last_weekend_json" not in st.session_state:
+    st.session_state["last_weekend_json"] = None
+
 import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -9,6 +15,21 @@ import logic  # ← logic.pyが必要
 # --- ページ設定 ---
 st.set_page_config(layout="wide", page_title="AI-FX Analyzer 2026")
 st.title("🤖 AI連携型 USD/JPY 戦略分析ツール (SBI仕様)")
+
+
+# --- 緊急時オーバーライド（通常はAUTOのまま） ---
+st.sidebar.markdown("### 🧯 緊急時オーバーライド")
+override_mode = st.sidebar.selectbox(
+    "モード（通常はAUTO）",
+    ["AUTO", "FORCE_NO_TRADE", "FORCE_DEFENSIVE"],
+    index=0,
+    help="相場判断ではなく、データ異常・システム不調など“土俵が壊れている”場合だけ使用"
+)
+override_reason = ""
+if override_mode != "AUTO":
+    st.sidebar.warning("⚠ 緊急時のみ使用（データ異常・システム不調時）")
+    override_reason = st.sidebar.text_input("理由（必須）", value="")
+
 
 # --- 状態保持の初期化 ---
 if "ai_range" not in st.session_state:
@@ -276,7 +297,7 @@ with tab2:
                     ctx["last_report"] = st.session_state.last_ai_report
                     ctx["panel_short"] = diag['short']['status'] if diag else "不明"
                     ctx["panel_mid"] = diag['mid']['status'] if diag else "不明"
-                    strategy = logic.get_ai_order_strategy(api_key, ctx)
+                    strategy = logic.get_ai_order_strategy(api_key, ctx, override_mode=override_mode, override_reason=override_reason)
                     st.info("AI診断およびパネル診断との整合性を確認しました。")
                     st.markdown(strategy)
         else:
@@ -292,3 +313,31 @@ with tab3:
 
 
 
+
+
+with tab4:
+    st.subheader("🗓 週末判断（AI命令 / JSON固定）")
+    st.caption("週末（金曜〜土曜）に起動し、利確・損切・継続（週/1か月）をAIが命令として返します。人間は入力のみ。")
+
+    if st.button("🗓 週末判断を生成"):
+        if not api_key:
+            st.error("Gemini APIキーを入力してください。")
+        else:
+            ctx = {
+                "price": st.session_state.get("latest_quote", 0.0),
+                "panel_short": st.session_state.get("panel_short", "不明"),
+                "panel_mid": st.session_state.get("panel_mid", "不明"),
+                "last_report": st.session_state.get("last_report", "なし"),
+                "entry_price": st.session_state.get("entry_price", 0.0),
+                "trade_type": st.session_state.get("trade_type", "なし"),
+            }
+            weekend = logic.get_ai_weekend_decision(api_key, ctx, override_mode=override_mode, override_reason=override_reason)
+            st.session_state["last_weekend_json"] = weekend
+
+    if st.session_state.get("last_weekend_json"):
+        wj = st.session_state["last_weekend_json"]
+        st.json(wj)
+        st.markdown(f"**Action:** {wj.get('action')}")
+        st.markdown(f"**Why:** {wj.get('why','')}")
+        if wj.get("override", {}).get("mode") and wj["override"]["mode"] != "AUTO":
+            st.warning(f"Human override: {wj['override']['mode']} / {wj['override'].get('reason','')}")
