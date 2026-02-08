@@ -1010,15 +1010,102 @@ last_report_summary={report[:1200]}
         return out
 
 def get_ai_range(api_key, context_data):
+    """
+    AI予想レンジ（1週間の高値/安値）を取得して返す。
+    返り値は [high, low] のリスト（main.pyの既存実装と互換）。
+
+    ※不具合対策:
+    - LLMが「1週間」などの文字を含めて返すと、正規表現が「1」を拾ってしまうことがある。
+      → 数値を正規化（全角→半角）し、妥当レンジでフィルタし、最大/最小で決定する。
+    """
     try:
-        model = genai.GenerativeModel(get_active_model(api_key))
-        p = context_data.get('price', 0.0)
-        prompt = f"現在のドル円は {p:.2f}円です。今後1週間の[最高値, 最安値]を半角数字のみで返してください。"
-        res = model.generate_content(prompt).text
-        nums = re.findall(r"\d+\.\d+|\d+", res)
-        return [float(nums[0]), float(nums[1])] if len(nums) >= 2 else None
-    except:
+        model_name = get_active_model(api_key)
+        if not model_name:
+            return None
+        model = genai.GenerativeModel(model_name)
+
+        # 現在値（妥当レンジ推定に使用）
+        try:
+            p = float(context_data.get("price", 0.0) or 0.0)
+        except Exception:
+            p = 0.0
+
+        # できるだけ「数字2つだけ」を返させる（文章/単位/番号を禁止）
+        prompt = (
+            f"現在のドル円は {p:.3f}円です。"
+            "今後1週間の『予想最高値,予想最安値』を、半角数字の小数で2つ、カンマ区切りで返してください。"
+            "文章・単位（円）・括弧・改行・番号・追加説明は禁止。"
+            "例: 161.250,159.800"
+        )
+
+        resp = model.generate_content(prompt)
+        raw = (getattr(resp, "text", None) or "").strip()
+        if not raw:
+            return None
+
+        # 全角数字/句読点の正規化（Geminiが全角で返す場合に備える）
+        trans = str.maketrans({
+            "０":"0","１":"1","２":"2","３":"3","４":"4","５":"5","６":"6","７":"7","８":"8","９":"9",
+            "．":".","，":",","－":"-","ー":"-",
+        })
+        raw_norm = raw.translate(trans)
+
+        # 数字抽出（小数優先）
+        nums = re.findall(r"-?\d+\.\d+|-?\d+", raw_norm)
+        vals = []
+        for s in nums:
+            try:
+                vals.append(float(s))
+            except Exception:
+                continue
+
+        if not vals:
+            return None
+
+        # 妥当レンジフィルタ（USD/JPYの想定レンジ + 現在値近傍を優先）
+        # まず「極端な値（例: 1, 2026）」を落とす
+        plausible = [v for v in vals if 50.0 <= v <= 300.0]
+
+        # 現在値が取れているなら、さらに近傍（±30円）を優先
+        if p >= 50.0:
+            near = [v for v in plausible if (p - 30.0) <= v <= (p + 30.0)]
+        else:
+            near = plausible
+
+        candidates = near if len(near) >= 2 else plausible
+
+        if len(candidates) >= 2:
+            high = float(max(candidates))
+            low = float(min(candidates))
+            # あり得ない並び（高値=安値）も許容だが、low>highはここでは起きない
+            return [high, low]
+
+        # ここまで来るのは「妥当な数値が1つしか取れない」ケース。
+        # もう一度だけ強制フォーマットで再試行（429対策のため1回だけ）
+        prompt2 = (
+            f"USD/JPYの現在値は {p:.3f}。"
+            "次の形式で『最高値,最安値』を必ず2つ返してください: 161.250,159.800"
+        )
+        resp2 = model.generate_content(prompt2)
+        raw2 = (getattr(resp2, "text", None) or "").strip()
+        raw2 = raw2.translate(trans)
+        nums2 = re.findall(r"-?\d+\.\d+|-?\d+", raw2)
+        vals2 = []
+        for s in nums2:
+            try:
+                vals2.append(float(s))
+            except Exception:
+                continue
+        plausible2 = [v for v in vals2 if 50.0 <= v <= 300.0]
+        if len(plausible2) >= 2:
+            high = float(max(plausible2))
+            low = float(min(plausible2))
+            return [high, low]
+
         return None
+    except Exception:
+        return None
+
 
 # === PORTFOLIO_AUTOMATION_EXTENSIONS v1 ===
 
