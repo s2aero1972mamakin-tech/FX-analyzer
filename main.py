@@ -148,6 +148,22 @@ _KEY_JP = {
     "panel_short": "短期パネル",
     "panel_mid": "中期パネル",
     "last_report": "前回レポート",
+    # 週末判断（JSON）
+    "action": "週末アクション",
+    "levels": "水準",
+    "trail": "トレール",
+    "month_hold_line": "1か月保有ライン",
+    "structure_ok": "構造OK",
+    "structure_detail": "構造詳細",
+    "higher_high": "週足高値更新",
+    "lower_low": "週足安値更新",
+    "close_confirm": "週足終値確認",
+    "cur_high": "今週高値",
+    "cur_low": "今週安値",
+    "cur_close": "今週終値",
+    "prior_high_max": "過去高値(窓)",
+    "prior_low_min": "過去安値(窓)",
+
 }
 
 _DECISION_JP = {
@@ -158,6 +174,10 @@ _DECISION_JP = {
     "HOLD_WEEK": "週で確定",
     "HOLD_MONTH": "1か月保有",
     "STAY": "見送り",
+    "TAKE_PROFIT": "利確",
+    "CUT_LOSS": "損切",
+    "NO_POSITION": "ノーポジ",
+
 }
 _SIDE_JP = {"LONG": "買い", "SHORT": "売り", "NONE": "なし"}
 _HORIZON_JP = {"DAY": "1日", "WEEK": "1週間", "MONTH": "1か月"}
@@ -167,6 +187,8 @@ def _jpize_value(key: str, val):
     try:
         if isinstance(val, bool):
             return "はい" if val else "いいえ"
+        if key == "action" and isinstance(val, str):
+            return _DECISION_JP.get(val, val)
         if key == "decision" and isinstance(val, str):
             return _DECISION_JP.get(val, val)
         if key == "side" and isinstance(val, str):
@@ -206,6 +228,10 @@ if "last_alt" not in st.session_state:
     st.session_state.last_alt = None
 if "last_alt_strategy" not in st.session_state:
     st.session_state.last_alt_strategy = None
+
+# ✅【追加】週末判断（JSON）状態保持
+if "last_weekend" not in st.session_state:
+    st.session_state.last_weekend = None
 
 # ✅【追加】ポートフォリオ（複数ポジション）状態
 if "portfolio_positions" not in st.session_state:
@@ -580,10 +606,58 @@ with tab2:
             else:
                 st.info("条件を満たす代替ペアがないため、今週は完全ノートレ推奨です。")
 with tab3:
-    st.markdown("##### 週末・月末判断 & スワップ運用")
-    if st.button("💰 長期ポートフォリオ＆週末診断"):
-        if api_key:
-            with st.spinner("スワップ・金利分析中..."):
-                st.markdown(logic.get_ai_portfolio(api_key, ctx))
-        else:
-            st.warning("Gemini API Key を入力してください。")
+    st.markdown("##### ✅ 週末・月末判断（完全自動） & スワップ運用")
+
+    # 週末判断（JSON命令）: 人が解釈しないための最重要ボタン
+    col_w1, col_w2 = st.columns([1.2, 1.0])
+    with col_w1:
+        if st.button("✅ 週末判断（JSON命令を生成）"):
+            if api_key:
+                with st.spinner("週末判断（利確/損切/継続/1か月継続）を生成中..."):
+                    wctx = dict(ctx)
+                    # 注文戦略タブと同じ情報を渡す（週末判断の精度安定）
+                    wctx["last_report"] = st.session_state.last_ai_report or ""
+                    wctx["panel_short"] = diag['short']['status'] if diag else "不明"
+                    wctx["panel_mid"] = diag['mid']['status'] if diag else "不明"
+                    # pair_label が無ければドル円に固定（代替ペアを週末判断したい場合はポジション側でpairを保持）
+                    wctx.setdefault("pair_label", "USD/JPY (ドル円)")
+                    st.session_state.last_weekend = logic.get_ai_weekend_decision(api_key, wctx)
+            else:
+                st.warning("Gemini API Key を入力してください。")
+
+    with col_w2:
+        # 文章の長期ポートフォリオ（参考）
+        if st.button("💰 長期ポートフォリオ（文章）"):
+            if api_key:
+                with st.spinner("スワップ・金利分析中..."):
+                    st.markdown(logic.get_ai_portfolio(api_key, ctx))
+            else:
+                st.warning("Gemini API Key を入力してください。")
+
+    # --- 週末判断の表示（日本語キー表示） ---
+    if st.session_state.last_weekend is not None:
+        st.subheader("📌 週末判断（命令）")
+        try:
+            st.json(jpize_json(st.session_state.last_weekend))
+        except Exception:
+            st.json(st.session_state.last_weekend)
+
+        # --- 数値ルール監査（HOLD_MONTHの条件が明文化されたか） ---
+        try:
+            wctx2 = dict(ctx)
+            wctx2["last_report"] = st.session_state.last_ai_report or ""
+            wctx2["panel_short"] = diag['short']['status'] if diag else "不明"
+            wctx2["panel_mid"] = diag['mid']['status'] if diag else "不明"
+            wctx2.setdefault("pair_label", "USD/JPY (ドル円)")
+
+            if hasattr(logic, "numeric_hold_month_ok"):
+                ok, detail = logic.numeric_hold_month_ok(wctx2)
+                st.caption("🔎 数値ルール監査（HOLD_MONTHの根拠）")
+                st.json(jpize_json({
+                    "structure_ok": bool(detail.get("structure_ok", False)),
+                    "month_hold_line": detail.get("month_hold_line", 0),
+                    "reached": bool(detail.get("reached", False)),
+                    "structure_detail": detail.get("structure_detail", {}),
+                }))
+        except Exception:
+            pass
