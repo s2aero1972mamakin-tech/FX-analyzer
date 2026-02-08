@@ -245,6 +245,108 @@ def no_trade_gate(context_data: dict, market_regime: str, force_defensive: bool 
 
     return (len(reasons) > 0), regime, reasons
 
+
+# -----------------------------
+# トレンド週のみエントリー（週1放置運用のための最重要ルール）
+# -----------------------------
+_TREND_ONLY_RULES = {
+    # トレンド強度（abs(SMA25-SMA75)/ATR）
+    "trend_score_min": 1.0,
+    # 過熱回避（RSIレンジ）
+    "rsi_long_min": 45.0,
+    "rsi_long_max": 70.0,
+    "rsi_short_min": 30.0,
+    "rsi_short_max": 55.0,
+    # 荒すぎる週は避ける（ATR/ATR_avg60）
+    "atr_spike_max": 1.7,
+}
+
+def trend_only_gate(context_data: dict):
+    """週1運用向け：トレンド条件を満たさない週はエントリー禁止。
+    Returns:
+      allowed(bool), side_hint(str), trend_score(float|None), reasons(list[str])
+    """
+    reasons = []
+    price = _safe_float(context_data.get("price"))
+    sma25 = _safe_float(context_data.get("sma25"))
+    sma75 = _safe_float(context_data.get("sma75"))
+    atr = _safe_float(context_data.get("atr"))
+    atr_avg60 = _safe_float(context_data.get("atr_avg60"))
+    rsi = _safe_float(context_data.get("rsi"))
+
+    # 必要データ
+    for k, v in [("price", price), ("sma25", sma25), ("sma75", sma75), ("atr", atr), ("rsi", rsi)]:
+        if v is None or v != v:
+            reasons.append(f"trend_gate_data_invalid_{k}")
+
+    if reasons:
+        return False, "NONE", None, reasons
+
+    # 方向一致（CloseとMAの並び）
+    side_hint = "NONE"
+    if (price > sma25) and (sma25 > sma75):
+        side_hint = "LONG"
+    elif (price < sma25) and (sma25 < sma75):
+        side_hint = "SHORT"
+    else:
+        reasons.append("trend_gate_direction_not_aligned")
+
+    # トレンド強度（MA差がATRに対して十分か）
+    trend_score = None
+    try:
+        trend_score = abs(sma25 - sma75) / max(float(atr), 1e-9)
+        if trend_score < float(_TREND_ONLY_RULES["trend_score_min"]):
+            reasons.append(f"trend_gate_trend_score_low:{trend_score:.2f}")
+    except Exception:
+        reasons.append("trend_gate_trend_score_calc_failed")
+
+    # RSI過熱回避
+    if side_hint == "LONG":
+        if not (float(_TREND_ONLY_RULES["rsi_long_min"]) <= rsi <= float(_TREND_ONLY_RULES["rsi_long_max"])):
+            reasons.append("trend_gate_rsi_out_of_range_long")
+    elif side_hint == "SHORT":
+        if not (float(_TREND_ONLY_RULES["rsi_short_min"]) <= rsi <= float(_TREND_ONLY_RULES["rsi_short_max"])):
+            reasons.append("trend_gate_rsi_out_of_range_short")
+
+    # 荒すぎる週は避ける（週1放置で事故りやすい）
+    if atr_avg60 is not None and atr_avg60 > 0:
+        try:
+            ratio = float(atr) / float(atr_avg60)
+            if ratio > float(_TREND_ONLY_RULES["atr_spike_max"]):
+                reasons.append(f"trend_gate_atr_spike:{ratio:.2f}")
+        except Exception:
+            pass
+
+    allowed = (len(reasons) == 0)
+    return allowed, side_hint, trend_score, reasons
+
+def _recommended_stop_entry(context_data: dict, side_hint: str):
+    """トレンド週の逆指値（ブレイク）用推奨エントリー価格を返す。無ければNone。"""
+    price = _safe_float(context_data.get("price"))
+    atr = _safe_float(context_data.get("atr"))
+    rh = _safe_float(context_data.get("recent_high20"))
+    rl = _safe_float(context_data.get("recent_low20"))
+    buf = _safe_float(context_data.get("breakout_buffer"))
+
+    # バッファのフォールバック（0.1円 or ATRの1/4）
+    if buf is None:
+        try:
+            buf = max(0.10, (float(atr) * 0.25 if atr is not None else 0.10))
+        except Exception:
+            buf = 0.10
+
+    if side_hint == "LONG":
+        base = rh if rh is not None else price
+        if base is None:
+            return None, buf
+        return float(base) + float(buf), float(buf)
+    if side_hint == "SHORT":
+        base = rl if rl is not None else price
+        if base is None:
+            return None, buf
+        return float(base) - float(buf), float(buf)
+    return None, float(buf)
+
 # -----------------------------
 # 超軽量TTLキャッシュ（Streamlit再実行対策）
 # -----------------------------
@@ -911,6 +1013,43 @@ def get_ai_order_strategy(api_key, context_data, override_mode="AUTO", override_
             out["notes"].append("human_override=true")
         return out
 
+
+    # --- トレンド週のみ（週1放置運用の中核ルール） ---
+    allowed_trend, side_hint, trend_score, trend_reasons = trend_only_gate(context_data)
+    context_data["trend_side_hint"] = side_hint
+    if trend_score is not None:
+        context_data["trend_score"] = float(trend_score)
+
+    # トレンド条件を満たさない週は無条件で見送り（レンジ週は原則やらない）
+    if not allowed_trend:
+        why = "トレンド条件を満たさないため今週は見送り（トレンド週のみ運用ルール）。"
+        if trend_reasons:
+            why += " / " + ", ".join(trend_reasons[:6])
+        out = {
+            "decision": "NO_TRADE",
+            "side": "NONE",
+            "entry": 0,
+            "take_profit": 0,
+            "stop_loss": 0,
+            "horizon": "WEEK",
+            "confidence": 0.0,
+            "why": why,
+            "notes": trend_reasons[:12],
+            "market_regime": market_regime,
+            "regime_why": regime_why,
+            "rule": {"trend_only": True, "trend_side_hint": side_hint, "trend_score": trend_score},
+        }
+        if override_mode != "AUTO":
+            out["override"] = {"mode": override_mode, "reason": override_reason.strip()}
+            out["notes"].append("human_override=true")
+        return out
+
+    # 推奨：ブレイク逆指値のエントリー価格（IFD-OCO前提）
+    rec_entry, rec_buf = _recommended_stop_entry(context_data, side_hint)
+    if rec_entry is not None:
+        context_data["recommended_entry"] = float(rec_entry)
+        context_data["breakout_buffer"] = float(rec_buf)
+
     # --- AI注文生成（JSON固定） ---
     try:
         model = genai.GenerativeModel(get_active_model(api_key))
@@ -939,6 +1078,12 @@ atr={a}
 panel_short={ps}
 panel_mid={pm}
 {pos_instr}
+trend_side_hint={context_data.get('trend_side_hint','NONE')}
+trend_score={context_data.get('trend_score','')}
+recent_high20={context_data.get('recent_high20','')}
+recent_low20={context_data.get('recent_low20','')}
+recommended_entry={context_data.get('recommended_entry','')}
+breakout_buffer={context_data.get('breakout_buffer','')}
 last_report_summary={report[:1200]}
 
 【出力ルール（最重要）】
@@ -953,6 +1098,13 @@ last_report_summary={report[:1200]}
   confidence: 0.0〜1.0
   why: 1〜3文（日本語）
   notes: 0〜6個の配列（日本語）
+- 追加必須キー（注文方式の自動化）：
+  order_bundle: "IFD_OCO" | "OCO" | "NONE"
+  entry_type: "STOP" | "LIMIT" | "MARKET" | "NONE"
+  entry_price_kind_jp: "逆指値" | "指値" | "成行" | "なし"
+  bundle_hint_jp: 1行（例: "SBI: 逆指値(IFD-OCO)で放置運用"）
+- トレンド週のみ運用：side は trend_side_hint に必ず合わせる（LONG/SHORT）。
+- decision="TRADE" のとき entry は recommended_entry を優先して使い、entry_type="STOP" とする。
 - decision="TRADE" の場合、必ず stop_loss を含める（欠落禁止）
 - 数値は小数OK、USD/JPYなので 2〜3桁小数で良い
 - あいまい表現で行動を濁さない。TRADE/NO_TRADEどちらかに決める。
@@ -986,6 +1138,50 @@ last_report_summary={report[:1200]}
         # 正常時：regimeを付与
         obj["market_regime"] = market_regime
         obj["regime_why"] = regime_why
+
+        # --- 注文方式の確定（週1放置運用：トレンド週のみ + 逆指値IFD-OCO固定） ---
+        try:
+            decision = obj.get("decision")
+            side = obj.get("side")
+            # トレンド週のみ運用：sideは必ずヒントに一致させる（不一致は事故防止で停止）
+            if decision == "TRADE":
+                if side_hint in ("LONG","SHORT") and side not in (side_hint,):
+                    obj = {
+                        "decision": "NO_TRADE",
+                        "side": "NONE",
+                        "entry": 0,
+                        "take_profit": 0,
+                        "stop_loss": 0,
+                        "horizon": "WEEK",
+                        "confidence": 0.0,
+                        "why": f"AIのside({side})がトレンド判定({side_hint})と不一致のため取引停止（事故防止）。",
+                        "notes": ["side_mismatch_to_trend_gate"],
+                        "market_regime": market_regime,
+                        "regime_why": regime_why,
+                        "rule": {"trend_only": True, "trend_side_hint": side_hint}
+                    }
+                else:
+                    # 推奨エントリー（ブレイク逆指値）に揃える
+                    rec_entry = _safe_float(context_data.get("recommended_entry"))
+                    if rec_entry is not None:
+                        old_entry = _safe_float(obj.get("entry"))
+                        tp = _safe_float(obj.get("take_profit"))
+                        sl = _safe_float(obj.get("stop_loss"))
+                        if old_entry is not None and tp is not None and sl is not None:
+                            delta = float(rec_entry) - float(old_entry)
+                            obj["entry"] = float(rec_entry)
+                            obj["take_profit"] = float(tp) + delta
+                            obj["stop_loss"] = float(sl) + delta
+                            obj.setdefault("notes", []).append("entry_aligned_to_recommended_stop")
+
+                    # 注文方式キーを必ず付与
+                    obj["order_bundle"] = "IFD_OCO"
+                    obj["entry_type"] = "STOP"
+                    obj["entry_price_kind_jp"] = "逆指値"
+                    obj["bundle_hint_jp"] = "SBI: 逆指値(IFD-OCO)で放置運用（TP/SL同時）"
+                    obj.setdefault("notes", []).append("order_method_fixed_ifd_oco_stop")
+        except Exception:
+            pass
         if override_mode != "AUTO":
             obj["override"] = {"mode": override_mode, "reason": override_reason.strip()}
             obj.setdefault("notes", []).append("human_override=true")
@@ -1539,12 +1735,14 @@ if "get_ai_weekend_decision" in globals():
             addon = "（数値ルール: month_hold_line未達 or 週足構造未確認のためHOLD_MONTHをHOLD_WEEKに降格）"
             obj["why"] = (why + " " + addon).strip() if why else addon
 
-        # If numeric rules pass, promote to HOLD_MONTH (even if AI didn't)
+        # If numeric rules pass, promote to HOLD_MONTH only when AI intends to hold (safety-first)
         if isinstance(obj, dict) and ok:
-            obj["action"] = "HOLD_MONTH"
-            why = (obj.get("why") or "").strip()
-            addon = "（数値ルールで1か月継続条件を満たしたためHOLD_MONTH）"
-            obj["why"] = (why + " " + addon).strip() if why else addon
+            a = obj.get("action")
+            if a in ("HOLD_WEEK", "HOLD_MONTH"):
+                obj["action"] = "HOLD_MONTH"
+                why = (obj.get("why") or "").strip()
+                addon = "（数値ルールで1か月継続条件を満たしたためHOLD_MONTH）"
+                obj["why"] = (why + " " + addon).strip() if why else addon
 
         return obj
 
