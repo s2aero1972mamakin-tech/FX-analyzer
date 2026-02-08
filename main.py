@@ -18,12 +18,11 @@ if "quote" not in st.session_state:
 if "last_ai_report" not in st.session_state:
     st.session_state.last_ai_report = "" 
 
-
-# --- ✅【追加】ポートフォリオ（複数ポジション）状態 ---
+# ✅【追加】ポートフォリオ（複数ポジション）状態
 if "portfolio_positions" not in st.session_state:
-    # 各要素: {"pair": "USD/JPY", "ticker": "JPY=X", "direction": "LONG/SHORT",
-    #          "risk_percent": 0.5, "entry_price": float, "entry_time": iso}
+    # 各要素: {"pair": str, "direction": "LONG/SHORT", "risk_percent": float, "entry_price": float, "entry_time": iso}
     st.session_state.portfolio_positions = []
+
 
 # --- APIキー取得 ---
 try:
@@ -39,24 +38,11 @@ st.sidebar.subheader("💰 SBI FX 資金管理")
 # 1. 資金管理入力
 capital = st.sidebar.number_input("軍資金 (JPY)", value=300000, step=10000)
 risk_percent = st.sidebar.slider("1トレード許容損失 (%)", 1.0, 10.0, 2.0, help="負けた時に資金の何%を失う覚悟があるか。プロは2%推奨。")
-weekly_dd_cap_percent = st.sidebar.slider("週単位DDキャップ (%)", 0.5, 5.0, 2.0, 0.1, help="この週に許容する損失上限（全ポジ合計）。推奨は2%。")
 leverage = 25  # 固定
 
 # 2. ポジション情報 (AI連動 & チャート表示用)
 st.sidebar.markdown("---")
 st.sidebar.subheader("📂 保有ポジション")
-
-# --- ✅【追加】ポートフォリオ一覧（複数ポジション） ---
-st.sidebar.markdown("### 📦 ポートフォリオ一覧")
-if st.session_state.portfolio_positions:
-    st.sidebar.json(st.session_state.portfolio_positions)
-else:
-    st.sidebar.caption("現在、登録ポジションはありません。")
-
-if st.sidebar.button("🧹 ポートフォリオ全クリア"):
-    st.session_state.portfolio_positions = []
-    st.sidebar.success("クリアしました。")
-
 entry_price = st.sidebar.number_input("保有価格 (円) ※なしは0", value=0.0, format="%.3f")
 trade_type = st.sidebar.radio("保有タイプ", ["買い (Long)", "売り (Short)"], index=0)
 
@@ -296,9 +282,64 @@ with tab2:
                     ctx["last_report"] = st.session_state.last_ai_report
                     ctx["panel_short"] = diag['short']['status'] if diag else "不明"
                     ctx["panel_mid"] = diag['mid']['status'] if diag else "不明"
-                    strategy = logic.get_ai_order_strategy(api_key, ctx, portfolio_positions=st.session_state.portfolio_positions, weekly_dd_cap_percent=weekly_dd_cap_percent, risk_percent_per_trade=risk_percent)
-                    st.info("AI診断およびパネル診断との整合性を確認しました。")
-                    st.markdown(strategy)
+                    strategy = logic.get_ai_order_strategy(api_key, ctx)
+st.info("AI診断およびパネル診断との整合性を確認しました。")
+
+# --- 表示（dict/str両対応） ---
+if isinstance(strategy, dict):
+    st.json(strategy)
+else:
+    st.markdown(strategy)
+
+# ✅【追加】ドル円がNO_TRADE（見送り）の場合のみ、代替ペアを自動提案
+try:
+    decision = strategy.get("decision") if isinstance(strategy, dict) else ""
+except Exception:
+    decision = ""
+
+if decision == "NO_TRADE":
+    st.warning("USD/JPY が見送り判定のため、代替ペア候補を自動提案します（通貨集中フィルタ＆週DDキャップ適用）。")
+    alt = logic.suggest_alternative_pair_if_usdjpy_stay(
+        api_key=api_key,
+        active_positions=st.session_state.portfolio_positions,
+        risk_percent_per_trade=float(risk_percent),
+        weekly_dd_cap_percent=float(weekly_dd_cap_percent),
+        max_positions_per_currency=int(max_positions_per_currency),
+        exclude_pair_label="USD/JPY (ドル円)"
+    )
+    st.json(alt)
+
+    if alt.get("best_pair_name"):
+        if st.button(f"🧠 代替ペアで注文戦略を生成: {alt['best_pair_name']}"):
+            alt_ctx = dict(ctx)
+            alt_ctx["pair_label"] = alt["best_pair_name"]
+            alt_ctx["ticker"] = logic.PAIR_MAP.get(alt["best_pair_name"], alt_ctx.get("ticker"))
+            alt_strategy = logic.get_ai_order_strategy(api_key, alt_ctx, pair_name=alt["best_pair_name"])
+            st.subheader("代替ペアの注文戦略")
+            if isinstance(alt_strategy, dict):
+                st.json(alt_strategy)
+            else:
+                st.markdown(alt_strategy)
+
+            # 代替ペアのTRADEならワンクリックでポートフォリオに登録
+            if isinstance(alt_strategy, dict) and alt_strategy.get("decision") == "TRADE":
+                if st.button(f"➕ ポートフォリオに登録: {alt['best_pair_name']}"):
+                    # 週DDキャップ最終チェック
+                    if not logic.can_open_under_weekly_cap(st.session_state.portfolio_positions, float(risk_percent), float(weekly_dd_cap_percent)):
+                        st.error("週単位DDキャップを超えるため登録できません。")
+                    elif logic.violates_currency_concentration(alt['best_pair_name'], st.session_state.portfolio_positions, int(max_positions_per_currency)):
+                        st.error("通貨集中フィルタにより登録できません。")
+                    else:
+                        st.session_state.portfolio_positions.append({
+                            "pair": alt["best_pair_name"],
+                            "direction": "LONG" if alt_strategy.get("side") == "LONG" else "SHORT",
+                            "risk_percent": float(risk_percent),
+                            "entry_price": float(alt_strategy.get("entry", alt_ctx.get("price", 0.0)) or 0.0),
+                            "entry_time": datetime.now(TOKYO).isoformat()
+                        })
+                        st.success("ポートフォリオに登録しました。")
+    else:
+        st.info("条件を満たす代替ペアがないため、今週は完全ノートレ推奨です。")
         else:
             st.warning("Gemini API Key を入力してください。")
 
@@ -307,5 +348,5 @@ with tab3:
     if st.button("💰 長期ポートフォリオ＆週末診断"):
         if api_key:
             with st.spinner("スワップ・金利分析中..."):
-                st.markdown(logic.get_ai_portfolio(api_key, ctx, portfolio_positions=st.session_state.portfolio_positions, weekly_dd_cap_percent=weekly_dd_cap_percent)) # ctxを渡してポジション連動させる
+                st.markdown(logic.get_ai_portfolio(api_key, ctx)) # ctxを渡してポジション連動させる
         else: st.warning("Gemini API Key を入力してください。")
