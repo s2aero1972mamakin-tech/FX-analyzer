@@ -133,46 +133,49 @@ last_date = df.index[-1]
 start_view = last_date - timedelta(days=60)
 df_view = df.loc[df.index >= start_view]
 
-# ✅ 【修正】3段構成チャート (価格 / RSI / 米国債)
-# 凡例(legend)を表示、タイトルも分かりやすく
+# ✅ 【修正】3段構成チャート
 fig = make_subplots(
     rows=3, cols=1, 
     shared_xaxes=True, 
     vertical_spacing=0.08, 
     row_heights=[0.6, 0.2, 0.2],
-    subplot_titles=(f"{target_pair_name} チャート & 移動平均線", "RSI (14) - 過熱感", "米国10年債利回り (US10Y)")
+    subplot_titles=(f"{target_pair_name} Chart", "RSI (14)", "US 10Y Yield")
 )
 
-# 1段目: 価格とMA (凡例あり)
+# 1段目: 価格とMA (凡例表示)
 fig.add_trace(go.Candlestick(x=df_view.index, open=df_view['Open'], high=df_view['High'], low=df_view['Low'], close=df_view['Close'], name='Price', showlegend=True), row=1, col=1)
-fig.add_trace(go.Scatter(x=df_view.index, y=df_view['SMA_25'], line=dict(color='orange', width=1), name='SMA25 (中期)', showlegend=True), row=1, col=1)
-fig.add_trace(go.Scatter(x=df_view.index, y=df_view['SMA_75'], line=dict(color='blue', width=1), name='SMA75 (長期)', showlegend=True), row=1, col=1)
+fig.add_trace(go.Scatter(x=df_view.index, y=df_view['SMA_25'], line=dict(color='orange', width=1), name='SMA25', showlegend=True), row=1, col=1)
+fig.add_trace(go.Scatter(x=df_view.index, y=df_view['SMA_75'], line=dict(color='blue', width=1), name='SMA75', showlegend=True), row=1, col=1)
 
-# 2段目: RSI (凡例あり)
+# 2段目: RSI (以前のシンプルなスタイル + 凡例表示)
 fig.add_trace(go.Scatter(x=df_view.index, y=df_view['RSI'], line=dict(color='purple', width=1), name='RSI', showlegend=True), row=2, col=1)
-fig.add_hline(y=70, line_dash="dot", row=2, col=1, line_color="red", annotation_text="買われすぎ(70)")
-fig.add_hline(y=30, line_dash="dot", row=2, col=1, line_color="blue", annotation_text="売られすぎ(30)")
+# 70/30ライン (凡例には出さない)
+fig.add_shape(type="line", x0=df_view.index[0], x1=df_view.index[-1], y0=70, y1=70, line=dict(color="gray", width=1, dash="dot"), row=2, col=1)
+fig.add_shape(type="line", x0=df_view.index[0], x1=df_view.index[-1], y0=30, y1=30, line=dict(color="gray", width=1, dash="dot"), row=2, col=1)
 
-# 3段目: 米国債利回り (凡例あり)
+# 3段目: 米国債利回り (凡例表示)
 if "US10Y" in df_view.columns and not df_view["US10Y"].isnull().all():
-    fig.add_trace(go.Scatter(x=df_view.index, y=df_view['US10Y'], line=dict(color='green', width=1), name='US10Y Yield', showlegend=True), row=3, col=1)
+    fig.add_trace(go.Scatter(x=df_view.index, y=df_view['US10Y'], line=dict(color='green', width=1), name='US10Y', showlegend=True), row=3, col=1)
 
-# レイアウト調整: 凡例を表示、高さを確保
+# レイアウト調整: 凡例を右側に固定
 fig.update_layout(height=850, margin=dict(l=20, r=20, t=40, b=20), showlegend=True)
-# 凡例の位置調整（グラフの邪魔にならないように）
-fig.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+fig.update_layout(legend=dict(
+    yanchor="top",
+    y=1,
+    xanchor="left",
+    x=1.01  # グラフエリアの右外側に配置
+))
 
 st.plotly_chart(fig, use_container_width=True)
 
-
-# ✅ 【移動】通貨強弱チャート (メイン画面下部へ)
+# 通貨強弱 (メイン画面下部)
 st.markdown("---")
-st.subheader("💪 通貨強弱チャート (直近1ヶ月)")
+st.subheader("💪 Currency Strength (1 Month)")
 strength_df = logic.get_currency_strength()
 if not strength_df.empty:
     st.line_chart(strength_df)
 else:
-    st.info("通貨強弱データの取得に失敗しました。")
+    st.info("データ取得中...")
 
 
 # =================================================
