@@ -71,7 +71,7 @@ with st.sidebar.expander("ポジション1 (主要)", expanded=True):
         p1_price = st.number_input("取得価格", 0.0, step=0.01, key="p1_price")
         p1_lots = st.number_input("数量(万通貨)", 0.0, step=0.1, key="p1_lots")
         p1_side = st.radio("売買", ["Long", "Short"], key="p1_side", horizontal=True)
-        # 簡易現在値入力(本来はAPI取得推奨)
+        # 簡易現在値入力
         p1_cur = st.number_input("現在値(概算)", value=p1_price, step=0.01, key="p1_cur")
         
         if p1_lots > 0:
@@ -102,20 +102,11 @@ with st.sidebar.expander("ポジション2 (追加)", expanded=False):
 st.sidebar.info(f"合計含み損益: {int(total_unrealized_pl):,} 円")
 st.sidebar.warning(f"使用中証拠金: {int(total_margin_used):,} 円")
 
-# ✅ 【復活】通貨強弱チャート (サイドバー下部)
-st.sidebar.markdown("---")
-st.sidebar.subheader("💪 通貨強弱 (直近1ヶ月)")
-strength_df = logic.get_currency_strength()
-if not strength_df.empty:
-    st.sidebar.line_chart(strength_df)
-else:
-    st.sidebar.caption("データ取得中...")
-
 # =================================================
 # メイン画面処理
 # =================================================
 
-# データ取得 (選択されたペアを使用)
+# データ取得
 usdjpy_raw, us10y_raw = logic.get_market_data(symbol=target_symbol)
 df = logic.calculate_indicators(usdjpy_raw, us10y_raw)
 
@@ -137,40 +128,52 @@ st.markdown(
 # 診断生成
 diag = logic.judge_condition(df)
 
-# チャート表示 (連動グラフ)
+# チャート表示
 last_date = df.index[-1]
-start_view = last_date - timedelta(days=60) # 期間を少し長めに
+start_view = last_date - timedelta(days=60)
 df_view = df.loc[df.index >= start_view]
 
 # ✅ 【修正】3段構成チャート (価格 / RSI / 米国債)
-# 2段目のRSIは、選択したペア(target_symbol)に基づいて計算されたものが表示されます。
+# 凡例(legend)を表示、タイトルも分かりやすく
 fig = make_subplots(
     rows=3, cols=1, 
     shared_xaxes=True, 
-    vertical_spacing=0.05, 
+    vertical_spacing=0.08, 
     row_heights=[0.6, 0.2, 0.2],
-    subplot_titles=(f"{target_pair_name} Price & MA", "RSI (14) - Overbought/Oversold", "US 10Y Yield")
+    subplot_titles=(f"{target_pair_name} チャート & 移動平均線", "RSI (14) - 過熱感", "米国10年債利回り (US10Y)")
 )
 
-# 1段目: 価格とMA
-fig.add_trace(go.Candlestick(x=df_view.index, open=df_view['Open'], high=df_view['High'], low=df_view['Low'], close=df_view['Close'], name='Price'), row=1, col=1)
-fig.add_trace(go.Scatter(x=df_view.index, y=df_view['SMA_25'], line=dict(color='orange', width=1), name='SMA25'), row=1, col=1)
-fig.add_trace(go.Scatter(x=df_view.index, y=df_view['SMA_75'], line=dict(color='blue', width=1), name='SMA75'), row=1, col=1)
+# 1段目: 価格とMA (凡例あり)
+fig.add_trace(go.Candlestick(x=df_view.index, open=df_view['Open'], high=df_view['High'], low=df_view['Low'], close=df_view['Close'], name='Price', showlegend=True), row=1, col=1)
+fig.add_trace(go.Scatter(x=df_view.index, y=df_view['SMA_25'], line=dict(color='orange', width=1), name='SMA25 (中期)', showlegend=True), row=1, col=1)
+fig.add_trace(go.Scatter(x=df_view.index, y=df_view['SMA_75'], line=dict(color='blue', width=1), name='SMA75 (長期)', showlegend=True), row=1, col=1)
 
-# 2段目: RSI (買われすぎ/売られすぎ)
-fig.add_trace(go.Scatter(x=df_view.index, y=df_view['RSI'], line=dict(color='purple', width=1), name='RSI'), row=2, col=1)
-# 70と30のラインを明確に引く
-fig.add_shape(type="line", x0=df_view.index[0], x1=df_view.index[-1], y0=70, y1=70, line=dict(color="red", width=1, dash="dot"), row=2, col=1)
-fig.add_shape(type="line", x0=df_view.index[0], x1=df_view.index[-1], y0=30, y1=30, line=dict(color="blue", width=1, dash="dot"), row=2, col=1)
-# 買われすぎ(70以上)エリアを背景色で強調
-# (Plotlyの仕様上、shapeで塗りつぶすのは複雑になるため、ラインのみで対応)
+# 2段目: RSI (凡例あり)
+fig.add_trace(go.Scatter(x=df_view.index, y=df_view['RSI'], line=dict(color='purple', width=1), name='RSI', showlegend=True), row=2, col=1)
+fig.add_hline(y=70, line_dash="dot", row=2, col=1, line_color="red", annotation_text="買われすぎ(70)")
+fig.add_hline(y=30, line_dash="dot", row=2, col=1, line_color="blue", annotation_text="売られすぎ(30)")
 
-# 3段目: 米国債利回り (US10Y)
+# 3段目: 米国債利回り (凡例あり)
 if "US10Y" in df_view.columns and not df_view["US10Y"].isnull().all():
-    fig.add_trace(go.Scatter(x=df_view.index, y=df_view['US10Y'], line=dict(color='green', width=1), name='US10Y Yield'), row=3, col=1)
+    fig.add_trace(go.Scatter(x=df_view.index, y=df_view['US10Y'], line=dict(color='green', width=1), name='US10Y Yield', showlegend=True), row=3, col=1)
 
-fig.update_layout(height=800, margin=dict(l=0, r=0, t=30, b=0), showlegend=False) # 高さ調整
+# レイアウト調整: 凡例を表示、高さを確保
+fig.update_layout(height=850, margin=dict(l=20, r=20, t=40, b=20), showlegend=True)
+# 凡例の位置調整（グラフの邪魔にならないように）
+fig.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+
 st.plotly_chart(fig, use_container_width=True)
+
+
+# ✅ 【移動】通貨強弱チャート (メイン画面下部へ)
+st.markdown("---")
+st.subheader("💪 通貨強弱チャート (直近1ヶ月)")
+strength_df = logic.get_currency_strength()
+if not strength_df.empty:
+    st.line_chart(strength_df)
+else:
+    st.info("通貨強弱データの取得に失敗しました。")
+
 
 # =================================================
 # タブ機能
