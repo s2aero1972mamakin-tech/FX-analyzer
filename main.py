@@ -20,6 +20,14 @@ if "quote" not in st.session_state:
 if "last_ai_report" not in st.session_state:
     st.session_state.last_ai_report = ""
 
+# ✅【追加】注文命令書/代替ペアの状態保持（Streamlitのボタン再実行対策）
+if "last_strategy" not in st.session_state:
+    st.session_state.last_strategy = None
+if "last_alt" not in st.session_state:
+    st.session_state.last_alt = None
+if "last_alt_strategy" not in st.session_state:
+    st.session_state.last_alt_strategy = None
+
 # ✅【追加】ポートフォリオ（複数ポジション）状態
 if "portfolio_positions" not in st.session_state:
     # 各要素: {"pair": str, "direction": "LONG/SHORT", "risk_percent": float, "entry_price": float, "entry_time": iso}
@@ -282,11 +290,10 @@ with tab1:
         else:
             st.warning("Gemini API Key を入力してください。")
 
-# strategy は tab2 外でも参照されるので、事前に初期化（削除ではなく安全化）
-strategy = {}
 
 with tab2:
-    if st.button("📝 注文命令書作成"):
+    # --- 注文命令書（週1運用の中核） ---
+    if st.button("📝 注文命令書作成", key="btn_make_order"):
         if api_key:
             if not st.session_state.last_ai_report:
                 st.warning("先に『詳細レポート』を生成してください。")
@@ -295,75 +302,84 @@ with tab2:
                     ctx["last_report"] = st.session_state.last_ai_report
                     ctx["panel_short"] = diag['short']['status'] if diag else "不明"
                     ctx["panel_mid"] = diag['mid']['status'] if diag else "不明"
-                    strategy = logic.get_ai_order_strategy(api_key, ctx)
-
-                    st.info("AI診断およびパネル診断との整合性を確認しました。")
-
-                    # --- 表示（dict/str両対応） ---
-                    if isinstance(strategy, dict):
-                        st.json(strategy)
-                    else:
-                        st.markdown(strategy)
-
-                    # ✅【追加】ドル円がNO_TRADE（見送り）の場合のみ、代替ペアを自動提案
-                    try:
-                        decision = strategy.get("decision") if isinstance(strategy, dict) else ""
-                    except Exception:
-                        decision = ""
-
-                    if decision == "NO_TRADE":
-                        st.warning("USD/JPY が見送り判定のため、代替ペア候補を自動提案します（通貨集中フィルタ＆週DDキャップ適用）。")
-                        alt = logic.suggest_alternative_pair_if_usdjpy_stay(
-                            api_key=api_key,
-                            active_positions=st.session_state.portfolio_positions,
-                            risk_percent_per_trade=float(risk_percent),
-                            weekly_dd_cap_percent=float(weekly_dd_cap_percent),
-                            max_positions_per_currency=int(max_positions_per_currency),
-                            exclude_pair_label="USD/JPY (ドル円)"
-                        )
-                        st.json(alt)
-
-                        if isinstance(alt, dict) and alt.get("best_pair_name"):
-                            if st.button(f"🧠 代替ペアで注文戦略を生成: {alt['best_pair_name']}"):
-                                alt_ctx = dict(ctx)
-                                alt_ctx["pair_label"] = alt["best_pair_name"]
-                                alt_ctx["ticker"] = logic.PAIR_MAP.get(alt["best_pair_name"], alt_ctx.get("ticker"))
-                                alt_strategy = logic.get_ai_order_strategy(api_key, alt_ctx, pair_name=alt["best_pair_name"])
-                                st.subheader("代替ペアの注文戦略")
-                                if isinstance(alt_strategy, dict):
-                                    st.json(alt_strategy)
-                                else:
-                                    st.markdown(alt_strategy)
-
-                                # 代替ペアのTRADEならワンクリックでポートフォリオに登録
-                                if isinstance(alt_strategy, dict) and alt_strategy.get("decision") == "TRADE":
-                                    if st.button(f"➕ ポートフォリオに登録: {alt['best_pair_name']}"):
-                                        if not logic.can_open_under_weekly_cap(
-                                            st.session_state.portfolio_positions,
-                                            float(risk_percent),
-                                            float(weekly_dd_cap_percent)
-                                        ):
-                                            st.error("週単位DDキャップを超えるため登録できません。")
-                                        elif logic.violates_currency_concentration(
-                                            alt['best_pair_name'],
-                                            st.session_state.portfolio_positions,
-                                            int(max_positions_per_currency)
-                                        ):
-                                            st.error("通貨集中フィルタにより登録できません。")
-                                        else:
-                                            st.session_state.portfolio_positions.append({
-                                                "pair": alt["best_pair_name"],
-                                                "direction": "LONG" if alt_strategy.get("side") == "LONG" else "SHORT",
-                                                "risk_percent": float(risk_percent),
-                                                "entry_price": float(alt_strategy.get("entry", alt_ctx.get("price", 0.0)) or 0.0),
-                                                "entry_time": datetime.now(TOKYO).isoformat()
-                                            })
-                                            st.success("ポートフォリオに登録しました。")
-                        else:
-                            st.info("条件を満たす代替ペアがないため、今週は完全ノートレ推奨です。")
+                    st.session_state.last_strategy = logic.get_ai_order_strategy(api_key, ctx)
+                    # 注文命令書を作り直したら、代替ペア関連のキャッシュはリセット（誤爆防止）
+                    st.session_state.last_alt = None
+                    st.session_state.last_alt_strategy = None
         else:
             st.warning("Gemini API Key を入力してください。")
 
+    # --- 直近の注文命令書を表示（ボタン押下後も表示が残る） ---
+    strategy = st.session_state.get("last_strategy") or {}
+    if strategy:
+        st.info("AI診断およびパネル診断との整合性を確認しました。")
+        if isinstance(strategy, dict):
+            st.json(strategy)
+        else:
+            st.markdown(strategy)
+
+        decision = ""
+        try:
+            decision = strategy.get("decision") if isinstance(strategy, dict) else ""
+        except Exception:
+            decision = ""
+
+        # ✅ ドル円が見送りなら、代替ペア提案（週DDキャップ＆通貨集中フィルタ適用）
+        if decision == "NO_TRADE":
+            st.warning("USD/JPY が見送り判定のため、代替ペア候補を自動提案します（通貨集中フィルタ＆週DDキャップ適用）。")
+
+            # 代替提案は重いので、初回だけ生成して保持（ボタンの二段押しがStreamlitで失敗しないように）
+            if st.session_state.get("last_alt") is None:
+                st.session_state.last_alt = logic.suggest_alternative_pair_if_usdjpy_stay(
+                    api_key=api_key,
+                    active_positions=st.session_state.portfolio_positions,
+                    risk_percent_per_trade=float(risk_percent),
+                    weekly_dd_cap_percent=float(weekly_dd_cap_percent),
+                    max_positions_per_currency=int(max_positions_per_currency),
+                    exclude_pair_label="USD/JPY (ドル円)"
+                )
+
+            alt = st.session_state.get("last_alt") or {}
+            st.json(alt)
+
+            if isinstance(alt, dict) and alt.get("best_pair_name"):
+                best_pair = alt["best_pair_name"]
+
+                # 代替ペアの注文戦略を生成（別ボタンでも動くように、状態を保持）
+                if st.button(f"🧠 代替ペアで注文戦略を生成: {best_pair}", key="btn_make_alt_order"):
+                    alt_ctx = dict(ctx)
+                    alt_ctx["pair_label"] = best_pair
+                    # ticker が見つからない場合は、そのまま（logic側のデフォルトに任せる）
+                    if hasattr(logic, "PAIR_MAP"):
+                        alt_ctx["ticker"] = logic.PAIR_MAP.get(best_pair, alt_ctx.get("ticker"))
+                    st.session_state.last_alt_strategy = logic.get_ai_order_strategy(api_key, alt_ctx, pair_name=best_pair)
+
+                alt_strategy = st.session_state.get("last_alt_strategy")
+                if alt_strategy:
+                    st.subheader("代替ペアの注文戦略")
+                    if isinstance(alt_strategy, dict):
+                        st.json(alt_strategy)
+                    else:
+                        st.markdown(alt_strategy)
+
+                    # 代替ペアがTRADEならワンクリックでポートフォリオに登録
+                    if isinstance(alt_strategy, dict) and alt_strategy.get("decision") == "TRADE":
+                        if st.button(f"➕ ポートフォリオに登録: {best_pair}", key="btn_add_alt_to_portfolio"):
+                            if not logic.can_open_under_weekly_cap(st.session_state.portfolio_positions, float(risk_percent), float(weekly_dd_cap_percent)):
+                                st.error("週単位DDキャップを超えるため登録できません。")
+                            elif logic.violates_currency_concentration(best_pair, st.session_state.portfolio_positions, int(max_positions_per_currency)):
+                                st.error("通貨集中フィルタにより登録できません。")
+                            else:
+                                st.session_state.portfolio_positions.append({
+                                    "pair": best_pair,
+                                    "direction": "LONG" if (isinstance(alt_strategy, dict) and alt_strategy.get("side") == "LONG") else "SHORT",
+                                    "risk_percent": float(risk_percent),
+                                    "entry_price": float((alt_strategy.get("entry") if isinstance(alt_strategy, dict) else 0.0) or ctx.get("price", 0.0) or 0.0),
+                                    "entry_time": datetime.now(TOKYO).isoformat()
+                                })
+                                st.success("ポートフォリオに登録しました。")
+            else:
+                st.info("条件を満たす代替ペアがないため、今週は完全ノートレ推奨です。")
 with tab3:
     st.markdown("##### 週末・月末判断 & スワップ運用")
     if st.button("💰 長期ポートフォリオ＆週末診断"):
