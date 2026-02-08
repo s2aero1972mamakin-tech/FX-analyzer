@@ -57,7 +57,7 @@ target_symbol = logic.PAIR_MAP[selected_pair_label]
 target_pair_name = selected_pair_label.split(" ")[0]
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("💰 ポートフォリオ状況 (資金管理)")
+st.sidebar.subheader("💰 ポートフォリオ状況")
 
 # 資金管理計算用
 total_unrealized_pl = 0.0
@@ -102,6 +102,15 @@ with st.sidebar.expander("ポジション2 (追加)", expanded=False):
 st.sidebar.info(f"合計含み損益: {int(total_unrealized_pl):,} 円")
 st.sidebar.warning(f"使用中証拠金: {int(total_margin_used):,} 円")
 
+# ✅ 【復活】通貨強弱チャート (サイドバー下部)
+st.sidebar.markdown("---")
+st.sidebar.subheader("💪 通貨強弱 (直近1ヶ月)")
+strength_df = logic.get_currency_strength()
+if not strength_df.empty:
+    st.sidebar.line_chart(strength_df)
+else:
+    st.sidebar.caption("データ取得中...")
+
 # =================================================
 # メイン画面処理
 # =================================================
@@ -128,22 +137,43 @@ st.markdown(
 # 診断生成
 diag = logic.judge_condition(df)
 
-# チャート表示
+# チャート表示 (連動グラフ)
 last_date = df.index[-1]
-start_view = last_date - timedelta(days=45)
+start_view = last_date - timedelta(days=60) # 期間を少し長めに
 df_view = df.loc[df.index >= start_view]
 
-fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.7, 0.3])
+# ✅ 【修正】3段構成チャート (価格 / RSI / 米国債)
+# 2段目のRSIは、選択したペア(target_symbol)に基づいて計算されたものが表示されます。
+fig = make_subplots(
+    rows=3, cols=1, 
+    shared_xaxes=True, 
+    vertical_spacing=0.05, 
+    row_heights=[0.6, 0.2, 0.2],
+    subplot_titles=(f"{target_pair_name} Price & MA", "RSI (14) - Overbought/Oversold", "US 10Y Yield")
+)
+
+# 1段目: 価格とMA
 fig.add_trace(go.Candlestick(x=df_view.index, open=df_view['Open'], high=df_view['High'], low=df_view['Low'], close=df_view['Close'], name='Price'), row=1, col=1)
 fig.add_trace(go.Scatter(x=df_view.index, y=df_view['SMA_25'], line=dict(color='orange', width=1), name='SMA25'), row=1, col=1)
 fig.add_trace(go.Scatter(x=df_view.index, y=df_view['SMA_75'], line=dict(color='blue', width=1), name='SMA75'), row=1, col=1)
+
+# 2段目: RSI (買われすぎ/売られすぎ)
 fig.add_trace(go.Scatter(x=df_view.index, y=df_view['RSI'], line=dict(color='purple', width=1), name='RSI'), row=2, col=1)
-fig.add_hline(y=70, line_dash="dot", row=2, col=1); fig.add_hline(y=30, line_dash="dot", row=2, col=1)
-fig.update_layout(height=500, margin=dict(l=0, r=0, t=0, b=0))
+# 70と30のラインを明確に引く
+fig.add_shape(type="line", x0=df_view.index[0], x1=df_view.index[-1], y0=70, y1=70, line=dict(color="red", width=1, dash="dot"), row=2, col=1)
+fig.add_shape(type="line", x0=df_view.index[0], x1=df_view.index[-1], y0=30, y1=30, line=dict(color="blue", width=1, dash="dot"), row=2, col=1)
+# 買われすぎ(70以上)エリアを背景色で強調
+# (Plotlyの仕様上、shapeで塗りつぶすのは複雑になるため、ラインのみで対応)
+
+# 3段目: 米国債利回り (US10Y)
+if "US10Y" in df_view.columns and not df_view["US10Y"].isnull().all():
+    fig.add_trace(go.Scatter(x=df_view.index, y=df_view['US10Y'], line=dict(color='green', width=1), name='US10Y Yield'), row=3, col=1)
+
+fig.update_layout(height=800, margin=dict(l=0, r=0, t=30, b=0), showlegend=False) # 高さ調整
 st.plotly_chart(fig, use_container_width=True)
 
 # =================================================
-# タブ機能 (ポートフォリオ・スキャナー対応)
+# タブ機能
 # =================================================
 tab1, tab2, tab3 = st.tabs(["📊 詳細レポート", "📝 注文戦略(AI)", "📅 週末ホールド判定(数値)"])
 
@@ -155,8 +185,9 @@ ctx = {
     "rsi": df["RSI"].iloc[-1],
     "atr": df["ATR"].iloc[-1],
     "atr_avg60": df["ATR"].rolling(60).mean().iloc[-1] if len(df)>60 else 0,
+    "us10y": df["US10Y"].iloc[-1] if "US10Y" in df.columns else 0, 
     "capital": capital,
-    "open_price": df["Open"].iloc[-1] # Gap検知用
+    "open_price": df["Open"].iloc[-1] 
 }
 
 with tab1:
@@ -187,16 +218,15 @@ with tab2:
                     ctx["panel_short"] = diag['short']['status'] if diag else "不明"
                     ctx["panel_mid"] = diag['mid']['status'] if diag else "不明"
                     
-                    # ペア名を渡して汎用プロンプトを駆動
                     strategy = logic.get_ai_order_strategy(api_key, ctx, pair_name=target_pair_name)
                     st.json(strategy)
                     
                     if strategy.get("decision") == "TRADE":
                         ent = strategy.get("entry", 0)
                         sl = strategy.get("stop_loss", 0)
-                        risk_val = abs(ent - sl) * 10000 # 1万通貨あたりリスク
+                        risk_val = abs(ent - sl) * 10000 
                         if risk_val > 0:
-                            allowable_loss = free_margin * 0.02 # 2%ルール
+                            allowable_loss = free_margin * 0.02 
                             lots = allowable_loss / risk_val
                             st.success(f"推奨ロット数: **{lots:.2f}万通貨** (余力の2%リスク許容)")
         else:
@@ -206,7 +236,6 @@ with tab3:
     st.markdown("#### 週末/月末 ホールド可否判定 (数値ルール主導)")
     st.info("💡 **ルール**: 含み益が **2.0円 (200pips)** 以上ならHOLD、それ以外は決済推奨。")
     
-    # 判定対象の選択
     col1, col2 = st.columns(2)
     with col1:
         eval_pair = st.selectbox("診断対象", list(logic.PAIR_MAP.keys()), key="eval_pair")
@@ -217,7 +246,6 @@ with tab3:
     if st.button("🚀 判定実行"):
         if api_key and eval_price > 0:
             with st.spinner("数値ルール照合中..."):
-                # 診断対象の現在レートを取得
                 d_sym = logic.PAIR_MAP[eval_pair]
                 d_df, _ = logic.get_market_data(symbol=d_sym, period="5d")
                 
