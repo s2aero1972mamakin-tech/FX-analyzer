@@ -1020,227 +1020,591 @@ def get_ai_range(api_key, context_data):
     except:
         return None
 
+# === PORTFOLIO_AUTOMATION_EXTENSIONS v1 ===
 
+    from typing import Any, Tuple
 
-# =========================================================
-# ✅【追加】100点改修: 数値HOLD_MONTH / 相関フィルタ / 週DDキャップ
-# 既存プロンプト/アルゴリズムは一切削除せず、後段で優先ルールを追加する
-# =========================================================
+    def _pair_label_to_currencies(pair_label: str) -> Tuple[str, str]:
+        """Extract base/quote currencies from label like 'USD/JPY (ドル円)' or 'EUR/USD (ユーロドル)'."""
+        # label begins with 'AAA/BBB'
+        head = pair_label.split()[0]
+        if "/" in head and len(head) >= 7:
+            base, quote = head.split("/")[:2]
+            return base.strip(), quote.strip()
+        # fallback: attempt from ticker map key format
+        if "/" in pair_label:
+            base, quote = pair_label.split("/")[:2]
+            return base.strip()[:3], quote.strip()[:3]
+        return "UNK", "UNK"
 
-def _extract_pair_codes(pair_label: str):
-    """'USD/JPY (ドル円)' -> ('USD','JPY') / 'USD/JPY' -> ('USD','JPY')"""
-    if not pair_label:
-        return ("", "")
-    s = pair_label.strip()
-    # 先頭の 'XXX/YYY' を拾う
-    m = re.match(r"([A-Z]{3})\s*/\s*([A-Z]{3})", s)
-    if not m:
-        return ("", "")
-    return (m.group(1), m.group(2))
+    def portfolio_weekly_risk_percent(active_positions: list) -> float:
+        """Sum of risk_percent across active positions."""
+        total = 0.0
+        for p in active_positions or []:
+            try:
+                total += float(p.get("risk_percent", p.get("risk", 0.0)))
+            except Exception:
+                continue
+        return float(total)
 
-def _position_currency_exposure(portfolio_positions: list):
-    """簡易の通貨エクスポージャ（相関フィルタ用）。"""
-    expo = {}
-    for p in (portfolio_positions or []):
-        pair = p.get("pair") or ""
-        b, q = _extract_pair_codes(pair)
-        if b: expo[b] = expo.get(b, 0) + 1
-        if q: expo[q] = expo.get(q, 0) + 1
-    return expo
+    def portfolio_currency_counts(active_positions: list) -> dict:
+        counts = {}
+        for p in active_positions or []:
+            pair = p.get("pair") or p.get("pair_label") or p.get("pair_name") or ""
+            if not pair:
+                continue
+            b, q = _pair_label_to_currencies(pair)
+            counts[b] = counts.get(b, 0) + 1
+            counts[q] = counts.get(q, 0) + 1
+        return counts
 
-def portfolio_correlation_filter_ok(candidate_pair_label: str, portfolio_positions: list, max_shared_currency: int = 1):
-    """既存ポジと通貨が被り過ぎる候補を除外（相関の簡易フィルタ）。"""
-    expo = _position_currency_exposure(portfolio_positions)
-    b, q = _extract_pair_codes(candidate_pair_label)
-    if not b and not q:
-        return True
-    # 候補が含む通貨のどれかが既に max_shared_currency 以上ならNG
-    if (b and expo.get(b, 0) >= max_shared_currency) or (q and expo.get(q, 0) >= max_shared_currency):
-        return False
-    return True
+    def violates_currency_concentration(candidate_pair_label: str, active_positions: list, max_positions_per_currency: int = 1) -> bool:
+        """
+        Simple correlation proxy:
+        - If any currency (USD/JPY/EUR/AUD/GBP...) would be held in more than max_positions_per_currency positions, block.
+        Default max_positions_per_currency=1 prevents stacking multiple JPY-crosses etc.
+        """
+        counts = portfolio_currency_counts(active_positions)
+        b, q = _pair_label_to_currencies(candidate_pair_label)
+        # +1 exposure if opened
+        return (counts.get(b, 0) + 1 > max_positions_per_currency) or (counts.get(q, 0) + 1 > max_positions_per_currency)
 
-def weekly_dd_cap_ok(portfolio_positions: list, add_risk_percent: float, weekly_dd_cap_percent: float = 2.0):
-    """週単位DDキャップ（全ポジ合計リスク%）"""
-    total = 0.0
-    for p in (portfolio_positions or []):
+    def can_open_under_weekly_cap(active_positions: list, new_risk_percent: float, weekly_dd_cap_percent: float) -> bool:
         try:
-            total += float(p.get("risk_percent", 0.0) or 0.0)
+            new_risk = float(new_risk_percent)
+            cap = float(weekly_dd_cap_percent)
         except Exception:
-            pass
-    return (total + float(add_risk_percent or 0.0)) <= float(weekly_dd_cap_percent or 0.0)
+            return True
+        return (portfolio_weekly_risk_percent(active_positions) + new_risk) <= cap
 
-def calc_month_hold_line(ticker: str, trade_side: str, atr_daily: float = 0.0, buffer_atr: float = 0.2):
+    def _build_market_summary_for_pairs() -> str:
+        market_summary = ""
+        for name, sym in PAIR_MAP.items():
+            try:
+                df = _yahoo_chart(sym, rng="5d", interval="1d")
+                if df is None or df.empty:
+                    continue
+                close = float(df["Close"].iloc[-1])
+                prev = float(df["Close"].iloc[-2]) if len(df) >= 2 else close
+                chg = (close - prev) / prev * 100 if prev else 0.0
+                trend = "上昇" if close > float(df["Close"].mean()) else "下降"
+                market_summary += f"- {name}: Price={close:.3f} / Chg={chg:+.2f}% / Trend={trend}\n"
+            except Exception:
+                continue
+        return market_summary
+
+    def suggest_alternative_pair_if_usdjpy_stay(
+        api_key: str,
+        active_positions: list,
+        risk_percent_per_trade: float,
+        weekly_dd_cap_percent: float = 2.0,
+        max_positions_per_currency: int = 1,
+        exclude_pair_label: str = "USD/JPY (ドル円)"
+    ) -> dict:
+        """
+        If USD/JPY is NO_TRADE (STAY), suggest an alternative pair.
+        - Uses an AI-ranked list (top N) and then applies:
+          (1) weekly DD cap
+          (2) currency concentration filter
+        Returns dict or {}.
+        """
+        model_name = get_active_model(api_key)
+        if not model_name:
+            return {}
+
+        # Weekly cap gate first
+        if not can_open_under_weekly_cap(active_positions, risk_percent_per_trade, weekly_dd_cap_percent):
+            return {
+                "best_pair_name": "",
+                "reason": "週単位DDキャップを超えるため今週は新規不可",
+                "confidence": 1.0,
+                "blocked": True,
+                "blocked_by": "weekly_dd_cap"
+            }
+
+        market_summary = _build_market_summary_for_pairs()
+
+        prompt = f"""
+あなたはプロのFXファンドマネージャーです。
+以下の市場データから「今週、USD/JPYが見送りのときに代替として最も利益チャンスがありそうなペア」を最大5つ、優先順で提案してください。
+ただし同じ通貨への偏り（例: JPY絡みを複数）を避ける観点も考慮してください。
+
+【市場概況】
+{market_summary}
+
+【必須制約】
+- 可能なら {exclude_pair_label} 以外から選ぶ
+- 出力はJSONのみ
+
+【出力JSON】
+{{
+  "candidates": [
+    {{"pair": "EUR/USD (ユーロドル)", "reason": "...", "confidence": 0.0}},
+    {{"pair": "AUD/JPY (豪ドル円)", "reason": "...", "confidence": 0.0}}
+  ]
+}}
+"""
+
+        try:
+            model = genai.GenerativeModel(model_name)
+            resp = model.generate_content(prompt)
+            txt = (resp.text or "").strip()
+            data = safe_json_loads(txt) if 'safe_json_loads' in globals() else json.loads(_extract_json(txt))
+            candidates = data.get("candidates", [])
+        except Exception:
+            # fallback: reuse existing scan_best_pair single answer
+            single = scan_best_pair(api_key)
+            candidates = []
+            if isinstance(single, dict) and single.get("best_pair_name"):
+                candidates.append({
+                    "pair": single.get("best_pair_name"),
+                    "reason": single.get("reason", ""),
+                    "confidence": single.get("confidence", 0.5)
+                })
+
+        # Filter + pick
+        for c in candidates:
+            pair = c.get("pair", "")
+            if not pair:
+                continue
+            if pair == exclude_pair_label:
+                continue
+            if violates_currency_concentration(pair, active_positions, max_positions_per_currency=max_positions_per_currency):
+                continue
+            return {
+                "best_pair_name": pair,
+                "reason": c.get("reason", ""),
+                "confidence": c.get("confidence", 0.5),
+                "blocked": False
+            }
+
+        return {
+            "best_pair_name": "",
+            "reason": "条件（DDキャップ/通貨分散）を満たす代替ペアが見つかりませんでした",
+            "confidence": 0.0,
+            "blocked": True,
+            "blocked_by": "filters"
+        }
+
+# =============================
+# 100% TOOL ADDITIONS
+# - explicit weekly structure_ok rules
+# - numeric HOLD_MONTH enforcement (AI HOLD_MONTH is downgraded if numeric conditions not met)
+# - fix function signatures used by main_auto (pair_name/portfolio args)
+# NOTE: Existing algorithms/prompts are NOT deleted or modified above.
+# =============================
+
+# --- Ensure PAIR_MAP exists at module scope (some upstream edits may have nested it accidentally) ---
+if "PAIR_MAP" not in globals():
+    PAIR_MAP = {
+        "USD/JPY (ドル円)": "JPY=X",
+        "EUR/USD (ユーロドル)": "EURUSD=X",
+        "GBP/USD (ポンドドル)": "GBPUSD=X",
+        "AUD/USD (豪ドル米ドル)": "AUDUSD=X",
+        "EUR/JPY (ユーロ円)": "EURJPY=X",
+        "GBP/JPY (ポンド円)": "GBPJPY=X",
+        "AUD/JPY (豪ドル円)": "AUDJPY=X",
+    }
+
+# --- Lightweight helpers (safe float / json extract might already exist) ---
+def _fx_safe_float(x, default=None):
+    try:
+        v = float(x)
+        if v != v:  # NaN
+            return default
+        return v
+    except Exception:
+        return default
+
+def _pair_label_to_symbol(pair_label: str) -> str:
+    # Prefer explicit ticker in PAIR_MAP
+    if pair_label in PAIR_MAP:
+        return PAIR_MAP[pair_label]
+    # If label already looks like a ticker, return as-is
+    if isinstance(pair_label, str) and pair_label.endswith("=X"):
+        return pair_label
+    # Fallback: try to build e.g. "EURJPY=X" from "EUR/JPY ..."
+    try:
+        head = pair_label.split()[0]  # "EUR/JPY"
+        base, quote = head.split("/")
+        return f"{base}{quote}=X"
+    except Exception:
+        return ""
+
+def _fetch_ohlc(symbol: str, period: str, interval: str):
     """
-    1か月保有ライン（数値）を算出。
-    方式: 前月高値/安値 ± バッファ(ATR*buffer_atr)
-      - LONG: 前月高値 + buf
-      - SHORT: 前月安値 - buf
+    Robust OHLC fetch. Uses existing _yahoo_chart if present; else falls back to yfinance.
     """
     try:
-        df = yf.Ticker(ticker).history(period="8mo", interval="1d")
+        if "_yahoo_chart" in globals():
+            df = _yahoo_chart(symbol, rng=period, interval=interval)
+            if df is not None and not df.empty:
+                return df
+    except Exception:
+        pass
+    try:
+        df = yf.download(symbol, period=period, interval=interval, auto_adjust=False, progress=False)
         if df is None or df.empty:
             return None
-        # timezone除去
-        if getattr(df.index, "tz", None) is not None:
-            df.index = df.index.tz_localize(None)
-        # 月次に集約
-        m = df.resample("M").agg({"High":"max", "Low":"min"})
-        if m is None or m.empty or len(m) < 2:
-            return None
-        prev = m.iloc[-2]
-        prev_high = float(prev["High"])
-        prev_low = float(prev["Low"])
-        buf = float(atr_daily or 0.0) * float(buffer_atr or 0.0)
-        if str(trade_side).upper() in ("BUY", "LONG"):
-            return prev_high + buf
-        if str(trade_side).upper() in ("SELL", "SHORT"):
-            return prev_low - buf
-        return None
+        # Normalize columns
+        for c in ["Open","High","Low","Close","Adj Close","Volume"]:
+            if c in df.columns and hasattr(df[c], "iloc"):
+                # yfinance sometimes returns multi-index columns
+                if isinstance(df[c].iloc[0], (pd.Series, pd.DataFrame)):
+                    df[c] = df[c].iloc[:,0]
+        return df
     except Exception:
         return None
 
+def compute_month_hold_line(pair_label: str, direction: str, buffer_atr_mult: float = 0.2):
+    """
+    Numeric 1-month hold line based on previous month's high/low (+ optional buffer).
+    - LONG: prev_month_high + buffer
+    - SHORT: prev_month_low  - buffer
+    Buffer is derived from weekly average range as a lightweight ATR proxy.
+    """
+    sym = _pair_label_to_symbol(pair_label)
+    if not sym:
+        return None
 
+    mdf = _fetch_ohlc(sym, period="1y", interval="1mo")
+    if mdf is None or mdf.empty or len(mdf) < 2:
+        return None
 
+    # previous completed month is -2 (last row may be current month in progress)
+    prev = mdf.iloc[-2]
+    prev_high = _fx_safe_float(prev.get("High"))
+    prev_low  = _fx_safe_float(prev.get("Low"))
+    if prev_high is None or prev_low is None:
+        return None
 
-def weekend_hold_month_numeric_only(context_data: dict):
-    """HOLD_MONTH を数値のみで判定する（AI文章・panelは参照しない）。"""
-    side = str(context_data.get("side") or context_data.get("trade_type") or "").upper()
-    price = _safe_float(context_data.get("price"))
-    line = context_data.get("month_hold_line")
-    try:
-        line = float(line) if line is not None else None
-    except Exception:
-        line = None
+    # weekly ATR proxy
+    wdf = _fetch_ohlc(sym, period="6mo", interval="1wk")
+    buf = 0.0
+    if wdf is not None and not wdf.empty and len(wdf) >= 8:
+        rng = (wdf["High"] - wdf["Low"]).dropna()
+        if not rng.empty:
+            atr_proxy = float(rng.tail(14).mean())
+            buf = atr_proxy * float(buffer_atr_mult)
 
-    # 最低限の安全条件（存在すれば使う）
-    structure_ok = context_data.get("structure_ok")
-    if structure_ok is False:
-        return False
+    d = str(direction).upper()
+    if d in ("BUY","LONG"):
+        return float(prev_high + buf)
+    if d in ("SELL","SHORT"):
+        return float(prev_low - buf)
+    return None
 
-    if line is None or price is None:
-        return False
+def compute_weekly_structure_ok(pair_label: str, direction: str, lookback_weeks: int = 4, close_rule: str = "CLOSE_BREAK"):
+    """
+    Explicit numeric structure_ok rules (weekly timeframe):
+    - '週足高値安値更新' : LONG -> higher high, SHORT -> lower low vs lookback window
+    - '週足終値が○○以上' : default CLOSE_BREAK:
+        LONG -> weekly close >= prior window max high (breakout close)
+        SHORT-> weekly close <= prior window min low  (breakdown close)
+    Returns (ok: bool, details: dict)
+    """
+    sym = _pair_label_to_symbol(pair_label)
+    if not sym:
+        return False, {"reason": "no_symbol"}
 
-    if side in ("BUY", "LONG"):
-        return price >= line
-    if side in ("SELL", "SHORT"):
-        return price <= line
-    return False
+    wdf = _fetch_ohlc(sym, period="1y", interval="1wk")
+    if wdf is None or wdf.empty or len(wdf) < (lookback_weeks + 2):
+        return False, {"reason": "weekly_data_insufficient"}
 
+    # last completed week: use -2 to avoid partial current week
+    cur = wdf.iloc[-2]
+    hist = wdf.iloc[-(lookback_weeks+2):-2]  # prior lookback_weeks
+    cur_high = _fx_safe_float(cur.get("High"))
+    cur_low  = _fx_safe_float(cur.get("Low"))
+    cur_close= _fx_safe_float(cur.get("Close"))
 
-def _validate_weekend_json(obj: dict):
-    """週末判断JSONの最小バリデーション（既存コードを壊さないため軽量）。"""
-    if not isinstance(obj, dict):
-        return False, ["not_a_dict"]
-    action = obj.get("action")
-    if action not in ("TAKE_PROFIT", "CUT_LOSS", "HOLD_WEEK", "HOLD_MONTH", "NO_POSITION"):
-        return False, ["invalid_action"]
-    lv = obj.get("levels")
-    if lv is not None and not isinstance(lv, dict):
-        return False, ["levels_not_dict"]
-    return True, []
+    if cur_high is None or cur_low is None or cur_close is None:
+        return False, {"reason": "weekly_nan"}
 
+    prior_high_max = float(hist["High"].max())
+    prior_low_min  = float(hist["Low"].min())
+    prior_close_max= float(hist["Close"].max())
+    prior_close_min= float(hist["Close"].min())
 
-# --- ✅ get_ai_weekend_decision: 既存AI判断は残しつつ、HOLD_MONTHだけ数値で確定 ---
-_old_get_ai_weekend_decision = get_ai_weekend_decision
+    d = str(direction).upper()
+    if d in ("BUY","LONG"):
+        hh = cur_high > prior_high_max
+        if close_rule == "CLOSE_BREAK":
+            cc = cur_close >= prior_high_max
+        else:
+            cc = cur_close >= prior_close_max
+        ok = bool(hh and cc)
+        return ok, {
+            "direction": "LONG",
+            "higher_high": hh,
+            "close_confirm": cc,
+            "cur_high": cur_high,
+            "cur_close": cur_close,
+            "prior_high_max": prior_high_max,
+            "prior_close_max": prior_close_max,
+        }
 
-def get_ai_weekend_decision(api_key, context_data, override_mode="AUTO", override_reason=""):
-    """既存関数をラップし、HOLD_MONTH を数値条件に固定する。"""
-    obj = _old_get_ai_weekend_decision(api_key, context_data, override_mode=override_mode, override_reason=override_reason)
+    if d in ("SELL","SHORT"):
+        ll = cur_low < prior_low_min
+        if close_rule == "CLOSE_BREAK":
+            cc = cur_close <= prior_low_min
+        else:
+            cc = cur_close <= prior_close_min
+        ok = bool(ll and cc)
+        return ok, {
+            "direction": "SHORT",
+            "lower_low": ll,
+            "close_confirm": cc,
+            "cur_low": cur_low,
+            "cur_close": cur_close,
+            "prior_low_min": prior_low_min,
+            "prior_close_min": prior_close_min,
+        }
 
-    # 既存実装の異常系ガード（市場レジーム形式など）
-    if not isinstance(obj, dict) or "action" not in obj:
-        return obj
+    return False, {"reason": "direction_unknown"}
 
-    ok, reasons = _validate_weekend_json(obj)
-    if not ok:
-        # 既存の戻りを壊さない
-        obj.setdefault("notes", [])
-        obj["notes"] = list(obj["notes"]) + ["weekend_json_validation_failed", *reasons]
-        return obj
+def numeric_hold_month_ok(context_data: dict, buffer_atr_mult: float = 0.2):
+    """
+    Numeric-only HOLD_MONTH condition:
+    - month_hold_line reached (prev month high/low +/- buffer)
+    - weekly structure_ok is True (explicit weekly rules)
+    Direction is derived from trade_type (BUY/SELL) or decision.
+    """
+    pair_label = context_data.get("pair_label") or context_data.get("pair") or "USD/JPY (ドル円)"
+    price = _fx_safe_float(context_data.get("price"))
+    direction = context_data.get("trade_type") or context_data.get("decision") or context_data.get("trend") or ""
+    direction = str(direction).upper()
 
-    ctx = dict(context_data or {})
+    if price is None:
+        return False, {"reason": "no_price"}
 
-    # month_hold_line を数値で用意
-    if ctx.get("month_hold_line") is None:
-        ticker = ctx.get("ticker")
-        if not ticker:
-            # pair_label から推定（無ければUSD/JPY）
-            pair_label = str(ctx.get("pair_label") or "USD/JPY (ドル円)")
-            ticker = PAIR_MAP.get(pair_label) or "JPY=X"
-        atr = _safe_float(ctx.get("atr"))
-        side = obj.get("side") or ctx.get("trade_type") or ""
-        mline = calc_month_hold_line(ticker, side, atr_daily=atr)
-        if mline is not None:
-            ctx["month_hold_line"] = mline
+    # Normalize direction tokens
+    if direction == "BUY":
+        d = "LONG"
+    elif direction == "SELL":
+        d = "SHORT"
+    elif direction in ("LONG","SHORT"):
+        d = direction
+    else:
+        return False, {"reason": "no_direction"}
 
-    # ✅ 数値判定のみで HOLD_MONTH を許可/禁止
-    numeric_hold = weekend_hold_month_numeric_only({**ctx, "side": ctx.get("trade_type") or obj.get("side")})
+    month_line = compute_month_hold_line(pair_label, d, buffer_atr_mult=buffer_atr_mult)
+    if month_line is None:
+        return False, {"reason": "no_month_hold_line"}
 
-    if numeric_hold:
-        if obj.get("action") != "HOLD_MONTH":
-            obj.setdefault("notes", [])
-            obj["notes"] = list(obj["notes"]) + ["numeric_hold_month_override=true"]
-        obj["action"] = "HOLD_MONTH"
-        # 表示用に month_hold_line を levels へ
+    structure_ok, sdetail = compute_weekly_structure_ok(pair_label, d)
+
+    if d == "LONG":
+        reached = price >= month_line
+    else:
+        reached = price <= month_line
+
+    ok = bool(reached and structure_ok)
+    return ok, {
+        "pair": pair_label,
+        "direction": d,
+        "price": price,
+        "month_hold_line": month_line,
+        "reached": reached,
+        "structure_ok": structure_ok,
+        "structure_detail": sdetail,
+    }
+
+# --- Wrapper: enforce numeric-only HOLD_MONTH without deleting existing prompt logic ---
+if "get_ai_weekend_decision" in globals():
+    _old_get_ai_weekend_decision = get_ai_weekend_decision
+
+    def get_ai_weekend_decision(api_key, context_data, override_mode="AUTO", override_reason="", **kwargs):
+        obj = _old_get_ai_weekend_decision(api_key, context_data, override_mode=override_mode, override_reason=override_reason)
+
+        # If no position, keep as-is
         try:
-            lv = obj.get("levels") if isinstance(obj.get("levels"), dict) else {}
-            if ctx.get("month_hold_line") is not None:
-                lv["month_hold_line"] = float(ctx.get("month_hold_line"))
-            obj["levels"] = lv
+            ep = float(context_data.get("entry_price", 0.0) or 0.0)
+        except Exception:
+            ep = 0.0
+
+        if ep <= 0:
+            return obj
+
+        ok, detail = numeric_hold_month_ok(context_data)
+
+        # Always annotate notes with numeric checks (for audit)
+        try:
+            if isinstance(obj, dict):
+                notes = obj.get("notes")
+                if not isinstance(notes, list):
+                    notes = []
+                notes.append(f"numeric_hold_month_ok={ok}")
+                notes.append(f"month_hold_line={detail.get('month_hold_line','')}")
+                notes.append(f"weekly_structure_ok={detail.get('structure_ok','')}")
+                obj["notes"] = notes
+                # expose computed levels for UI/log (non-breaking)
+                obj.setdefault("levels", {})
+                obj["levels"].setdefault("month_hold_line", detail.get("month_hold_line", 0))
         except Exception:
             pass
-    else:
-        if obj.get("action") == "HOLD_MONTH":
+
+        # Enforce: HOLD_MONTH only when numeric rules pass
+        if isinstance(obj, dict) and obj.get("action") == "HOLD_MONTH" and not ok:
             obj["action"] = "HOLD_WEEK"
-            obj.setdefault("notes", [])
-            obj["notes"] = list(obj["notes"]) + ["numeric_hold_month_required=true", "downgraded_to=HOLD_WEEK"]
+            why = (obj.get("why") or "").strip()
+            addon = "（数値ルール: month_hold_line未達 or 週足構造未確認のためHOLD_MONTHをHOLD_WEEKに降格）"
+            obj["why"] = (why + " " + addon).strip() if why else addon
 
-    return obj
+        # If numeric rules pass, promote to HOLD_MONTH (even if AI didn't)
+        if isinstance(obj, dict) and ok:
+            obj["action"] = "HOLD_MONTH"
+            why = (obj.get("why") or "").strip()
+            addon = "（数値ルールで1か月継続条件を満たしたためHOLD_MONTH）"
+            obj["why"] = (why + " " + addon).strip() if why else addon
 
-
-_old_get_ai_portfolio = get_ai_portfolio
-
-def get_ai_portfolio(api_key, context_data, portfolio_positions=None, weekly_dd_cap_percent: float = 2.0):
-    # 既存テキストを残しつつ、運用に必要な数値情報も追記してAIに渡す
-    ctx = dict(context_data or {})
-    ctx["weekly_dd_cap_percent"] = weekly_dd_cap_percent
-    ctx["portfolio_positions"] = portfolio_positions or []
-    return _old_get_ai_portfolio(api_key, ctx)
-
-
-# --- ✅ 注文戦略: 週DDキャップ + 相関フィルタを notes に反映（既存ロジックを削除しない） ---
-_old_get_ai_order_strategy = get_ai_order_strategy
-
-def get_ai_order_strategy(api_key, context_data, override_mode="AUTO", override_reason="", portfolio_positions=None, weekly_dd_cap_percent: float = 2.0, risk_percent_per_trade: float = 2.0):
-    obj = _old_get_ai_order_strategy(api_key, context_data, override_mode=override_mode, override_reason=override_reason)
-    # 既存が辞書でなければそのまま
-    if not isinstance(obj, dict):
         return obj
 
-    # 週DDキャップ（この週、これ以上の新規を許可しない）
-    try:
-        if obj.get("decision") in ("BUY", "SELL"):
-            if not weekly_dd_cap_ok(portfolio_positions, add_risk_percent=risk_percent_per_trade, weekly_dd_cap_percent=weekly_dd_cap_percent):
-                obj["decision"] = "NO_TRADE"
-                obj["side"] = "NONE"
-                obj["confidence"] = 0.0
-                obj["notes"] = list(obj.get("notes") or []) + ["blocked_by_weekly_dd_cap=true"]
-                obj["why"] = (obj.get("why") or "") + f"\n\n週単位DDキャップ({weekly_dd_cap_percent}%)により新規エントリーを停止。"
-    except Exception:
-        pass
+# --- Wrapper: make get_ai_order_strategy accept pair_name/portfolio args used by main_auto (no deletions) ---
+if "get_ai_order_strategy" in globals():
+    _old_get_ai_order_strategy = get_ai_order_strategy
 
-    # 相関フィルタ（通貨被り過多なら見送り）
-    try:
-        pair_label = context_data.get("pair_label") or "USD/JPY (ドル円)"
-        if obj.get("decision") in ("BUY", "SELL"):
-            if not portfolio_correlation_filter_ok(pair_label, portfolio_positions, max_shared_currency=1):
-                obj["decision"] = "NO_TRADE"
-                obj["side"] = "NONE"
-                obj["confidence"] = 0.0
-                obj["notes"] = list(obj.get("notes") or []) + ["blocked_by_correlation_filter=true"]
-                obj["why"] = (obj.get("why") or "") + "\n\n通貨エクスポージャの偏り（相関）を避けるため新規は見送り。"
-    except Exception:
-        pass
+    def get_ai_order_strategy(api_key, context_data, override_mode="AUTO", override_reason="", pair_name=None,
+                              portfolio_positions=None, weekly_dd_cap_percent=2.0, risk_percent_per_trade=2.0,
+                              max_positions_per_currency=1, **kwargs):
+        """
+        Backward/forward compatible wrapper:
+        - Keeps original prompt/logic (calls old function)
+        - Adds weekly DD cap + currency concentration gates if portfolio_positions is provided
+        """
+        # If portfolio provided, gate before calling AI (fast fail)
+        if portfolio_positions is not None:
+            if not can_open_under_weekly_cap(portfolio_positions, risk_percent_per_trade, weekly_dd_cap_percent):
+                return {
+                    "decision": "NO_TRADE",
+                    "confidence": 1.0,
+                    "why": "週単位DDキャップ超過のため新規不可",
+                    "notes": ["blocked_by_weekly_dd_cap"]
+                }
+            if pair_name:
+                if violates_currency_concentration(pair_name, portfolio_positions, max_positions_per_currency=max_positions_per_currency):
+                    return {
+                        "decision": "NO_TRADE",
+                        "confidence": 1.0,
+                        "why": "通貨集中（簡易相関）フィルタにより新規不可",
+                        "notes": ["blocked_by_currency_concentration"]
+                    }
 
-    return obj
+        # call original function unmodified
+        return _old_get_ai_order_strategy(api_key, context_data, override_mode=override_mode, override_reason=override_reason)
 
+# --- Promote nested helper defs to module scope if missing (fix for earlier indentation issues) ---
+if "portfolio_weekly_risk_percent" not in globals():
+    def portfolio_weekly_risk_percent(active_positions: list) -> float:
+        total = 0.0
+        for p in active_positions or []:
+            try:
+                total += float(p.get("risk_percent", p.get("risk", 0.0)))
+            except Exception:
+                continue
+        return float(total)
+
+if "portfolio_currency_counts" not in globals():
+    def portfolio_currency_counts(active_positions: list) -> dict:
+        counts = {}
+        for p in active_positions or []:
+            pair = p.get("pair") or p.get("pair_label") or p.get("pair_name") or ""
+            if not pair:
+                continue
+            b, q = _pair_label_to_currencies(pair) if "_pair_label_to_currencies" in globals() else (pair[:3], pair[4:7])
+            counts[b] = counts.get(b, 0) + 1
+            counts[q] = counts.get(q, 0) + 1
+        return counts
+
+if "violates_currency_concentration" not in globals():
+    def violates_currency_concentration(candidate_pair_label: str, active_positions: list, max_positions_per_currency: int = 1) -> bool:
+        counts = portfolio_currency_counts(active_positions)
+        b, q = _pair_label_to_currencies(candidate_pair_label) if "_pair_label_to_currencies" in globals() else (candidate_pair_label[:3], candidate_pair_label[4:7])
+        return (counts.get(b, 0) + 1 > max_positions_per_currency) or (counts.get(q, 0) + 1 > max_positions_per_currency)
+
+if "can_open_under_weekly_cap" not in globals():
+    def can_open_under_weekly_cap(active_positions: list, new_risk_percent: float, weekly_dd_cap_percent: float) -> bool:
+        try:
+            new_risk = float(new_risk_percent)
+            cap = float(weekly_dd_cap_percent)
+        except Exception:
+            return True
+        return (portfolio_weekly_risk_percent(active_positions) + new_risk) <= cap
+
+if "suggest_alternative_pair_if_usdjpy_stay" not in globals():
+    def _build_market_summary_for_pairs() -> str:
+        market_summary = ""
+        for name, sym in PAIR_MAP.items():
+            try:
+                df = _fetch_ohlc(sym, period="5d", interval="1d")
+                if df is None or df.empty:
+                    continue
+                close = float(df["Close"].iloc[-1])
+                prev = float(df["Close"].iloc[-2]) if len(df) >= 2 else close
+                chg = (close - prev) / prev * 100 if prev else 0.0
+                trend = "上昇" if close > float(df["Close"].mean()) else "下降"
+                market_summary += f"- {name}: Price={close:.3f} / Chg={chg:+.2f}% / Trend={trend}\n"
+            except Exception:
+                continue
+        return market_summary
+
+    def suggest_alternative_pair_if_usdjpy_stay(
+        api_key: str,
+        active_positions: list,
+        risk_percent_per_trade: float,
+        weekly_dd_cap_percent: float = 2.0,
+        max_positions_per_currency: int = 1,
+        exclude_pair_label: str = "USD/JPY (ドル円)"
+    ) -> dict:
+        model_name = get_active_model(api_key)
+        if not model_name:
+            return {}
+
+        if not can_open_under_weekly_cap(active_positions, risk_percent_per_trade, weekly_dd_cap_percent):
+            return {"best_pair_name": "", "reason": "週単位DDキャップ超過", "confidence": 1.0, "blocked": True, "blocked_by": "weekly_dd_cap"}
+
+        market_summary = _build_market_summary_for_pairs()
+
+        prompt = f"""
+あなたはプロのFXファンドマネージャーです。
+以下の市場データから「今週、USD/JPYが見送りのときに代替として最も利益チャンスがありそうなペア」を最大5つ、優先順で提案してください。
+ただし同じ通貨への偏り（例: JPY絡みを複数）を避ける観点も考慮してください。
+
+【市場概況】
+{market_summary}
+
+【必須制約】
+- 可能なら {exclude_pair_label} 以外から選ぶ
+- 出力はJSONのみ
+
+【出力JSON】
+{{
+  "candidates": [
+    {{"pair": "EUR/USD (ユーロドル)", "reason": "...", "confidence": 0.0}},
+    {{"pair": "AUD/JPY (豪ドル円)", "reason": "...", "confidence": 0.0}}
+  ]
+}}
+"""
+        candidates = []
+        try:
+            model = genai.GenerativeModel(model_name)
+            resp = model.generate_content(prompt)
+            txt = (getattr(resp, "text", "") or "").strip()
+            # try to parse using existing helpers
+            if "safe_json_loads" in globals():
+                data = safe_json_loads(txt)
+            else:
+                data = json.loads(_extract_json(txt)) if "_extract_json" in globals() else json.loads(txt)
+            candidates = data.get("candidates", []) or []
+        except Exception:
+            pass
+
+        for c in candidates:
+            pair = c.get("pair", "")
+            if not pair or pair == exclude_pair_label:
+                continue
+            if violates_currency_concentration(pair, active_positions, max_positions_per_currency=max_positions_per_currency):
+                continue
+            return {"best_pair_name": pair, "reason": c.get("reason", ""), "confidence": c.get("confidence", 0.5), "blocked": False}
+
+        return {"best_pair_name": "", "reason": "条件を満たす代替ペアなし", "confidence": 0.0, "blocked": True, "blocked_by": "filters"}
