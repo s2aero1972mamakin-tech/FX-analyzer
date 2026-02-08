@@ -571,7 +571,11 @@ with tab2:
 
             if isinstance(alt, dict) and alt.get("best_pair_name"):
                 best_pair = alt["best_pair_name"]
-
+                if hasattr(logic, "canonical_pair_label"):
+                    try:
+                        best_pair = logic.canonical_pair_label(best_pair)
+                    except Exception:
+                        pass
                 # 代替ペアの注文戦略を生成（別ボタンでも動くように、状態を保持）
                 if st.button(f"🧠 代替ペアで注文戦略を生成: {best_pair}", key="btn_make_alt_order"):
                     alt_ctx = _build_ctx_for_pair(best_pair, ctx, us10y_raw)
