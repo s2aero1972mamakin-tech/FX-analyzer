@@ -6,11 +6,96 @@ from datetime import datetime, timedelta
 import pytz
 import logic  # ← logic.pyが必要
 
+# --- 起動時セルフチェック（logic.pyの差し替えミスを即検知） ---
+_REQUIRED_LOGIC = [
+    "get_market_data", "calculate_indicators", "judge_condition",
+    "get_latest_quote", "get_ai_range", "get_ai_analysis", "get_ai_order_strategy",
+    "get_ai_portfolio", "get_currency_strength",
+    "suggest_alternative_pair_if_usdjpy_stay", "violates_currency_concentration", "can_open_under_weekly_cap",
+]
+_missing = [name for name in _REQUIRED_LOGIC if not hasattr(logic, name)]
+if _missing:
+    st.error("❌ logic.py に必要な関数が見つかりません（差し替えミスの可能性大）。不足: " + ", ".join(_missing))
+    st.error("👉 対処: 私が渡した修正版 logic_fixed_final.py を logic.py にリネームして差し替えてください。")
+    st.stop()
+
+
 # --- ページ設定 ---
 st.set_page_config(layout="wide", page_title="AI-FX Analyzer 2026")
 st.title("🤖 AI連携型 USD/JPY 戦略分析ツール (SBI仕様)")
 
 TOKYO = pytz.timezone("Asia/Tokyo")
+
+# --- Pair-context builder for alternative pairs (prevents hallucination / wrong indicators) ---
+def _normalize_pair_label(label: str) -> str:
+    """Try to map AI-returned label to an existing PAIR_MAP key."""
+    try:
+        if hasattr(logic, "PAIR_MAP") and label in logic.PAIR_MAP:
+            return label
+    except Exception:
+        pass
+    head = (label or "").split()[0]
+    try:
+        if hasattr(logic, "PAIR_MAP"):
+            for k in logic.PAIR_MAP.keys():
+                if (k or "").split()[0] == head:
+                    return k
+    except Exception:
+        pass
+    return label
+
+def _build_ctx_for_pair(pair_label: str, base_ctx: dict, us10y_raw):
+    """Build context_data (price/ATR/RSI/SMA_DIFF) for a specific FX pair label."""
+    pair_label = _normalize_pair_label(pair_label)
+    ctx2 = dict(base_ctx or {})
+    ctx2["pair_label"] = pair_label
+
+    sym = None
+    try:
+        if hasattr(logic, "PAIR_MAP"):
+            sym = logic.PAIR_MAP.get(pair_label)
+    except Exception:
+        sym = None
+
+    if not sym:
+        try:
+            if hasattr(logic, "_pair_label_to_symbol"):
+                sym = logic._pair_label_to_symbol(pair_label)
+        except Exception:
+            sym = None
+
+    if sym:
+        ctx2["ticker"] = sym
+        try:
+            raw = None
+            if hasattr(logic, "_fetch_ohlc"):
+                raw = logic._fetch_ohlc(sym, period="1y", interval="1d")
+            elif hasattr(logic, "_yahoo_chart"):
+                raw = logic._yahoo_chart(sym, rng="1y", interval="1d")
+
+            df2 = logic.calculate_indicators(raw, us10y_raw) if raw is not None else None
+            if df2 is not None and not df2.empty:
+                lr = df2.iloc[-1]
+                def _get(col, default):
+                    try:
+                        v = lr[col]
+                        return float(v) if pd.notna(v) else float(default)
+                    except Exception:
+                        return float(default)
+
+                ctx2["price"] = _get("Close", ctx2.get("price", 0.0))
+                ctx2["atr"] = _get("ATR", ctx2.get("atr", 0.0))
+                ctx2["rsi"] = _get("RSI", ctx2.get("rsi", 50.0))
+                ctx2["sma_diff"] = _get("SMA_DIFF", ctx2.get("sma_diff", 0.0))
+                ctx2["us10y"] = _get("US10Y", ctx2.get("us10y", 0.0))
+                ctx2["_pair_ctx_ok"] = True
+                return ctx2
+        except Exception:
+            pass
+
+    ctx2["_pair_ctx_ok"] = False
+    return ctx2
+
 
 # --- 状態保持の初期化 ---
 if "ai_range" not in st.session_state:
@@ -58,6 +143,11 @@ weekly_dd_cap_percent = st.sidebar.slider(
 max_positions_per_currency = st.sidebar.number_input(
     "同一通貨の最大保有数（通貨集中フィルタ）", min_value=1, max_value=5, value=1, step=1
 )
+
+# ✅【追加】デバッグ（テスト用）
+st.sidebar.subheader("🧪 デバッグ")
+force_no_trade_debug = st.sidebar.checkbox("NO_TRADE分岐を強制表示（テスト用）", value=False, help="代替ペアの動線テスト用。実運用ではOFF。")
+
 
 leverage = 25  # 固定
 
@@ -130,6 +220,15 @@ start_view = last_date - timedelta(days=45)
 df_view = df.loc[df.index >= start_view]
 y_min_view = float(df_view["Low"].min())
 y_max_view = float(df_view["High"].max())
+
+# ✅ AI予想ラインがチャート範囲外に出ても表示されるよう、Y軸レンジに予想高安を含める
+if st.session_state.ai_range:
+    try:
+        _hi, _lo = st.session_state.ai_range
+        y_min_view = min(y_min_view, float(_lo))
+        y_max_view = max(y_max_view, float(_hi))
+    except Exception:
+        pass
 
 # 最新レート表示 (スマホ対応・時刻フォーマット)
 if q_price is not None:
@@ -325,7 +424,12 @@ with tab2:
             decision = ""
 
         # ✅ ドル円が見送りなら、代替ペア提案（週DDキャップ＆通貨集中フィルタ適用）
-        if decision == "NO_TRADE":
+        effective_no_trade = (decision == "NO_TRADE") or bool(force_no_trade_debug)
+
+        if force_no_trade_debug:
+            st.error("⚠️ テストモード: decisionに関係なくNO_TRADE分岐（代替ペア提案）を表示しています。実運用の注文は押さないでください。")
+
+        if effective_no_trade:
             st.warning("USD/JPY が見送り判定のため、代替ペア候補を自動提案します（通貨集中フィルタ＆週DDキャップ適用）。")
 
             # 代替提案は重いので、初回だけ生成して保持（ボタンの二段押しがStreamlitで失敗しないように）
@@ -347,12 +451,10 @@ with tab2:
 
                 # 代替ペアの注文戦略を生成（別ボタンでも動くように、状態を保持）
                 if st.button(f"🧠 代替ペアで注文戦略を生成: {best_pair}", key="btn_make_alt_order"):
-                    alt_ctx = dict(ctx)
-                    alt_ctx["pair_label"] = best_pair
-                    # ticker が見つからない場合は、そのまま（logic側のデフォルトに任せる）
-                    if hasattr(logic, "PAIR_MAP"):
-                        alt_ctx["ticker"] = logic.PAIR_MAP.get(best_pair, alt_ctx.get("ticker"))
-                    st.session_state.last_alt_strategy = logic.get_ai_order_strategy(api_key, alt_ctx, pair_name=best_pair)
+                    alt_ctx = _build_ctx_for_pair(best_pair, ctx, us10y_raw)
+                    if not alt_ctx.get("_pair_ctx_ok"):
+                        st.warning("⚠️ 代替ペアの最新テクニカル（RSI/ATR等）が取得できませんでした。精度が落ちるため、原則ノートレ推奨です。")
+                    st.session_state.last_alt_strategy = logic.get_ai_order_strategy(api_key, alt_ctx)
 
                 alt_strategy = st.session_state.get("last_alt_strategy")
                 if alt_strategy:
