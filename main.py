@@ -87,6 +87,12 @@ def _build_ctx_for_pair(pair_label: str, base_ctx: dict, us10y_raw):
                 ctx2["atr"] = _get("ATR", ctx2.get("atr", 0.0))
                 ctx2["rsi"] = _get("RSI", ctx2.get("rsi", 50.0))
                 ctx2["sma_diff"] = _get("SMA_DIFF", ctx2.get("sma_diff", 0.0))
+                ctx2["sma25"] = _get("SMA_25", ctx2.get("sma25", ctx2.get("price", 0.0)))
+                ctx2["sma75"] = _get("SMA_75", ctx2.get("sma75", ctx2.get("price", 0.0)))
+                try:
+                    ctx2["atr_avg60"] = float(df2["ATR"].tail(60).mean()) if ("ATR" in df2.columns and df2["ATR"].tail(60).notna().any()) else ctx2.get("atr", 0.0)
+                except Exception:
+                    ctx2["atr_avg60"] = ctx2.get("atr", 0.0)
                 ctx2["us10y"] = _get("US10Y", ctx2.get("us10y", 0.0))
                 ctx2["_pair_ctx_ok"] = True
                 return ctx2
@@ -96,6 +102,94 @@ def _build_ctx_for_pair(pair_label: str, base_ctx: dict, us10y_raw):
     ctx2["_pair_ctx_ok"] = False
     return ctx2
 
+
+
+
+# --- 表示用: JSONキーを日本語化（注文命令書・代替提案の表示専用）---
+_KEY_JP = {
+    # 注文命令書
+    "decision": "判定",
+    "side": "売買方向",
+    "entry": "エントリー価格",
+    "take_profit": "利確（TP）",
+    "stop_loss": "損切（SL）",
+    "horizon": "想定期間",
+    "confidence": "確信度",
+    "why": "理由",
+    "notes": "注記",
+    "market_regime": "相場モード",
+    "regime_why": "モード理由",
+
+    # 代替ペア提案
+    "best_pair_name": "推奨ペア",
+    "reason": "理由",
+    "blocked": "ブロック",
+    "blocked_by": "ブロック理由",
+    "candidates": "候補",
+    "pair": "ペア",
+
+    # 参考（ctx / ポートフォリオ表示などで使う可能性）
+    "pair_label": "ペア",
+    "ticker": "ティッカー",
+    "direction": "方向",
+    "risk_percent": "リスク（%）",
+    "entry_price": "建値",
+    "entry_time": "建玉時刻",
+    "current_time": "現在時刻",
+    "is_gotobi": "五十日",
+    "capital": "資金（JPY）",
+    "us10y": "米10年債利回り",
+    "atr": "ATR",
+    "atr_avg60": "ATR平均（60日）",
+    "rsi": "RSI",
+    "sma_diff": "MA乖離",
+    "sma25": "SMA25",
+    "sma75": "SMA75",
+    "panel_short": "短期パネル",
+    "panel_mid": "中期パネル",
+    "last_report": "前回レポート",
+}
+
+_DECISION_JP = {
+    "TRADE": "取引",
+    "NO_TRADE": "見送り",
+    "BUY": "買い",
+    "SELL": "売り",
+    "HOLD_WEEK": "週で確定",
+    "HOLD_MONTH": "1か月保有",
+    "STAY": "見送り",
+}
+_SIDE_JP = {"LONG": "買い", "SHORT": "売り", "NONE": "なし"}
+_HORIZON_JP = {"DAY": "1日", "WEEK": "1週間", "MONTH": "1か月"}
+_REGIME_JP = {"DEFENSIVE": "守備", "OFFENSIVE": "攻勢", "NEUTRAL": "中立", "RANGE": "レンジ", "TREND": "トレンド"}
+
+def _jpize_value(key: str, val):
+    try:
+        if isinstance(val, bool):
+            return "はい" if val else "いいえ"
+        if key == "decision" and isinstance(val, str):
+            return _DECISION_JP.get(val, val)
+        if key == "side" and isinstance(val, str):
+            return _SIDE_JP.get(val, val)
+        if key == "horizon" and isinstance(val, str):
+            return _HORIZON_JP.get(val, val)
+        if key == "market_regime" and isinstance(val, str):
+            return _REGIME_JP.get(val, val)
+    except Exception:
+        pass
+    return val
+
+def jpize_json(obj):
+    """辞書キーを日本語化したコピーを返す（表示専用）。"""
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            jk = _KEY_JP.get(k, k)
+            out[jk] = jpize_json(_jpize_value(k, v))
+        return out
+    if isinstance(obj, list):
+        return [jpize_json(x) for x in obj]
+    return obj
 
 # --- 状態保持の初期化 ---
 if "ai_range" not in st.session_state:
@@ -370,6 +464,9 @@ ctx = {
     "atr": float(df["ATR"].iloc[-1]) if pd.notna(df["ATR"].iloc[-1]) else 0.0,
     "sma_diff": float(df["SMA_DIFF"].iloc[-1]) if pd.notna(df["SMA_DIFF"].iloc[-1]) else 0.0,
     "rsi": float(df["RSI"].iloc[-1]) if pd.notna(df["RSI"].iloc[-1]) else 50.0,
+    "sma25": float(df["SMA_25"].iloc[-1]) if ("SMA_25" in df.columns and pd.notna(df["SMA_25"].iloc[-1])) else float(df["Close"].iloc[-1]),
+    "sma75": float(df["SMA_75"].iloc[-1]) if ("SMA_75" in df.columns and pd.notna(df["SMA_75"].iloc[-1])) else float(df["Close"].iloc[-1]),
+    "atr_avg60": float(df["ATR"].tail(60).mean()) if ("ATR" in df.columns and df["ATR"].tail(60).notna().any()) else float(df["ATR"].iloc[-1]) if ("ATR" in df.columns and pd.notna(df["ATR"].iloc[-1])) else 0.0,
     "current_time": q_time.strftime("%H:%M") if q_time else "不明",
     "is_gotobi": datetime.now(TOKYO).day in [5, 10, 15, 20, 25, 30],
     "capital": capital,
@@ -413,7 +510,7 @@ with tab2:
     if strategy:
         st.info("AI診断およびパネル診断との整合性を確認しました。")
         if isinstance(strategy, dict):
-            st.json(strategy)
+            st.json(jpize_json(strategy))
         else:
             st.markdown(strategy)
 
@@ -444,7 +541,7 @@ with tab2:
                 )
 
             alt = st.session_state.get("last_alt") or {}
-            st.json(alt)
+            st.json(jpize_json(alt))
 
             if isinstance(alt, dict) and alt.get("best_pair_name"):
                 best_pair = alt["best_pair_name"]
@@ -460,7 +557,7 @@ with tab2:
                 if alt_strategy:
                     st.subheader("代替ペアの注文戦略")
                     if isinstance(alt_strategy, dict):
-                        st.json(alt_strategy)
+                        st.json(jpize_json(alt_strategy))
                     else:
                         st.markdown(alt_strategy)
 
