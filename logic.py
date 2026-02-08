@@ -1409,6 +1409,11 @@ def suggest_alternative_pair_if_usdjpy_stay(
 
     prompt = f"""
 あなたはプロのFXファンドマネージャーです。
+以下の「候補ペア」リストからのみ選んでください。表記は必ず候補リストと完全一致させてください。
+
+【候補ペア】
+{chr(10).join(PAIR_MAP.keys())}
+
 以下の市場データから「今週、USD/JPYが見送りのときに代替として最も利益チャンスがありそうなペア」を最大5つ、優先順で提案してください。
 ただし同じ通貨への偏り（例: JPY絡みを複数）を避ける観点も考慮してください。
 
@@ -1446,12 +1451,15 @@ def suggest_alternative_pair_if_usdjpy_stay(
                 "confidence": single.get("confidence", 0.5)
             })
 
-    # Filter + pick
+    
+# Filter + pick
     for c in candidates:
-        pair = c.get("pair", "")
+        pair_raw = c.get("pair", "")
+        pair = canonical_pair_label(pair_raw)
         if not pair:
             continue
-        if pair == exclude_pair_label:
+        # Exclude USD/JPY regardless of suffix text
+        if _same_pair(pair, exclude_pair_label):
             continue
         if violates_currency_concentration(pair, active_positions, max_positions_per_currency=max_positions_per_currency):
             continue
@@ -1489,6 +1497,54 @@ if "PAIR_MAP" not in globals():
         "GBP/JPY (ポンド円)": "GBPJPY=X",
         "AUD/JPY (豪ドル円)": "AUDJPY=X",
     }
+
+# --- Pair label normalization (to avoid AI output mismatch) ---
+def _pair_head(label: str) -> str:
+    """Return 'AAA/BBB' head in uppercase if possible, else ''."""
+    try:
+        s = str(label).strip()
+        if not s:
+            return ""
+        if s.endswith("=X"):
+            # ticker, cannot always derive head
+            return ""
+        head = s.split()[0]
+        if "/" in head and len(head) >= 7:
+            a, b = head.split("/")[:2]
+            return f"{a.strip().upper()}/{b.strip().upper()}"
+        return ""
+    except Exception:
+        return ""
+
+def canonical_pair_label(pair_label: str) -> str:
+    """Map AI-returned pair string to a canonical PAIR_MAP key when possible."""
+    s = str(pair_label).strip() if pair_label is not None else ""
+    if not s:
+        return ""
+    # Already canonical
+    if s in PAIR_MAP:
+        return s
+    # If label contains head, try to match by head
+    head = _pair_head(s)
+    if head:
+        for k in PAIR_MAP.keys():
+            if _pair_head(k) == head:
+                return k
+        # If not found, keep original (e.g., 'EUR/USD')
+        return head
+    # Ticker pass-through
+    if s.endswith("=X"):
+        return s
+    return s
+
+def _same_pair(a: str, b: str) -> bool:
+    """Compare two pair labels by their head 'AAA/BBB'."""
+    ha = _pair_head(a)
+    hb = _pair_head(b)
+    if ha and hb:
+        return ha == hb
+    # fallback exact
+    return str(a).strip() == str(b).strip()
 
 # --- Lightweight helpers (safe float / json extract might already exist) ---
 def _fx_safe_float(x, default=None):
