@@ -1022,109 +1022,109 @@ def get_ai_range(api_key, context_data):
 
 # === PORTFOLIO_AUTOMATION_EXTENSIONS v1 ===
 
-    from typing import Any, Tuple
+from typing import Any, Tuple
 
-    def _pair_label_to_currencies(pair_label: str) -> Tuple[str, str]:
-        """Extract base/quote currencies from label like 'USD/JPY (ドル円)' or 'EUR/USD (ユーロドル)'."""
-        # label begins with 'AAA/BBB'
-        head = pair_label.split()[0]
-        if "/" in head and len(head) >= 7:
-            base, quote = head.split("/")[:2]
-            return base.strip(), quote.strip()
-        # fallback: attempt from ticker map key format
-        if "/" in pair_label:
-            base, quote = pair_label.split("/")[:2]
-            return base.strip()[:3], quote.strip()[:3]
-        return "UNK", "UNK"
+def _pair_label_to_currencies(pair_label: str) -> Tuple[str, str]:
+    """Extract base/quote currencies from label like 'USD/JPY (ドル円)' or 'EUR/USD (ユーロドル)'."""
+    # label begins with 'AAA/BBB'
+    head = pair_label.split()[0]
+    if "/" in head and len(head) >= 7:
+        base, quote = head.split("/")[:2]
+        return base.strip(), quote.strip()
+    # fallback: attempt from ticker map key format
+    if "/" in pair_label:
+        base, quote = pair_label.split("/")[:2]
+        return base.strip()[:3], quote.strip()[:3]
+    return "UNK", "UNK"
 
-    def portfolio_weekly_risk_percent(active_positions: list) -> float:
-        """Sum of risk_percent across active positions."""
-        total = 0.0
-        for p in active_positions or []:
-            try:
-                total += float(p.get("risk_percent", p.get("risk", 0.0)))
-            except Exception:
-                continue
-        return float(total)
-
-    def portfolio_currency_counts(active_positions: list) -> dict:
-        counts = {}
-        for p in active_positions or []:
-            pair = p.get("pair") or p.get("pair_label") or p.get("pair_name") or ""
-            if not pair:
-                continue
-            b, q = _pair_label_to_currencies(pair)
-            counts[b] = counts.get(b, 0) + 1
-            counts[q] = counts.get(q, 0) + 1
-        return counts
-
-    def violates_currency_concentration(candidate_pair_label: str, active_positions: list, max_positions_per_currency: int = 1) -> bool:
-        """
-        Simple correlation proxy:
-        - If any currency (USD/JPY/EUR/AUD/GBP...) would be held in more than max_positions_per_currency positions, block.
-        Default max_positions_per_currency=1 prevents stacking multiple JPY-crosses etc.
-        """
-        counts = portfolio_currency_counts(active_positions)
-        b, q = _pair_label_to_currencies(candidate_pair_label)
-        # +1 exposure if opened
-        return (counts.get(b, 0) + 1 > max_positions_per_currency) or (counts.get(q, 0) + 1 > max_positions_per_currency)
-
-    def can_open_under_weekly_cap(active_positions: list, new_risk_percent: float, weekly_dd_cap_percent: float) -> bool:
+def portfolio_weekly_risk_percent(active_positions: list) -> float:
+    """Sum of risk_percent across active positions."""
+    total = 0.0
+    for p in active_positions or []:
         try:
-            new_risk = float(new_risk_percent)
-            cap = float(weekly_dd_cap_percent)
+            total += float(p.get("risk_percent", p.get("risk", 0.0)))
         except Exception:
-            return True
-        return (portfolio_weekly_risk_percent(active_positions) + new_risk) <= cap
+            continue
+    return float(total)
 
-    def _build_market_summary_for_pairs() -> str:
-        market_summary = ""
-        for name, sym in PAIR_MAP.items():
-            try:
-                df = _yahoo_chart(sym, rng="5d", interval="1d")
-                if df is None or df.empty:
-                    continue
-                close = float(df["Close"].iloc[-1])
-                prev = float(df["Close"].iloc[-2]) if len(df) >= 2 else close
-                chg = (close - prev) / prev * 100 if prev else 0.0
-                trend = "上昇" if close > float(df["Close"].mean()) else "下降"
-                market_summary += f"- {name}: Price={close:.3f} / Chg={chg:+.2f}% / Trend={trend}\n"
-            except Exception:
+def portfolio_currency_counts(active_positions: list) -> dict:
+    counts = {}
+    for p in active_positions or []:
+        pair = p.get("pair") or p.get("pair_label") or p.get("pair_name") or ""
+        if not pair:
+            continue
+        b, q = _pair_label_to_currencies(pair)
+        counts[b] = counts.get(b, 0) + 1
+        counts[q] = counts.get(q, 0) + 1
+    return counts
+
+def violates_currency_concentration(candidate_pair_label: str, active_positions: list, max_positions_per_currency: int = 1) -> bool:
+    """
+    Simple correlation proxy:
+    - If any currency (USD/JPY/EUR/AUD/GBP...) would be held in more than max_positions_per_currency positions, block.
+    Default max_positions_per_currency=1 prevents stacking multiple JPY-crosses etc.
+    """
+    counts = portfolio_currency_counts(active_positions)
+    b, q = _pair_label_to_currencies(candidate_pair_label)
+    # +1 exposure if opened
+    return (counts.get(b, 0) + 1 > max_positions_per_currency) or (counts.get(q, 0) + 1 > max_positions_per_currency)
+
+def can_open_under_weekly_cap(active_positions: list, new_risk_percent: float, weekly_dd_cap_percent: float) -> bool:
+    try:
+        new_risk = float(new_risk_percent)
+        cap = float(weekly_dd_cap_percent)
+    except Exception:
+        return True
+    return (portfolio_weekly_risk_percent(active_positions) + new_risk) <= cap
+
+def _build_market_summary_for_pairs() -> str:
+    market_summary = ""
+    for name, sym in PAIR_MAP.items():
+        try:
+            df = _yahoo_chart(sym, rng="5d", interval="1d")
+            if df is None or df.empty:
                 continue
-        return market_summary
+            close = float(df["Close"].iloc[-1])
+            prev = float(df["Close"].iloc[-2]) if len(df) >= 2 else close
+            chg = (close - prev) / prev * 100 if prev else 0.0
+            trend = "上昇" if close > float(df["Close"].mean()) else "下降"
+            market_summary += f"- {name}: Price={close:.3f} / Chg={chg:+.2f}% / Trend={trend}\n"
+        except Exception:
+            continue
+    return market_summary
 
-    def suggest_alternative_pair_if_usdjpy_stay(
-        api_key: str,
-        active_positions: list,
-        risk_percent_per_trade: float,
-        weekly_dd_cap_percent: float = 2.0,
-        max_positions_per_currency: int = 1,
-        exclude_pair_label: str = "USD/JPY (ドル円)"
-    ) -> dict:
-        """
-        If USD/JPY is NO_TRADE (STAY), suggest an alternative pair.
-        - Uses an AI-ranked list (top N) and then applies:
-          (1) weekly DD cap
-          (2) currency concentration filter
-        Returns dict or {}.
-        """
-        model_name = get_active_model(api_key)
-        if not model_name:
-            return {}
+def suggest_alternative_pair_if_usdjpy_stay(
+    api_key: str,
+    active_positions: list,
+    risk_percent_per_trade: float,
+    weekly_dd_cap_percent: float = 2.0,
+    max_positions_per_currency: int = 1,
+    exclude_pair_label: str = "USD/JPY (ドル円)"
+) -> dict:
+    """
+    If USD/JPY is NO_TRADE (STAY), suggest an alternative pair.
+    - Uses an AI-ranked list (top N) and then applies:
+      (1) weekly DD cap
+      (2) currency concentration filter
+    Returns dict or {}.
+    """
+    model_name = get_active_model(api_key)
+    if not model_name:
+        return {}
 
-        # Weekly cap gate first
-        if not can_open_under_weekly_cap(active_positions, risk_percent_per_trade, weekly_dd_cap_percent):
-            return {
-                "best_pair_name": "",
-                "reason": "週単位DDキャップを超えるため今週は新規不可",
-                "confidence": 1.0,
-                "blocked": True,
-                "blocked_by": "weekly_dd_cap"
-            }
+    # Weekly cap gate first
+    if not can_open_under_weekly_cap(active_positions, risk_percent_per_trade, weekly_dd_cap_percent):
+        return {
+            "best_pair_name": "",
+            "reason": "週単位DDキャップを超えるため今週は新規不可",
+            "confidence": 1.0,
+            "blocked": True,
+            "blocked_by": "weekly_dd_cap"
+        }
 
-        market_summary = _build_market_summary_for_pairs()
+    market_summary = _build_market_summary_for_pairs()
 
-        prompt = f"""
+    prompt = f"""
 あなたはプロのFXファンドマネージャーです。
 以下の市場データから「今週、USD/JPYが見送りのときに代替として最も利益チャンスがありそうなペア」を最大5つ、優先順で提案してください。
 ただし同じ通貨への偏り（例: JPY絡みを複数）を避ける観点も考慮してください。
@@ -1139,52 +1139,53 @@ def get_ai_range(api_key, context_data):
 【出力JSON】
 {{
   "candidates": [
-    {{"pair": "EUR/USD (ユーロドル)", "reason": "...", "confidence": 0.0}},
-    {{"pair": "AUD/JPY (豪ドル円)", "reason": "...", "confidence": 0.0}}
+{{"pair": "EUR/USD (ユーロドル)", "reason": "...", "confidence": 0.0}},
+{{"pair": "AUD/JPY (豪ドル円)", "reason": "...", "confidence": 0.0}}
   ]
 }}
 """
 
-        try:
-            model = genai.GenerativeModel(model_name)
-            resp = model.generate_content(prompt)
-            txt = (resp.text or "").strip()
-            data = safe_json_loads(txt) if 'safe_json_loads' in globals() else json.loads(_extract_json(txt))
-            candidates = data.get("candidates", [])
-        except Exception:
-            # fallback: reuse existing scan_best_pair single answer
-            single = scan_best_pair(api_key)
-            candidates = []
-            if isinstance(single, dict) and single.get("best_pair_name"):
-                candidates.append({
-                    "pair": single.get("best_pair_name"),
-                    "reason": single.get("reason", ""),
-                    "confidence": single.get("confidence", 0.5)
-                })
+    try:
+        model = genai.GenerativeModel(model_name)
+        resp = model.generate_content(prompt)
+        txt = (resp.text or "").strip()
+        data = safe_json_loads(txt) if 'safe_json_loads' in globals() else json.loads(_extract_json(txt))
+        candidates = data.get("candidates", [])
+    except Exception:
+        # fallback: reuse existing scan_best_pair single answer
+        fn = globals().get('scan_best_pair')
+        single = fn(api_key) if callable(fn) else {}
+        candidates = []
+        if isinstance(single, dict) and single.get("best_pair_name"):
+            candidates.append({
+                "pair": single.get("best_pair_name"),
+                "reason": single.get("reason", ""),
+                "confidence": single.get("confidence", 0.5)
+            })
 
-        # Filter + pick
-        for c in candidates:
-            pair = c.get("pair", "")
-            if not pair:
-                continue
-            if pair == exclude_pair_label:
-                continue
-            if violates_currency_concentration(pair, active_positions, max_positions_per_currency=max_positions_per_currency):
-                continue
-            return {
-                "best_pair_name": pair,
-                "reason": c.get("reason", ""),
-                "confidence": c.get("confidence", 0.5),
-                "blocked": False
-            }
-
+    # Filter + pick
+    for c in candidates:
+        pair = c.get("pair", "")
+        if not pair:
+            continue
+        if pair == exclude_pair_label:
+            continue
+        if violates_currency_concentration(pair, active_positions, max_positions_per_currency=max_positions_per_currency):
+            continue
         return {
-            "best_pair_name": "",
-            "reason": "条件（DDキャップ/通貨分散）を満たす代替ペアが見つかりませんでした",
-            "confidence": 0.0,
-            "blocked": True,
-            "blocked_by": "filters"
+            "best_pair_name": pair,
+            "reason": c.get("reason", ""),
+            "confidence": c.get("confidence", 0.5),
+            "blocked": False
         }
+
+    return {
+        "best_pair_name": "",
+        "reason": "条件（DDキャップ/通貨分散）を満たす代替ペアが見つかりませんでした",
+        "confidence": 0.0,
+        "blocked": True,
+        "blocked_by": "filters"
+    }
 
 # =============================
 # 100% TOOL ADDITIONS
@@ -1608,189 +1609,3 @@ if "suggest_alternative_pair_if_usdjpy_stay" not in globals():
             return {"best_pair_name": pair, "reason": c.get("reason", ""), "confidence": c.get("confidence", 0.5), "blocked": False}
 
         return {"best_pair_name": "", "reason": "条件を満たす代替ペアなし", "confidence": 0.0, "blocked": True, "blocked_by": "filters"}
-
-# ============================================================
-# [PATCH - 2026-02-08] Module-level exports & hardening
-# - Expose suggest_alternative_pair_if_usdjpy_stay at module level (main.py calls this)
-# - Avoid dependency on non-existent scan_best_pair fallback (rare crashes)
-# - Optional per-candidate numeric re-check using no_trade_gate to reduce hallucination
-# - Append-only: does NOT delete existing algorithms/prompts
-# ============================================================
-
-from typing import Any, Dict, List, Tuple, Optional
-
-def _pair_label_to_currencies(pair_label: str) -> Tuple[str, str]:
-    # Accepts labels like 'USD/JPY (ドル円)' or 'EUR/USD (ユーロドル)' or 'USD/JPY'.
-    if not pair_label:
-        return ('', '')
-    m = re.search(r'([A-Z]{3})\s*/\s*([A-Z]{3})', pair_label.upper())
-    if m:
-        return (m.group(1), m.group(2))
-    s = pair_label.upper()
-    if len(s) >= 7 and s[3] in ('/', '-', '_'):
-        return (s[:3], s[4:7])
-    return (s[:3], s[-3:]) if len(s) >= 6 else (s, '')
-
-def portfolio_weekly_risk_percent(active_positions: list) -> float:
-    total = 0.0
-    for p in active_positions or []:
-        try:
-            total += float(p.get('risk_percent', 0.0) or 0.0)
-        except Exception:
-            continue
-    return float(total)
-
-def can_open_under_weekly_cap(active_positions: list, new_risk_percent: float, weekly_dd_cap_percent: float) -> bool:
-    try:
-        new_risk = float(new_risk_percent)
-        cap = float(weekly_dd_cap_percent)
-    except Exception:
-        return True
-    return (portfolio_weekly_risk_percent(active_positions) + new_risk) <= cap
-
-def portfolio_currency_counts(active_positions: list) -> dict:
-    counts: Dict[str, int] = {}
-    for p in active_positions or []:
-        pair = p.get('pair') or p.get('pair_label') or p.get('pair_name') or ''
-        if not pair:
-            continue
-        b, q = _pair_label_to_currencies(pair)
-        if b:
-            counts[b] = counts.get(b, 0) + 1
-        if q:
-            counts[q] = counts.get(q, 0) + 1
-    return counts
-
-def violates_currency_concentration(candidate_pair_label: str, active_positions: list, max_positions_per_currency: int = 1) -> bool:
-    # Correlation proxy: if any currency would exceed max_positions_per_currency, block.
-    counts = portfolio_currency_counts(active_positions)
-    b, q = _pair_label_to_currencies(candidate_pair_label)
-    return (counts.get(b, 0) + 1 > max_positions_per_currency) or (counts.get(q, 0) + 1 > max_positions_per_currency)
-
-def _compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
-    delta = close.diff()
-    gain = delta.clip(lower=0)
-    loss = (-delta).clip(lower=0)
-    avg_gain = gain.rolling(period, min_periods=period).mean()
-    avg_loss = loss.rolling(period, min_periods=period).mean()
-    rs = avg_gain / avg_loss.replace(0, pd.NA)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi.fillna(50)
-
-def _compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    high = df['High']
-    low = df['Low']
-    close = df['Close']
-    prev_close = close.shift(1)
-    tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
-    atr = tr.rolling(period, min_periods=period).mean()
-    return atr
-
-def _build_market_summary_for_pairs() -> str:
-    market_summary = ''
-    for name, sym in PAIR_MAP.items():
-        try:
-            if '_fetch_ohlc' in globals():
-                dfp = _fetch_ohlc(sym, period='5d', interval='1d')
-            else:
-                dfp = _yahoo_chart(sym, rng='5d', interval='1d')
-            if dfp is None or dfp.empty:
-                continue
-            close = float(dfp['Close'].iloc[-1])
-            prev = float(dfp['Close'].iloc[-2]) if len(dfp) >= 2 else close
-            chg = (close - prev) / prev * 100 if prev else 0.0
-            trend = '上昇' if close > float(dfp['Close'].mean()) else '下降'
-            market_summary += f'- {name}: Price={close:.3f} / Chg={chg:+.2f}% / Trend={trend}\n'
-        except Exception:
-            continue
-    return market_summary
-
-def _parse_candidates_json(txt: str) -> List[Dict[str, Any]]:
-    txt = (txt or '').strip()
-    if not txt:
-        return []
-    try:
-        if 'safe_json_loads' in globals():
-            data = safe_json_loads(txt)
-        else:
-            data = json.loads(_extract_json(txt)) if '_extract_json' in globals() else json.loads(txt)
-        cands = data.get('candidates', []) or []
-        return [c for c in cands if isinstance(c, dict)]
-    except Exception:
-        return []
-
-def _candidate_numeric_gate(pair_label: str) -> Optional[str]:
-    # Optional numeric sanity check for suggested alternative pair.
-    try:
-        sym = PAIR_MAP.get(pair_label)
-        if not sym:
-            return None
-        if '_fetch_ohlc' in globals():
-            dfp = _fetch_ohlc(sym, period='60d', interval='1d')
-        else:
-            dfp = _yahoo_chart(sym, rng='3mo', interval='1d')
-        if dfp is None or dfp.empty or len(dfp) < 20:
-            return 'ALT_PAIR_DATA_INSUFFICIENT'
-        dfp = dfp.copy()
-        dfp['RSI'] = _compute_rsi(dfp['Close'], 14)
-        dfp['ATR'] = _compute_atr(dfp, 14)
-        price = float(dfp['Close'].iloc[-1])
-        prev_close = float(dfp['Close'].iloc[-2]) if len(dfp) >= 2 else price
-        ctx = {'price': price, 'rsi': float(dfp['RSI'].iloc[-1]), 'atr': float(dfp['ATR'].iloc[-1] or 0.0), 'prev_close': prev_close}
-        if 'no_trade_gate' in globals():
-            is_no, _, reasons = no_trade_gate(ctx, 'AUTO', force_defensive=False)
-            if is_no:
-                return 'ALT_PAIR_BLOCKED_BY_NO_TRADE_GATE: ' + (', '.join(reasons[:3]) if reasons else '')
-        return None
-    except Exception:
-        return None
-
-def suggest_alternative_pair_if_usdjpy_stay(api_key: str, active_positions: list, risk_percent_per_trade: float,
-                                           weekly_dd_cap_percent: float = 2.0, max_positions_per_currency: int = 1,
-                                           exclude_pair_label: str = 'USD/JPY (ドル円)') -> dict:
-    # Module-level export called by main.py.
-    model_name = get_active_model(api_key) if 'get_active_model' in globals() else None
-    if not model_name:
-        return {}
-    if not can_open_under_weekly_cap(active_positions, risk_percent_per_trade, weekly_dd_cap_percent):
-        return {'best_pair_name': '', 'reason': '週単位DDキャップ超過', 'confidence': 1.0, 'blocked': True, 'blocked_by': 'weekly_dd_cap'}
-    market_summary = _build_market_summary_for_pairs()
-    prompt = f'''
-あなたはプロのFXファンドマネージャーです。
-以下の市場データから「今週、USD/JPYが見送りのときに代替として最も利益チャンスがありそうなペア」を最大5つ、優先順で提案してください。
-ただし同じ通貨への偏り（例: JPY絡みを複数）を避ける観点も考慮してください。
-
-【市場概況】
-{market_summary}
-
-【必須制約】
-- 可能なら {exclude_pair_label} 以外から選ぶ
-- 出力はJSONのみ
-
-【出力JSON】
-{
-  "candidates": [
-    {"pair": "EUR/USD (ユーロドル)", "reason": "...", "confidence": 0.0},
-    {"pair": "AUD/JPY (豪ドル円)", "reason": "...", "confidence": 0.0}
-  ]
-}
-'''.strip()
-    candidates: List[Dict[str, Any]] = []
-    try:
-        model = genai.GenerativeModel(model_name)
-        resp = model.generate_content(prompt)
-        txt = (getattr(resp, 'text', '') or '').strip()
-        candidates = _parse_candidates_json(txt)
-    except Exception:
-        candidates = []
-    for c in candidates:
-        pair = (c.get('pair') or '').strip()
-        if not pair or pair == exclude_pair_label:
-            continue
-        if violates_currency_concentration(pair, active_positions, max_positions_per_currency=max_positions_per_currency):
-            continue
-        br = _candidate_numeric_gate(pair)
-        if br:
-            continue
-        return {'best_pair_name': pair, 'reason': (c.get('reason') or ''), 'confidence': float(c.get('confidence') or 0.5), 'blocked': False}
-    return {'best_pair_name': '', 'reason': '条件を満たす代替ペアなし', 'confidence': 0.0, 'blocked': True, 'blocked_by': 'filters'}
