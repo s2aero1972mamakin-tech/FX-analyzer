@@ -2143,3 +2143,638 @@ def suggest_alternative_pair_if_usdjpy_stay(
         fb.setdefault("debug", {})
         fb["debug"]["ai_candidate_error"] = ai_error
     return fb
+
+
+# =====================================================
+# ALT_PAIR_FIXES v3 (2026-02-09)
+# - Make alternative suggestions "TRADE-able":
+#   * After AI proposes candidates, we fetch that pair's OHLC and compute indicators,
+#     then apply the SAME numeric gates used for weekly trade safety:
+#       - trend_only_gate (trend week only)
+#       - no_trade_gate (volatility/MA-convergence gate) [conservative: force_defensive]
+#   * If candidate fails gates, we skip to next candidate.
+#   * numeric_scan_best_pair() is also tightened to require passing both gates.
+#   This prevents: "代替ペアは出たのに、注文書がNO_TRADEで0だらけ" confusion.
+# NOTE: Existing algorithms/prompts above are NOT deleted.
+# =====================================================
+
+def _alt_pair_build_indicator_df(pair_label: str):
+    """Fetch 1y daily OHLC for the given PAIR_MAP label and return indicator df.
+    Returns None on failure."""
+    try:
+        sym = (PAIR_MAP or {}).get(pair_label)
+        if not sym:
+            return None
+        # Prefer _fetch_ohlc if available (stable), else fallback to _yahoo_chart
+        raw = None
+        try:
+            if "_fetch_ohlc" in globals():
+                raw = _fetch_ohlc(sym, period="1y", interval="1d")
+            else:
+                raw = _yahoo_chart(sym, rng="1y", interval="1d")
+        except Exception:
+            raw = None
+        if raw is None or getattr(raw, "empty", True):
+            return None
+        # Reuse existing indicator pipeline
+        df_ind = calculate_indicators(raw, None)
+        if df_ind is None or getattr(df_ind, "empty", True):
+            return None
+        # Need enough bars for SMA75/ATR avg
+        if len(df_ind) < 90:
+            return None
+        return df_ind
+    except Exception:
+        return None
+
+
+def _alt_pair_tradeable_precheck(pair_label: str):
+    """Return (ok, debug_dict). ok=True means the pair is eligible to produce a TRADE plan.
+
+    We intentionally use force_defensive=True for no_trade_gate to avoid 'too wild' weeks.
+    """
+    dbg = {"pair": pair_label, "ok": False, "why": "", "notes": []}
+
+    df_ind = _alt_pair_build_indicator_df(pair_label)
+    if df_ind is None:
+        dbg["why"] = "indicator_df_unavailable"
+        return False, dbg
+
+    ctx = _build_ctx_from_indicator_df(df_ind) if "_build_ctx_from_indicator_df" in globals() else {}
+
+    # Add fields used by no_trade_gate (optional but helps)
+    try:
+        # atr_avg60 is already set by _build_ctx_from_indicator_df; keep
+        # include latest SMA values explicitly if present
+        lr = df_ind.iloc[-1]
+        if "SMA_25" in df_ind.columns and pd.notna(lr.get("SMA_25")):
+            ctx["sma25"] = float(lr["SMA_25"])
+        if "SMA_75" in df_ind.columns and pd.notna(lr.get("SMA_75")):
+            ctx["sma75"] = float(lr["SMA_75"])
+        # also include price
+        if "Close" in df_ind.columns and pd.notna(lr.get("Close")):
+            ctx["price"] = float(lr["Close"])
+    except Exception:
+        pass
+
+    # 1) trend-only gate
+    ok_trend, side_hint, trend_score, trend_reasons = trend_only_gate(ctx)
+    if not ok_trend:
+        dbg["why"] = "trend_only_gate_block"
+        dbg["notes"].extend(trend_reasons or [])
+        dbg["trend_score"] = trend_score
+        dbg["side_hint"] = side_hint
+        return False, dbg
+
+    # 2) no-trade gate (conservative)
+    try:
+        nt, regime, nt_reasons = no_trade_gate(ctx, "DEFENSIVE", force_defensive=True)
+    except Exception as e:
+        nt, regime, nt_reasons = True, "DEFENSIVE", [f"no_trade_gate_error:{type(e).__name__}"]
+
+    # enrich debug with volatility ratio
+    try:
+        atr = _safe_float(ctx.get("atr"))
+        atr_avg60 = _safe_float(ctx.get("atr_avg60"))
+        if atr is not None and atr_avg60 not in (None, 0):
+            dbg["atr_ratio"] = float(atr) / float(atr_avg60)
+    except Exception:
+        pass
+
+    if nt:
+        dbg["why"] = "no_trade_gate_block"
+        dbg["notes"].extend(nt_reasons or [])
+        dbg["regime"] = regime
+        dbg["trend_score"] = trend_score
+        dbg["side_hint"] = side_hint
+        return False, dbg
+
+    dbg["ok"] = True
+    dbg["why"] = "tradeable"
+    dbg["trend_score"] = trend_score
+    dbg["side_hint"] = side_hint
+    return True, dbg
+
+
+# Tighten numeric scan to require both gates
+try:
+    _old_numeric_scan_best_pair_v2 = numeric_scan_best_pair
+except Exception:
+    _old_numeric_scan_best_pair_v2 = None
+
+
+def numeric_scan_best_pair(
+    active_positions: list = None,
+    exclude_pair_label: str = "USD/JPY (ドル円)",
+    max_positions_per_currency: int = 1,
+) -> dict:
+    active_positions = active_positions or []
+    exclude_head = (exclude_pair_label or "").split()[0]
+
+    best_pair = ""
+    best_score = -1e9
+    best_meta = {}
+
+    for pair_label in (PAIR_MAP or {}).keys():
+        try:
+            head = (pair_label or "").split()[0]
+            if head and head == exclude_head:
+                continue
+
+            # Concentration filter only when positions exist
+            if active_positions:
+                try:
+                    if violates_currency_concentration(pair_label, active_positions, max_positions_per_currency=max_positions_per_currency):
+                        continue
+                except Exception:
+                    pass
+
+            ok, dbg = _alt_pair_tradeable_precheck(pair_label)
+            if not ok:
+                continue
+
+            score = float(dbg.get("trend_score") or -1e9)
+            if score > best_score:
+                best_score = score
+                best_pair = pair_label
+                best_meta = dbg
+        except Exception:
+            continue
+
+    if not best_pair:
+        return {
+            "best_pair_name": "",
+            "reason": "数値スキャンでもTRADE可能な代替ペアが見つかりませんでした（トレンド条件/荒れ相場ゲートで全落ち）",
+            "confidence": 0.0,
+            "blocked": True,
+            "blocked_by": "numeric_scan_no_tradeable_candidate",
+        }
+
+    return {
+        "best_pair_name": best_pair,
+        "reason": f"数値スキャンでTRADE可能（trend_score={best_meta.get('trend_score'):.2f}, ATR比={best_meta.get('atr_ratio','?')}）",
+        "confidence": 0.70,
+        "blocked": False,
+        "source": "numeric_scan_tradeable",
+        "meta": best_meta,
+    }
+
+
+# Override: choose only tradeable AI candidates; else fallback numeric scan (tradeable)
+try:
+    _old_suggest_alternative_v2 = suggest_alternative_pair_if_usdjpy_stay
+except Exception:
+    _old_suggest_alternative_v2 = None
+
+
+def suggest_alternative_pair_if_usdjpy_stay(
+    api_key: str,
+    active_positions: list,
+    risk_percent_per_trade: float,
+    weekly_dd_cap_percent: float = 2.0,
+    max_positions_per_currency: int = 1,
+    exclude_pair_label: str = "USD/JPY (ドル円)",
+) -> dict:
+    # Weekly cap first
+    if not can_open_under_weekly_cap(active_positions, risk_percent_per_trade, weekly_dd_cap_percent):
+        return {
+            "best_pair_name": "",
+            "reason": "週単位DDキャップを超えるため今週は新規不可",
+            "confidence": 1.0,
+            "blocked": True,
+            "blocked_by": "weekly_dd_cap",
+        }
+
+    model_name = get_active_model(api_key)
+
+    # If model unavailable, deterministic scan
+    if not model_name:
+        return numeric_scan_best_pair(
+            active_positions=active_positions,
+            exclude_pair_label=exclude_pair_label,
+            max_positions_per_currency=max_positions_per_currency,
+        )
+
+    market_summary = _build_market_summary_for_pairs()
+    bias_note = "（現在ノーポジのため、JPYクロスも候補に含めてOK）" if not (active_positions or []) else "（既存ポジとの通貨重複を避ける）"
+    allowed_labels = list((PAIR_MAP or {}).keys())
+
+    prompt = f"""
+あなたはプロのFXファンドマネージャーです。
+以下の市場データから「今週、USD/JPYが見送りのときに代替として最も利益チャンスがありそうなペア」を最大5つ、優先順で提案してください。
+{bias_note}
+
+【市場概況】
+{market_summary}
+
+【必須制約】
+- 可能なら {exclude_pair_label} 以外から選ぶ
+- 出力はJSONのみ
+- pair は必ず次の候補のいずれかから選ぶ（表記は完全一致）:
+{allowed_labels}
+
+【出力JSON】
+{{
+  "candidates": [
+    {{"pair": "EUR/USD (ユーロドル)", "reason": "...", "confidence": 0.0}},
+    {{"pair": "AUD/JPY (豪ドル円)", "reason": "...", "confidence": 0.0}}
+  ]
+}}
+""".strip()
+
+    candidates = []
+    ai_error = ""
+    try:
+        model = genai.GenerativeModel(model_name)
+        resp = model.generate_content(prompt)
+        txt = (resp.text or "").strip()
+        data = safe_json_loads(txt)
+        candidates = data.get("candidates", []) if isinstance(data, dict) else []
+    except Exception as e:
+        ai_error = f"{type(e).__name__}: {e}"
+        candidates = []
+
+    exclude_head = (exclude_pair_label or "").split()[0]
+
+    # AI candidates -> apply portfolio filters -> then tradeable precheck
+    for c in candidates or []:
+        try:
+            pair = (c or {}).get("pair", "")
+            if not pair:
+                continue
+            if pair.split()[0] == exclude_head:
+                continue
+
+            # concentration only when positions exist
+            if active_positions:
+                if violates_currency_concentration(pair, active_positions, max_positions_per_currency=max_positions_per_currency):
+                    continue
+
+            ok, dbg = _alt_pair_tradeable_precheck(pair)
+            if not ok:
+                # skip non-tradeable candidates
+                continue
+
+            return {
+                "best_pair_name": pair,
+                "reason": (c or {}).get("reason", ""),
+                "confidence": float((c or {}).get("confidence", 0.5) or 0.5),
+                "blocked": False,
+                "source": "ai_tradeable",
+                "meta": dbg,
+            }
+        except Exception:
+            continue
+
+    # fallback numeric scan (tradeable)
+    fb = numeric_scan_best_pair(
+        active_positions=active_positions,
+        exclude_pair_label=exclude_pair_label,
+        max_positions_per_currency=max_positions_per_currency,
+    )
+    if ai_error:
+        fb.setdefault("debug", {})
+        fb["debug"]["ai_candidate_error"] = ai_error
+    return fb
+
+
+
+# ==========================================================
+# AUTO_HIERARCHY_ORDER_GENERATION v1
+#   - 迷わない運用：AI →（失敗時）AI再生成 →（さらに失敗時）数値フォールバック
+#   - 「AI厳格」も残す（generation_policy="AI_STRICT"）
+# ==========================================================
+
+# 既存の get_ai_order_strategy（厳格1回生成）を退避
+try:
+    _STRICT_GET_AI_ORDER_STRATEGY = get_ai_order_strategy
+except Exception:
+    _STRICT_GET_AI_ORDER_STRATEGY = None
+
+def _is_technical_failure_order(result: dict) -> bool:
+    """AI出力の整形/検証失敗など『本来は取引可能性があるのに止まった』ケースだけ True。"""
+    if not isinstance(result, dict):
+        return True
+
+    decision = result.get("decision")
+    why = str(result.get("why", "") or "")
+    notes = result.get("notes", [])
+    notes_s = " ".join([str(x) for x in notes]) if isinstance(notes, list) else str(notes)
+
+    # TRADEなら当然OK
+    if decision == "TRADE":
+        return False
+
+    # ここは「正しい見送り」なので技術失敗扱いしない
+    legit_markers = [
+        "トレンド条件を満たさない",
+        "trend_gate_",          # トレンド週のみ運用
+        "NO_TRADEゲート",       # 数値ゲートで止めた
+        "volatility_too_high",  # 数値ゲート系
+        "data_invalid_",        # 指標欠損（AIの再生成では直らない）
+        "weekly_dd_cap",        # DDキャップ
+        "currency_concentration",
+    ]
+    if any(m in why for m in legit_markers) or any(m in notes_s for m in legit_markers):
+        return False
+
+    # 『AIの出力が壊れてる/遠すぎる/JSON不正』系は再生成・数値フォールバック対象
+    tech_markers = [
+        "parse_or_validation_failed",
+        "json_extract_failed",
+        "order_json_not_object",
+        "decision_invalid",
+        "side_invalid",
+        "horizon_invalid",
+        "entry_missing",
+        "take_profit_missing",
+        "stop_loss_missing",
+        "levels_inconsistent_",
+        "rr_too_low",
+        "entry_too_far_from_price",
+        "注文JSONの検証に失敗",
+        "注文生成で例外",
+        "(ResourceExhausted)",
+        "ResourceExhausted",
+        "quota",
+        "429",
+    ]
+    return any(m in why for m in tech_markers) or any(m in notes_s for m in tech_markers)
+
+def _is_quota_error(result: dict) -> bool:
+    if not isinstance(result, dict):
+        return False
+    why = str(result.get("why", "") or "")
+    return ("ResourceExhausted" in why) or ("quota" in why) or ("429" in why)
+
+def _ensure_trend_fields(ctx: dict) -> dict:
+    """trend_only_gate で使う補助フィールドを確実に作る（既にあれば上書きしない）。"""
+    if not isinstance(ctx, dict):
+        return {}
+    # base側でセットされる想定だが、保険で補完
+    try:
+        price = _safe_float(ctx.get("price"))
+        atr = _safe_float(ctx.get("atr"))
+        if price is None or atr is None:
+            return ctx
+        if "breakout_buffer" not in ctx:
+            ctx["breakout_buffer"] = max(atr * 0.35, price * 0.0025)  # 0.25% or 0.35ATR
+        if "recommended_entry" not in ctx:
+            side_hint = ctx.get("trend_side_hint")
+            if side_hint not in ("LONG", "SHORT"):
+                side_hint = "LONG"
+            try:
+                ctx["recommended_entry"] = _recommended_stop_entry(price, ctx["breakout_buffer"], side_hint)
+            except Exception:
+                ctx["recommended_entry"] = price
+    except Exception:
+        pass
+    return ctx
+
+def _build_numeric_fallback_order(ctx: dict, market_regime: str, regime_why: str, pair_name: str = "") -> dict:
+    """AI不調時の『止まらない』最終手段（数値ルール）。"""
+    ctx = _ensure_trend_fields(ctx or {})
+    price = _safe_float(ctx.get("price"), default=0.0) or 0.0
+    atr = _safe_float(ctx.get("atr"), default=0.0) or 0.0
+
+    side = ctx.get("trend_side_hint")
+    if side not in ("LONG", "SHORT"):
+        # side_hintが無いなら安全側で見送り
+        return {
+            "decision": "NO_TRADE", "side": "NONE", "entry": 0, "take_profit": 0, "stop_loss": 0,
+            "horizon": "WEEK", "confidence": 0.0,
+            "why": "数値フォールバック: side_hint不明のため取引停止。",
+            "notes": ["numeric_fallback_side_unknown"],
+            "market_regime": market_regime, "regime_why": regime_why,
+            "generator_path": "numeric_fallback_blocked"
+        }
+
+    # 価格が取れない/ATRが取れないなら停止
+    if price <= 0 or atr <= 0:
+        return {
+            "decision": "NO_TRADE", "side": "NONE", "entry": 0, "take_profit": 0, "stop_loss": 0,
+            "horizon": "WEEK", "confidence": 0.0,
+            "why": "数値フォールバック: price/ATR不足のため取引停止。",
+            "notes": ["numeric_fallback_missing_price_or_atr"],
+            "market_regime": market_regime, "regime_why": regime_why,
+            "generator_path": "numeric_fallback_blocked"
+        }
+
+    # entryは推奨逆指値（ブレイクアウト）に合わせる
+    entry = _safe_float(ctx.get("recommended_entry"), default=price)
+    # リスク幅（ATRベース）
+    risk = max(atr * 2.0, price * 0.004)  # 0.4% or 2ATR
+    reward = risk * 2.0  # RR=2.0 目安
+
+    if side == "LONG":
+        sl = entry - risk
+        tp = entry + reward
+        entry_kind = "STOP"
+        entry_kind_jp = "逆指値"
+        bundle = "IFD_OCO"
+        bundle_hint = "SBI: 逆指値(IFD-OCO)で放置運用（TP/SL同時）"
+    else:
+        sl = entry + risk
+        tp = entry - reward
+        entry_kind = "STOP"
+        entry_kind_jp = "逆指値"
+        bundle = "IFD_OCO"
+        bundle_hint = "SBI: 逆指値(IFD-OCO)で放置運用（TP/SL同時）"
+
+    obj = {
+        "decision": "TRADE",
+        "side": side,
+        "entry": float(entry),
+        "take_profit": float(tp),
+        "stop_loss": float(sl),
+        "horizon": "WEEK",
+        "confidence": 0.60,
+        "why": "AIの注文JSONが不正/失敗したため、数値ルールでフォールバック生成（RR=2.0 / ATR基準）。",
+        "notes": ["numeric_fallback_rr2_atr", "order_method_fixed_ifd_oco_stop"],
+        "order_bundle": bundle,
+        "entry_type": entry_kind,
+        "entry_price_kind_jp": entry_kind_jp,
+        "bundle_hint_jp": bundle_hint,
+        "market_regime": market_regime,
+        "regime_why": regime_why,
+        "generator_path": "numeric_fallback"
+    }
+
+    ok, reasons = _validate_order_json(obj, ctx)
+    if not ok:
+        return {
+            "decision": "NO_TRADE", "side": "NONE", "entry": 0, "take_profit": 0, "stop_loss": 0,
+            "horizon": "WEEK", "confidence": 0.0,
+            "why": "数値フォールバック生成は試みたが、検証に失敗したため取引停止。",
+            "notes": ["numeric_fallback_validation_failed"] + reasons,
+            "market_regime": market_regime, "regime_why": regime_why,
+            "generator_path": "numeric_fallback_failed"
+        }
+    return obj
+
+def _ai_retry_order(api_key: str, ctx: dict, market_regime: str, regime_why: str, pair_name: str = "") -> dict:
+    """AIの再生成（失敗時のみ）。JSON仕様を厳しくしてもう一度だけ作る。"""
+    try:
+        model_name = get_active_model(api_key)
+        if not model_name:
+            return {}
+        ctx = _ensure_trend_fields(ctx or {})
+        price = float(_safe_float(ctx.get("price"), default=0.0) or 0.0)
+        atr = float(_safe_float(ctx.get("atr"), default=0.0) or 0.0)
+        rsi = float(_safe_float(ctx.get("rsi"), default=50.0) or 50.0)
+        sma5 = _safe_float(ctx.get("sma5"))
+        sma25 = _safe_float(ctx.get("sma25"))
+        sma75 = _safe_float(ctx.get("sma75"))
+        side_hint = ctx.get("trend_side_hint", "LONG")
+        recommended_entry = float(_safe_float(ctx.get("recommended_entry"), default=price) or price)
+
+        prompt = f"""
+あなたはFXの運用担当です。以下の条件で、**必ずJSONのみ**を返してください。装飾や説明文は禁止です。
+
+【ペア】{pair_name or ctx.get("pair_label","")}
+【現値】{price:.6f}
+【ATR】{atr:.6f}
+【RSI】{rsi:.2f}
+【SMA5】{sma5}
+【SMA25】{sma25}
+【SMA75】{sma75}
+【相場モード】{market_regime}
+【相場理由】{regime_why}
+
+【運用ルール（厳守）】
+- 今週はトレンド週のみ。方向ヒント: {side_hint}
+- エントリーはブレイクアウト用の**逆指値**（STOP）で作る
+- 推奨エントリー: {recommended_entry:.6f} を必ず基準にする
+- entryは現値から3%以内（entry_too_farを回避）
+- RRは1.2以上（できれば1.6〜2.4）
+- 数値はすべて number（文字列禁止）
+
+【出力JSONスキーマ】
+{{
+  "decision": "TRADE" or "NO_TRADE",
+  "side": "LONG" or "SHORT" or "NONE",
+  "entry": number,
+  "take_profit": number,
+  "stop_loss": number,
+  "horizon": "WEEK",
+  "confidence": number,
+  "why": "string",
+  "notes": ["string", ...],
+  "order_bundle": "IFD_OCO",
+  "entry_type": "STOP",
+  "entry_price_kind_jp": "逆指値",
+  "bundle_hint_jp": "SBI: 逆指値(IFD-OCO)で放置運用（TP/SL同時）"
+}}
+"""
+
+        model = genai.GenerativeModel(model_name)
+        resp = model.generate_content(prompt)
+        txt = (getattr(resp, "text", "") or "").strip()
+        data = safe_json_loads(txt) if 'safe_json_loads' in globals() else json.loads(_extract_json(txt))
+        if not isinstance(data, dict):
+            return {}
+
+        # トレンド側ヒントと矛盾するなら見送り（運用ルール）
+        if data.get("decision") == "TRADE":
+            if side_hint in ("LONG","SHORT") and data.get("side") not in (side_hint,):
+                data["decision"] = "NO_TRADE"
+                data["side"] = "NONE"
+                data["entry"] = 0
+                data["take_profit"] = 0
+                data["stop_loss"] = 0
+                data["why"] = "AI再生成のsideがトレンド方向ヒントと不一致のため取引停止。"
+                data["notes"] = ["retry_side_mismatch"]
+
+        # entryは推奨に寄せる（暴発防止）
+        if data.get("decision") == "TRADE":
+            try:
+                data["entry"] = float(recommended_entry)
+            except Exception:
+                pass
+
+        ok, reasons = _validate_order_json(data, ctx)
+        if not ok:
+            return {
+                "decision": "NO_TRADE", "side": "NONE", "entry": 0, "take_profit": 0, "stop_loss": 0,
+                "horizon": "WEEK", "confidence": 0.0,
+                "why": "AI再生成でも注文JSONの検証に失敗したため取引停止。",
+                "notes": ["retry_parse_or_validation_failed"] + reasons,
+                "market_regime": market_regime, "regime_why": regime_why,
+                "generator_path": "ai_retry_failed"
+            }
+
+        data["market_regime"] = market_regime
+        data["regime_why"] = regime_why
+        data["generator_path"] = "ai_retry"
+        return data
+    except Exception as e:
+        return {
+            "decision": "NO_TRADE", "side": "NONE", "entry": 0, "take_profit": 0, "stop_loss": 0,
+            "horizon": "WEEK", "confidence": 0.0,
+            "why": f"AI再生成で例外。保守的に取引停止。({type(e).__name__})",
+            "notes": ["retry_exception"],
+            "market_regime": market_regime, "regime_why": regime_why,
+            "generator_path": "ai_retry_exception"
+        }
+
+def get_ai_order_strategy(
+    api_key: str,
+    context_data: dict,
+    override_mode: str = "AUTO",
+    override_reason: str = "",
+    pair_name: str = None,
+    portfolio_positions: list = None,
+    weekly_dd_cap_percent: float = 2.0,
+    risk_percent_per_trade: float = 2.0,
+    max_positions_per_currency: int = 1,
+    generation_policy: str = "AUTO_HIERARCHY",
+):
+    """
+    generation_policy:
+      - "AUTO_HIERARCHY"（推奨）: AI →（技術失敗時）AI再生成 →（さらに失敗時）数値フォールバック
+      - "AI_STRICT": 従来通り。AIが壊れたら見送りで止める（安全最優先）
+    """
+    if _STRICT_GET_AI_ORDER_STRATEGY is None:
+        return {"decision":"NO_TRADE","side":"NONE","entry":0,"take_profit":0,"stop_loss":0,"horizon":"WEEK","confidence":0.0,
+                "why":"内部エラー: strict generator未定義","notes":["strict_generator_missing"],"market_regime":"DEFENSIVE","regime_why":"",
+                "generator_path":"error"}
+
+    # まずは従来の厳格生成（1回）
+    strict_res = _STRICT_GET_AI_ORDER_STRATEGY(
+        api_key=api_key,
+        context_data=context_data,
+        override_mode=override_mode,
+        override_reason=override_reason,
+        pair_name=pair_name,
+        portfolio_positions=portfolio_positions,
+        weekly_dd_cap_percent=weekly_dd_cap_percent,
+        risk_percent_per_trade=risk_percent_per_trade,
+        max_positions_per_currency=max_positions_per_currency,
+    )
+    if isinstance(strict_res, dict) and "generator_path" not in strict_res:
+        strict_res["generator_path"] = "ai_strict"
+
+    # AI厳格モードならここで終わり
+    if str(generation_policy).upper() in ("AI_STRICT","STRICT","AI100"):
+        return strict_res
+
+    # 自動階層化：『技術失敗だけ』救済する
+    if not _is_technical_failure_order(strict_res):
+        return strict_res
+
+    market_regime = strict_res.get("market_regime", "DEFENSIVE")
+    regime_why = strict_res.get("regime_why", "")
+    ctx = context_data or {}
+
+    # quota系は再生成せず、数値フォールバックに直行
+    if not _is_quota_error(strict_res):
+        retry_res = _ai_retry_order(api_key, ctx, market_regime, regime_why, pair_name=pair_name or "")
+        if isinstance(retry_res, dict) and retry_res.get("decision") == "TRADE":
+            return retry_res
+        # retryがNO_TRADEでも、技術失敗ではないならそれを返す
+        if isinstance(retry_res, dict) and not _is_technical_failure_order(retry_res):
+            return retry_res
+
+    # 最終手段：数値フォールバック
+    fb = _build_numeric_fallback_order(ctx, market_regime, regime_why, pair_name=pair_name or "")
+    return fb
