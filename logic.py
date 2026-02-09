@@ -1409,11 +1409,6 @@ def suggest_alternative_pair_if_usdjpy_stay(
 
     prompt = f"""
 あなたはプロのFXファンドマネージャーです。
-以下の「候補ペア」リストからのみ選んでください。表記は必ず候補リストと完全一致させてください。
-
-【候補ペア】
-{chr(10).join(PAIR_MAP.keys())}
-
 以下の市場データから「今週、USD/JPYが見送りのときに代替として最も利益チャンスがありそうなペア」を最大5つ、優先順で提案してください。
 ただし同じ通貨への偏り（例: JPY絡みを複数）を避ける観点も考慮してください。
 
@@ -1451,15 +1446,12 @@ def suggest_alternative_pair_if_usdjpy_stay(
                 "confidence": single.get("confidence", 0.5)
             })
 
-    
-# Filter + pick
+    # Filter + pick
     for c in candidates:
-        pair_raw = c.get("pair", "")
-        pair = canonical_pair_label(pair_raw)
+        pair = c.get("pair", "")
         if not pair:
             continue
-        # Exclude USD/JPY regardless of suffix text
-        if _same_pair(pair, exclude_pair_label):
+        if pair == exclude_pair_label:
             continue
         if violates_currency_concentration(pair, active_positions, max_positions_per_currency=max_positions_per_currency):
             continue
@@ -1497,54 +1489,6 @@ if "PAIR_MAP" not in globals():
         "GBP/JPY (ポンド円)": "GBPJPY=X",
         "AUD/JPY (豪ドル円)": "AUDJPY=X",
     }
-
-# --- Pair label normalization (to avoid AI output mismatch) ---
-def _pair_head(label: str) -> str:
-    """Return 'AAA/BBB' head in uppercase if possible, else ''."""
-    try:
-        s = str(label).strip()
-        if not s:
-            return ""
-        if s.endswith("=X"):
-            # ticker, cannot always derive head
-            return ""
-        head = s.split()[0]
-        if "/" in head and len(head) >= 7:
-            a, b = head.split("/")[:2]
-            return f"{a.strip().upper()}/{b.strip().upper()}"
-        return ""
-    except Exception:
-        return ""
-
-def canonical_pair_label(pair_label: str) -> str:
-    """Map AI-returned pair string to a canonical PAIR_MAP key when possible."""
-    s = str(pair_label).strip() if pair_label is not None else ""
-    if not s:
-        return ""
-    # Already canonical
-    if s in PAIR_MAP:
-        return s
-    # If label contains head, try to match by head
-    head = _pair_head(s)
-    if head:
-        for k in PAIR_MAP.keys():
-            if _pair_head(k) == head:
-                return k
-        # If not found, keep original (e.g., 'EUR/USD')
-        return head
-    # Ticker pass-through
-    if s.endswith("=X"):
-        return s
-    return s
-
-def _same_pair(a: str, b: str) -> bool:
-    """Compare two pair labels by their head 'AAA/BBB'."""
-    ha = _pair_head(a)
-    hb = _pair_head(b)
-    if ha and hb:
-        return ha == hb
-    # fallback exact
-    return str(a).strip() == str(b).strip()
 
 # --- Lightweight helpers (safe float / json extract might already exist) ---
 def _fx_safe_float(x, default=None):
@@ -1950,3 +1894,252 @@ if "suggest_alternative_pair_if_usdjpy_stay" not in globals():
             return {"best_pair_name": pair, "reason": c.get("reason", ""), "confidence": c.get("confidence", 0.5), "blocked": False}
 
         return {"best_pair_name": "", "reason": "条件を満たす代替ペアなし", "confidence": 0.0, "blocked": True, "blocked_by": "filters"}
+
+
+
+# =====================================================
+# ALT_PAIR_FIXES v2 (2026-02-09)
+# - Fix: suggest_alternative_pair_if_usdjpy_stay() JSON parse NameError by providing
+#        _extract_json and safe_json_loads.
+# - Add: numeric_scan_best_pair() fallback that scans PAIR_MAP with the SAME trend_only_gate
+#        (so "USD/JPY見送りでも他ペアがトレンドならTRADE" を確実に拾う)
+# - Override: suggest_alternative_pair_if_usdjpy_stay() to use AI candidates first, then numeric scan fallback.
+# NOTE: Existing algorithms/prompts above are NOT deleted.
+# =====================================================
+
+def _extract_json(text: str) -> str:
+    """Backward-compat alias (older code referenced _extract_json)."""
+    return _extract_json_block(text)
+
+def safe_json_loads(text: str) -> dict:
+    """Robust JSON loader for LLM outputs (supports code fences / extra text)."""
+    j = _extract_json_block(text)
+    if not j:
+        # try stripping ```json fences
+        s = (text or "").strip()
+        s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.IGNORECASE)
+        s = re.sub(r"\s*```$", "", s)
+        j = _extract_json_block(s)
+    if not j:
+        raise ValueError("json_not_found")
+    return json.loads(j)
+
+def _build_ctx_from_indicator_df(df_ind: pd.DataFrame) -> dict:
+    """Build minimal context required by trend_only_gate from an indicator DataFrame."""
+    lr = df_ind.iloc[-1]
+    ctx = {
+        "price": float(lr["Close"]) if pd.notna(lr.get("Close", None)) else None,
+        "atr": float(lr["ATR"]) if pd.notna(lr.get("ATR", None)) else None,
+        "rsi": float(lr["RSI"]) if pd.notna(lr.get("RSI", None)) else None,
+        "sma25": float(lr["SMA_25"]) if pd.notna(lr.get("SMA_25", None)) else None,
+        "sma75": float(lr["SMA_75"]) if pd.notna(lr.get("SMA_75", None)) else None,
+    }
+    try:
+        if "ATR" in df_ind.columns and df_ind["ATR"].tail(60).notna().any():
+            ctx["atr_avg60"] = float(df_ind["ATR"].tail(60).mean())
+        else:
+            ctx["atr_avg60"] = ctx.get("atr")
+    except Exception:
+        ctx["atr_avg60"] = ctx.get("atr")
+    return ctx
+
+def numeric_scan_best_pair(
+    active_positions: list = None,
+    exclude_pair_label: str = "USD/JPY (ドル円)",
+    max_positions_per_currency: int = 1,
+) -> dict:
+    """Deterministic fallback: scan PAIR_MAP and pick the strongest pair that passes trend_only_gate."""
+    active_positions = active_positions or []
+    exclude_head = (exclude_pair_label or "").split()[0]
+
+    best_pair = ""
+    best_score = -1e9
+    best_meta = {}
+
+    for pair_label, sym in (PAIR_MAP or {}).items():
+        try:
+            head = (pair_label or "").split()[0]
+            if head and head == exclude_head:
+                continue
+
+            # If there are already positions, apply currency concentration filter.
+            # If no positions (ノーポジ), concentration check is meaningless, so we keep it permissive.
+            if active_positions:
+                try:
+                    if violates_currency_concentration(pair_label, active_positions, max_positions_per_currency=max_positions_per_currency):
+                        continue
+                except Exception:
+                    pass
+
+            # Fetch OHLC
+            raw = None
+            try:
+                if "_fetch_ohlc" in globals():
+                    raw = _fetch_ohlc(sym, period="1y", interval="1d")
+                else:
+                    raw = _yahoo_chart(sym, rng="1y", interval="1d")
+            except Exception:
+                raw = None
+
+            df_ind = calculate_indicators(raw, None) if raw is not None else None
+            # Need enough length for SMA75 and ATR
+            if df_ind is None or getattr(df_ind, "empty", True) or len(df_ind) < 80:
+                continue
+
+            ctx = _build_ctx_from_indicator_df(df_ind)
+            allowed, side_hint, trend_score, reasons = trend_only_gate(ctx)
+            if not allowed or trend_score is None:
+                continue
+
+            score = float(trend_score)
+            if score > best_score:
+                best_score = score
+                best_pair = pair_label
+                best_meta = {
+                    "side_hint": side_hint,
+                    "trend_score": score,
+                    "price": ctx.get("price"),
+                    "rsi": ctx.get("rsi"),
+                    "atr": ctx.get("atr"),
+                }
+        except Exception:
+            continue
+
+    if not best_pair:
+        return {
+            "best_pair_name": "",
+            "reason": "数値スキャンでもトレンド合格ペアが見つかりませんでした",
+            "confidence": 0.0,
+            "blocked": True,
+            "blocked_by": "numeric_scan_no_candidate",
+        }
+
+    return {
+        "best_pair_name": best_pair,
+        "reason": f"数値スキャンでトレンド合格（trend_score={best_meta.get('trend_score'):.2f}, RSI={best_meta.get('rsi'):.1f}）",
+        "confidence": 0.65,
+        "blocked": False,
+        "source": "numeric_scan",
+        "meta": best_meta,
+    }
+
+# Provide scan_best_pair for older fallback paths (used by earlier suggest_alternative impl)
+def scan_best_pair(api_key: str = None) -> dict:
+    try:
+        return numeric_scan_best_pair(active_positions=[])
+    except Exception:
+        return {"best_pair_name": "", "reason": "scan_best_pair_failed", "confidence": 0.0}
+
+# Override alternative suggestion to be robust and transparent
+def suggest_alternative_pair_if_usdjpy_stay(
+    api_key: str,
+    active_positions: list,
+    risk_percent_per_trade: float,
+    weekly_dd_cap_percent: float = 2.0,
+    max_positions_per_currency: int = 1,
+    exclude_pair_label: str = "USD/JPY (ドル円)",
+) -> dict:
+    """
+    代替ペア提案（安全 + 取りこぼし防止）:
+      1) 週DDキャップを先にチェック
+      2) AI候補(JSON) → フィルタ
+      3) AIがコケる/空なら、数値スキャン(trend_only_gate合格)で必ず拾いに行く
+    """
+    # Weekly cap gate first
+    if not can_open_under_weekly_cap(active_positions, risk_percent_per_trade, weekly_dd_cap_percent):
+        return {
+            "best_pair_name": "",
+            "reason": "週単位DDキャップを超えるため今週は新規不可",
+            "confidence": 1.0,
+            "blocked": True,
+            "blocked_by": "weekly_dd_cap",
+        }
+
+    # If model is unavailable, still try numeric scan
+    model_name = get_active_model(api_key)
+    if not model_name:
+        return numeric_scan_best_pair(
+            active_positions=active_positions,
+            exclude_pair_label=exclude_pair_label,
+            max_positions_per_currency=max_positions_per_currency,
+        )
+
+    market_summary = _build_market_summary_for_pairs()
+
+    # Prompt: do not over-constrain when portfolio is empty
+    bias_note = "（現在ノーポジのため、JPYクロスも候補に含めてOK）" if not (active_positions or []) else "（既存ポジとの通貨重複を避ける）"
+    allowed_labels = list(PAIR_MAP.keys()) if "PAIR_MAP" in globals() else []
+
+    prompt = f"""
+あなたはプロのFXファンドマネージャーです。
+以下の市場データから「今週、USD/JPYが見送りのときに代替として最も利益チャンスがありそうなペア」を最大5つ、優先順で提案してください。
+{bias_note}
+
+【市場概況】
+{market_summary}
+
+【必須制約】
+- 可能なら {exclude_pair_label} 以外から選ぶ
+- 出力はJSONのみ
+- pair は必ず次の候補のいずれかから選ぶ（表記は完全一致）:
+{allowed_labels}
+
+【出力JSON】
+{{
+  "candidates": [
+    {{"pair": "EUR/USD (ユーロドル)", "reason": "...", "confidence": 0.0}},
+    {{"pair": "AUD/JPY (豪ドル円)", "reason": "...", "confidence": 0.0}}
+  ]
+}}
+""".strip()
+
+    candidates = []
+    ai_error = ""
+    try:
+        model = genai.GenerativeModel(model_name)
+        resp = model.generate_content(prompt)
+        txt = (resp.text or "").strip()
+        data = safe_json_loads(txt)
+        candidates = data.get("candidates", []) if isinstance(data, dict) else []
+    except Exception as e:
+        ai_error = f"{type(e).__name__}: {e}"
+        candidates = []
+
+    exclude_head = (exclude_pair_label or "").split()[0]
+
+    # Filter + pick from AI candidates
+    for c in candidates or []:
+        try:
+            pair = (c or {}).get("pair", "")
+            if not pair:
+                continue
+
+            # Exclude by head match (more robust than exact Japanese label)
+            if (pair.split()[0] == exclude_head):
+                continue
+
+            # If already have positions, apply concentration
+            if active_positions:
+                if violates_currency_concentration(pair, active_positions, max_positions_per_currency=max_positions_per_currency):
+                    continue
+
+            return {
+                "best_pair_name": pair,
+                "reason": (c or {}).get("reason", ""),
+                "confidence": float((c or {}).get("confidence", 0.5) or 0.5),
+                "blocked": False,
+                "source": "ai",
+            }
+        except Exception:
+            continue
+
+    # Fallback: numeric scan (guarantees "他ペアがトレンドなら拾う")
+    fb = numeric_scan_best_pair(
+        active_positions=active_positions,
+        exclude_pair_label=exclude_pair_label,
+        max_positions_per_currency=max_positions_per_currency,
+    )
+    if ai_error:
+        fb.setdefault("debug", {})
+        fb["debug"]["ai_candidate_error"] = ai_error
+    return fb
