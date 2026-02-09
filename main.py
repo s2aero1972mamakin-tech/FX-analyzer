@@ -2,6 +2,7 @@ import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import pandas as pd
+import math
 from datetime import datetime, timedelta
 import pytz
 import logic  # ← logic.pyが必要
@@ -25,6 +26,19 @@ st.set_page_config(layout="wide", page_title="AI-FX Analyzer 2026")
 st.title("🤖 AI連携型 USD/JPY 戦略分析ツール (SBI仕様)")
 
 TOKYO = pytz.timezone("Asia/Tokyo")
+
+# --- SBI必要証拠金（1万通貨あたり / JPY） ---
+# ユーザー提示の固定値を優先して「最大発注可能数（枚）」を計算します。
+# ※SBI側の改定があり得るので、数値は必要に応じて更新してください。
+SBI_MARGIN_10K_JPY = {
+    "USD/JPY (ドル円)": 63000,
+    "EUR/USD (ユーロドル)": 75000,
+    "GBP/USD (ポンドドル)": 86000,
+    "AUD/USD (豪ドル米ドル)": 45000,
+    "EUR/JPY (ユーロ円)": 75000,
+    "GBP/JPY (ポンド円)": 86000,
+    "AUD/JPY (豪ドル円)": 45000,
+}
 
 # --- Pair-context builder for alternative pairs (prevents hallucination / wrong indicators) ---
 def _normalize_pair_label(label: str) -> str:
@@ -213,6 +227,95 @@ def jpize_json(obj):
         return [jpize_json(x) for x in obj]
     return obj
 
+
+# --- シンプル表示ヘルパー（注文書/代替提案の見やすさ改善） ---
+def _dget(d: dict, *keys, default=""):
+    for k in keys:
+        try:
+            v = d.get(k)
+        except Exception:
+            v = None
+        if v is None:
+            continue
+        if isinstance(v, str) and v.strip() == "":
+            continue
+        return v
+    return default
+
+def render_order_summary(order: dict, pair_name: str = "", title: str = "📌 注文サマリー"):
+    """注文命令書(dict)を、エントリー判断に必要な項目だけに絞って表示する。"""
+    if not isinstance(order, dict):
+        st.markdown(order)
+        return
+
+    decision = _dget(order, "判定", "decision", default="")
+    side = _dget(order, "売買方向", "side", default="")
+    entry = _dget(order, "エントリー価格", "entry", default=0)
+    tp = _dget(order, "利確（TP）", "take_profit", "tp", default=0)
+    sl = _dget(order, "損切（SL）", "stop_loss", "sl", default=0)
+    horizon = _dget(order, "想定期間", "horizon", default="")
+    conf = _dget(order, "確信度", "confidence", default="")
+    method = _dget(order, "bundle_hint_jp", "order_bundle", "entry_price_kind_jp", default="")
+    rr = _dget(order, "rr_ratio", default="")
+
+    why = _dget(order, "理由", "why", default="")
+    regime = _dget(order, "相場モード", "market_regime", default="")
+    regime_why = _dget(order, "モード理由", "regime_why", default="")
+
+    head = f"{title}"
+    if pair_name:
+        head += f"（{pair_name}）"
+    st.subheader(head)
+
+    if str(decision) in ["取引", "TRADE"]:
+        st.success(f"✅ 判定: {decision} / 方向: {side} / 期間: {horizon} / 確信度: {conf}")
+    else:
+        st.warning(f"⛔ 判定: {decision} / 方向: {side} / 期間: {horizon} / 確信度: {conf}")
+
+    try:
+        entry_f = float(entry)
+        tp_f = float(tp)
+        sl_f = float(sl)
+        rr_f = float(rr) if rr not in ("", None) else None
+        line = f"**エントリー**: {entry_f:.3f} / **利確TP**: {tp_f:.3f} / **損切SL**: {sl_f:.3f}  \\n**注文方式**: {method}"
+        if rr_f is not None:
+            line += f" / **RR**: {rr_f:.2f}"
+        st.markdown(line)
+    except Exception:
+        st.markdown(f"**エントリー**: {entry} / **TP**: {tp} / **SL**: {sl}  \\n**注文方式**: {method}")
+
+    if why:
+        w = str(why).strip()
+        if len(w) > 220:
+            w = w[:220] + " …"
+        st.caption(f"理由: {w}")
+
+    if regime or regime_why:
+        with st.expander("相場モード（参考）"):
+            if regime:
+                st.write(f"相場モード: {regime}")
+            if regime_why:
+                st.write(regime_why)
+
+def render_alt_summary(alt: dict, title: str = "🔁 代替ペア提案サマリー"):
+    if not isinstance(alt, dict):
+        st.markdown(alt)
+        return
+    pair = _dget(alt, "推奨ペア", "best_pair_name", default="")
+    conf = _dget(alt, "確信度", "confidence", default="")
+    blocked = _dget(alt, "ブロック", "blocked", default="")
+    reason = _dget(alt, "理由", "reason", default="")
+    st.subheader(title)
+    if pair:
+        st.info(f"候補: **{pair}** / 確信度: **{conf}** / ブロック: **{blocked}**")
+    else:
+        st.warning(f"候補なし / ブロック: {blocked}")
+    if reason:
+        r = str(reason).strip()
+        if len(r) > 240:
+            r = r[:240] + " …"
+        st.caption(f"理由: {r}")
+
 # --- 状態保持の初期化 ---
 if "ai_range" not in st.session_state:
     st.session_state.ai_range = None
@@ -228,6 +331,14 @@ if "last_alt" not in st.session_state:
     st.session_state.last_alt = None
 if "last_alt_strategy" not in st.session_state:
     st.session_state.last_alt_strategy = None
+
+# ✅【追加】ロット計算機の“対象ペア”を自動追従させる（USD/JPY or 代替ペア）
+if "calc_pair_label" not in st.session_state:
+    st.session_state.calc_pair_label = "USD/JPY (ドル円)"
+if "calc_ctx" not in st.session_state:
+    st.session_state.calc_ctx = None
+if "calc_strategy" not in st.session_state:
+    st.session_state.calc_strategy = None
 
 # ✅【追加】週末判断（JSON）状態保持
 if "last_weekend" not in st.session_state:
@@ -273,9 +384,298 @@ leverage = 25  # 固定
 
 # 2. ポジション情報 (AI連動 & チャート表示用)
 st.sidebar.markdown("---")
-st.sidebar.subheader("📂 保有ポジション")
-entry_price = st.sidebar.number_input("保有価格 (円) ※なしは0", value=0.0, format="%.3f")
-trade_type = st.sidebar.radio("保有タイプ", ["買い (Long)", "売り (Short)"], index=0)
+st.sidebar.subheader("📦 ポートフォリオ（複数）")
+
+# --- ポートフォリオ概要（このツール内の管理用） ---
+def _pair_head(_label: str) -> str:
+    try:
+        return (_label or "").split()[0].strip()
+    except Exception:
+        return ""
+
+def _pair_to_ccy(_label: str):
+    head = _pair_head(_label)
+    if "/" in head and len(head) >= 7:
+        base, quote = head.split("/")[:2]
+        return base.strip()[:3], quote.strip()[:3]
+    if "/" in (_label or ""):
+        base, quote = (_label or "").split("/")[:2]
+        return base.strip()[:3], quote.strip()[:3]
+    return "UNK", "UNK"
+
+def _portfolio_summary(active_positions: list):
+    total_risk = 0.0
+    counts = {}
+    for p in active_positions or []:
+        try:
+            total_risk += float(p.get("risk_percent", p.get("risk", 0.0)) or 0.0)
+        except Exception:
+            pass
+        pair = p.get("pair") or p.get("pair_label") or p.get("pair_name") or ""
+        b, q = _pair_to_ccy(pair)
+        counts[b] = counts.get(b, 0) + 1
+        counts[q] = counts.get(q, 0) + 1
+    return float(total_risk), counts
+
+# --- 余力（証拠金）計算 & 推奨lots算出ヘルパー ---
+_ONE_LOT_UNITS = 10000  # 1枚=1万通貨
+
+def _infer_quote_ccy_from_label(pair_label: str) -> str:
+    try:
+        head = (pair_label or "").split()[0]
+        if "/" in head:
+            return head.split("/")[1].strip()[:3].upper()
+    except Exception:
+        pass
+    return "JPY"
+
+def _jpy_conversion_factor(quote_ccy: str, usd_jpy: float) -> float:
+    q = (quote_ccy or "").upper()
+    if q == "JPY":
+        return 1.0
+    if q == "USD":
+        try:
+            return float(usd_jpy) if float(usd_jpy) > 0 else 1.0
+        except Exception:
+            return 1.0
+    # 想定外（例: EUR/GBPなど）は概算扱い
+    return 1.0
+
+def _required_margin_per_lot_jpy(pair_label: str, pair_price: float, usd_jpy: float, leverage: int = 25) -> float:
+    """1枚（1万通貨）あたりの必要証拠金(JPY)。SBI固定値を優先、なければ概算。"""
+    try:
+        fixed = SBI_MARGIN_10K_JPY.get(pair_label)
+        if fixed is not None and float(fixed) > 0:
+            return float(fixed)
+    except Exception:
+        pass
+
+    quote_ccy = _infer_quote_ccy_from_label(pair_label)
+    conv = _jpy_conversion_factor(quote_ccy, usd_jpy)
+    try:
+        price = float(pair_price)
+    except Exception:
+        price = 0.0
+    notional_jpy = price * _ONE_LOT_UNITS * conv
+    try:
+        lev = int(leverage) if int(leverage) > 0 else 25
+    except Exception:
+        lev = 25
+    return notional_jpy / float(lev) if notional_jpy > 0 else 0.0
+
+def _portfolio_margin_used_jpy(active_positions: list, usd_jpy: float, leverage: int = 25) -> float:
+    total = 0.0
+    for p in active_positions or []:
+        try:
+            pair = p.get("pair") or p.get("pair_label") or p.get("pair_name") or ""
+            lots = float(p.get("lots", 0.0) or 0.0)
+            if lots <= 0:
+                continue
+            price = float(p.get("entry_price", 0.0) or 0.0)
+            m = _required_margin_per_lot_jpy(pair, price if price > 0 else usd_jpy, usd_jpy, leverage=leverage)
+            if m > 0:
+                total += m * lots
+        except Exception:
+            continue
+    return float(total)
+
+def _recommend_lots_int_and_risk(
+    pair_label: str,
+    entry: float,
+    stop_loss: float,
+    capital_jpy: float,
+    risk_percent_target: float,
+    usd_jpy: float,
+    remaining_margin_jpy: float,
+    leverage: int = 25,
+):
+    """2%ルールに沿って『実行可能な整数lots』と実質リスク%を返す。"""
+    try:
+        cap = float(capital_jpy)
+    except Exception:
+        cap = 0.0
+    try:
+        rp = float(risk_percent_target)
+    except Exception:
+        rp = 0.0
+    try:
+        e = float(entry)
+        sl = float(stop_loss)
+    except Exception:
+        return 0, 0.0, 0.0, 0.0, 0.0, _infer_quote_ccy_from_label(pair_label)
+
+    stop_w = abs(e - sl)
+    quote_ccy = _infer_quote_ccy_from_label(pair_label)
+    conv = _jpy_conversion_factor(quote_ccy, usd_jpy)
+    loss_per_lot_jpy = stop_w * _ONE_LOT_UNITS * conv
+
+    if cap <= 0 or rp <= 0 or loss_per_lot_jpy <= 0:
+        return 0, 0.0, 0.0, float(loss_per_lot_jpy), float(stop_w), quote_ccy
+
+    risk_amount = cap * (rp / 100.0)
+    safe_lots_float = risk_amount / loss_per_lot_jpy if loss_per_lot_jpy > 0 else 0.0
+    lots_int = int(math.floor(safe_lots_float + 1e-9))
+
+    # 証拠金での上限（余力）
+    req_margin_per_lot = _required_margin_per_lot_jpy(pair_label, e if e > 0 else usd_jpy, usd_jpy, leverage=leverage)
+    if req_margin_per_lot > 0:
+        try:
+            rem = float(remaining_margin_jpy)
+        except Exception:
+            rem = 0.0
+        max_lots_by_margin = int(math.floor(rem / req_margin_per_lot + 1e-9)) if rem > 0 else 0
+        lots_int = min(lots_int, max_lots_by_margin)
+
+    actual_risk_pct = (lots_int * loss_per_lot_jpy / cap * 100.0) if (cap > 0 and lots_int > 0) else 0.0
+    return int(lots_int), float(actual_risk_pct), float(req_margin_per_lot), float(loss_per_lot_jpy), float(stop_w), quote_ccy
+
+
+total_risk_pct, ccy_counts = _portfolio_summary(st.session_state.portfolio_positions)
+remain_risk_pct = float(weekly_dd_cap_percent) - float(total_risk_pct)
+
+# ✅ 余力（必要証拠金）: いま持っているポジションの合計必要証拠金と、口座余力の概算
+try:
+    _usd_jpy_est = float((st.session_state.get("quote") or (None, None))[0] or 0.0)
+except Exception:
+    _usd_jpy_est = 0.0
+if _usd_jpy_est <= 0:
+    _usd_jpy_est = 150.0  # クオート未取得時の保険（/USD換算を使う場合のみ）
+
+used_margin_jpy = _portfolio_margin_used_jpy(st.session_state.portfolio_positions, _usd_jpy_est, leverage=leverage)
+remain_margin_jpy = float(capital) - float(used_margin_jpy)
+
+st.sidebar.markdown(
+    f"**現在の保有数:** {len(st.session_state.portfolio_positions)}  /  "
+    f"**合計リスク%:** {total_risk_pct:.2f}%  /  "
+    f"**残り枠:** {remain_risk_pct:.2f}%\n"
+    f"**総必要証拠金（概算）:** ¥{used_margin_jpy:,.0f}  /  "
+    f"**余力（概算）:** ¥{remain_margin_jpy:,.0f}"
+)
+
+if remain_margin_jpy < 0:
+    st.sidebar.error("❌ 余力がマイナスです（このツール内の概算）。ポジション登録内容（枚数/証拠金）を見直してください。")
+
+# 通貨偏りの簡易表示
+if ccy_counts:
+    ccy_line = " / ".join([f"{k}:{v}" for k, v in sorted(ccy_counts.items(), key=lambda x: (-x[1], x[0]))])
+    st.sidebar.caption("通貨露出（本ツール内）: " + ccy_line)
+
+# --- 追加フォーム（1つずつ登録） ---
+pair_options = []
+try:
+    if hasattr(logic, "PAIR_MAP") and isinstance(logic.PAIR_MAP, dict):
+        pair_options = list(logic.PAIR_MAP.keys())
+except Exception:
+    pair_options = []
+if "USD/JPY (ドル円)" not in pair_options:
+    pair_options = ["USD/JPY (ドル円)"] + pair_options
+
+with st.sidebar.expander("➕ ポジションを追加（手入力）", expanded=False):
+    add_pair = st.selectbox("ペア", pair_options, index=0)
+    add_dir = st.radio("方向", ["LONG（買い）", "SHORT（売り）"], horizontal=True)
+    add_risk = st.number_input("このポジのリスク（%）", min_value=0.0, max_value=10.0, value=float(risk_percent), step=0.1)
+    add_lots = st.number_input("枚数（1枚=1万通貨）", min_value=0.0, max_value=200.0, value=1.0, step=1.0)
+    add_entry = st.number_input("建値（価格）", value=0.0, format="%.6f")
+    add_sl = st.number_input("損切（SL）※任意", value=0.0, format="%.6f")
+    add_tp = st.number_input("利確（TP）※任意", value=0.0, format="%.6f")
+    add_horizon = st.selectbox("想定期間", ["WEEK（1週間）", "MONTH（1か月）"], index=0)
+    if st.button("追加する", key="btn_add_position_manual"):
+        st.session_state.portfolio_positions.append({
+            "pair": add_pair,
+            "direction": "LONG" if "LONG" in add_dir else "SHORT",
+            "risk_percent": float(add_risk),
+            "lots": float(add_lots),
+            "entry_price": float(add_entry),
+            "stop_loss": float(add_sl) if add_sl else 0.0,
+            "take_profit": float(add_tp) if add_tp else 0.0,
+            "horizon": "MONTH" if "MONTH" in add_horizon else "WEEK",
+            "entry_time": datetime.now(TOKYO).isoformat(),
+        })
+        st.success("追加しました。")
+        st.rerun()
+
+# --- 一覧（編集/削除） ---
+with st.sidebar.expander("📋 一覧（編集/削除）", expanded=False):
+    if st.session_state.portfolio_positions:
+        _dfp = pd.DataFrame(st.session_state.portfolio_positions)
+        if "lots" not in _dfp.columns:
+            _dfp["lots"] = 0.0
+        # 表示列を整える
+        cols = [c for c in ["pair","direction","risk_percent","lots","entry_price","stop_loss","take_profit","horizon","entry_time"] if c in _dfp.columns]
+        _dfp = _dfp[cols]
+        edited = st.data_editor(
+            _dfp,
+            use_container_width=True,
+            num_rows="dynamic",
+            key="portfolio_editor",
+        )
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            if st.button("反映", key="btn_apply_portfolio_editor"):
+                recs = []
+                for r in edited.to_dict(orient="records"):
+                    if not isinstance(r, dict):
+                        continue
+                    pair = str(r.get("pair", "") or "").strip()
+                    if not pair:
+                        continue
+
+                    d_raw = str(r.get("direction", "LONG") or "").upper()
+                    direction = "SHORT" if ("SHORT" in d_raw or "売" in d_raw) else "LONG"
+
+                    h_raw = str(r.get("horizon", "WEEK") or "").upper()
+                    horizon = "MONTH" if ("MONTH" in h_raw or "1か月" in h_raw) else "WEEK"
+
+                    def _to_float(v, default=0.0):
+                        try:
+                            return float(v)
+                        except Exception:
+                            return float(default)
+
+                    recs.append({
+                        "pair": pair,
+                        "direction": direction,
+                        "risk_percent": _to_float(r.get("risk_percent", 0.0), 0.0),
+                        "lots": _to_float(r.get("lots", 0.0), 0.0),
+                        "entry_price": _to_float(r.get("entry_price", 0.0), 0.0),
+                        "stop_loss": _to_float(r.get("stop_loss", 0.0), 0.0),
+                        "take_profit": _to_float(r.get("take_profit", 0.0), 0.0),
+                        "horizon": horizon,
+                        "entry_time": r.get("entry_time") or datetime.now(TOKYO).isoformat(),
+                    })
+
+                st.session_state.portfolio_positions = recs
+                st.success("反映しました。")
+                st.rerun()
+        with c2:
+            del_idx = st.number_input("削除行（0始まり）", min_value=0, max_value=max(0, len(st.session_state.portfolio_positions)-1), value=0, step=1)
+            if st.button("削除", key="btn_delete_portfolio_row"):
+                try:
+                    st.session_state.portfolio_positions.pop(int(del_idx))
+                    st.success("削除しました。")
+                    st.rerun()
+                except Exception:
+                    st.error("削除に失敗しました。")
+        with c3:
+            if st.button("全クリア", key="btn_clear_portfolio"):
+                st.session_state.portfolio_positions = []
+                st.warning("全ポジションをクリアしました。")
+                st.rerun()
+    else:
+        st.caption("まだポジションは登録されていません。")
+
+# --- 互換用: 既存ロジックが参照する単一保有（USD/JPY）の入力値をポートフォリオから抽出 ---
+entry_price = 0.0
+trade_type = "買い (Long)"
+try:
+    for p in reversed(st.session_state.portfolio_positions or []):
+        head = ((p.get("pair") or "").split()[0] if p.get("pair") else "")
+        if head == "USD/JPY":
+            entry_price = float(p.get("entry_price") or 0.0)
+            trade_type = "買い (Long)" if str(p.get("direction","")).upper() == "LONG" else "売り (Short)"
+            break
+except Exception:
+    pass
 
 # --- クオート更新 ---
 st.sidebar.markdown("---")
@@ -410,11 +810,31 @@ if st.session_state.ai_range:
     fig_main.add_trace(go.Scatter(x=view_x, y=[high_val, high_val], name=f"予想最高:{high_val:.2f}", line=dict(color="red", width=2, dash="dash")), row=1, col=1)
     fig_main.add_trace(go.Scatter(x=view_x, y=[low_val, low_val], name=f"予想最低:{low_val:.2f}", line=dict(color="green", width=2, dash="dash")), row=1, col=1)
 
-# ★ ポジション連動表示機能 (青・ピンク線)
-if entry_price > 0:
-    line_color = "blue" if "買い" in trade_type else "magenta"
-    pos_name = f"保有:{entry_price:.2f}"
-    fig_main.add_trace(go.Scatter(x=[start_view, last_date], y=[entry_price, entry_price], name=pos_name, line=dict(color=line_color, width=2, dash="dashdot")), row=1, col=1)
+# ★ ポートフォリオ連動表示（USD/JPYのみを本チャートに重ねる）
+try:
+    for p in st.session_state.portfolio_positions or []:
+        pair = (p.get("pair") or "").strip()
+        head = (pair.split()[0] if pair else "")
+        if head != "USD/JPY":
+            continue
+        ep = float(p.get("entry_price") or 0.0)
+        if ep <= 0:
+            continue
+        direction = (p.get("direction") or "").upper()
+        line_color = "blue" if direction == "LONG" else "magenta"
+        pos_name = f"{pair} 保有:{ep:.2f}"
+        fig_main.add_trace(
+            go.Scatter(
+                x=[start_view, last_date],
+                y=[ep, ep],
+                name=pos_name,
+                line=dict(color=line_color, width=2, dash="dashdot"),
+            ),
+            row=1, col=1
+        )
+except Exception:
+    pass
+
 
 fig_main.add_trace(go.Scatter(x=df.index, y=df["US10Y"], name="米10年債", line=dict(color="cyan"), showlegend=True), row=2, col=1)
 
@@ -438,36 +858,130 @@ with col_rsi:
     fig_rsi.update_layout(height=200, template="plotly_dark", yaxis=dict(range=[0, 100]), margin=dict(l=10, r=10, t=20, b=20))
     st.plotly_chart(fig_rsi, use_container_width=True)
 
+
 with col_calc:
     one_lot_units = 10000
-    required_margin_per_lot = (current_rate * one_lot_units) / leverage
-    max_lots = int(capital / required_margin_per_lot)
+
+    # ✅「直近に生成した注文書（USD/JPY or 代替ペア）」に追従するロット計算
+    calc_pair = st.session_state.get("calc_pair_label") or "USD/JPY (ドル円)"
+    calc_ctx = st.session_state.get("calc_ctx") or {}
+    calc_strategy = st.session_state.get("calc_strategy") or {}
+
+    # 価格（対象ペア）
+    try:
+        pair_price = float(calc_ctx.get("price", current_rate))
+    except Exception:
+        pair_price = float(current_rate)
+
+    # 通貨ペアのクオート通貨を推定（JPY or USD）
+    head = (calc_pair or "").split()[0]
+    quote_ccy = "JPY"
+    try:
+        if "/" in head:
+            quote_ccy = head.split("/")[1].strip()[:3].upper()
+    except Exception:
+        quote_ccy = "JPY"
+
+    # 口座通貨JPYへの換算係数（JPY建てなら1、USD建てならUSDJPYで換算）
+    usd_jpy = float(current_rate)  # USD/JPYの現在値（JPY=X）
+    if quote_ccy == "JPY":
+        conv = 1.0
+        unit_label = "円"
+        step = 0.1
+        default_manual = 0.5
+    elif quote_ccy == "USD":
+        conv = usd_jpy
+        unit_label = "USD"
+        step = 0.0005
+        default_manual = 0.005
+    else:
+        # ここに来るのは今のPAIR_MAPではほぼ無い想定（念のため）
+        conv = 1.0
+        unit_label = quote_ccy
+        step = 0.0005
+        default_manual = 0.005
+        st.warning(f"⚠️ ロット計算: クオート通貨が {quote_ccy} のため、厳密なJPY換算ができません。概算表示になります。")
+
+    # 注文書がTRADEなら「SL幅（価格差）」を自動採用（＝手入力なしで2%判定できる）
+    auto_stop_width = None
+    try:
+        if isinstance(calc_strategy, dict) and (calc_strategy.get("decision") == "TRADE"):
+            e = float(calc_strategy.get("entry", 0.0) or 0.0)
+            sl = float(calc_strategy.get("stop_loss", 0.0) or 0.0)
+            if e > 0 and sl > 0:
+                auto_stop_width = abs(e - sl)
+    except Exception:
+        auto_stop_width = None
+
+    # ✅ いまのポートフォリオ合計の必要証拠金/余力（概算）
+    used_margin_jpy_now = _portfolio_margin_used_jpy(st.session_state.portfolio_positions, usd_jpy, leverage=leverage)
+    remain_margin_jpy_now = float(capital) - float(used_margin_jpy_now)
+    if remain_margin_jpy_now < 0:
+        remain_margin_jpy_now = 0.0
 
     st.markdown("#### 🧮 リスク管理 vs 全力シミュレーション")
-    stop_p = st.number_input("想定損切幅 (円) ※例: 0.5円逆行で損切", value=0.5, step=0.1)
+    st.caption(
+        f"対象ペア: **{calc_pair}**（クオート通貨: {quote_ccy}） / 許容DD: {risk_percent:.1f}% / 週DDキャップ: {weekly_dd_cap_percent:.1f}%  |  "
+        f"総必要証拠金: ¥{used_margin_jpy_now:,.0f} / 余力: ¥{remain_margin_jpy_now:,.0f}"
+    )
 
-    if stop_p > 0:
-        risk_amount = capital * (risk_percent / 100)
-        safe_lots = risk_amount / (stop_p * one_lot_units)
+    # 損切幅（価格差）: 注文書があれば自動、なければ手入力（USD/JPY基準の初期値）
+    default_stop = float(auto_stop_width) if auto_stop_width is not None else float(default_manual)
+    stop_w = st.number_input(
+        f"想定損切幅（価格差: {unit_label}）※ 注文書がTRADEならSL幅を自動で初期値に設定",
+        value=default_stop,
+        step=step,
+        format="%.6f" if quote_ccy == "USD" else "%.3f",
+        key="lot_stop_width_input"
+    )
+
+    # 1枚（=1万通貨）の想定損失額（JPY換算）
+    loss_per_lot_jpy = abs(float(stop_w)) * one_lot_units * float(conv)
+
+    # 証拠金（JPY換算）
+    # ✅SBIの「必要証拠金（1万通貨あたり）」固定値がある場合はそれを優先
+    _fixed_margin = None
+    try:
+        _fixed_margin = float(SBI_MARGIN_10K_JPY.get(calc_pair)) if isinstance(SBI_MARGIN_10K_JPY, dict) else None
+    except Exception:
+        _fixed_margin = None
+
+    if _fixed_margin and _fixed_margin > 0:
+        required_margin_per_lot = float(_fixed_margin)
+        margin_mode = "SBI固定"
+    else:
+        # フォールバック（概算）: 名目金額/レバレッジ
+        notional_jpy = float(pair_price) * one_lot_units * float(conv)
+        required_margin_per_lot = notional_jpy / leverage if leverage else notional_jpy
+        margin_mode = "概算"
+
+    max_lots = int(remain_margin_jpy_now / required_margin_per_lot) if required_margin_per_lot > 0 else 0
+
+    if stop_w and float(stop_w) > 0:
+        risk_amount = capital * (risk_percent / 100.0)
+        safe_lots = (risk_amount / loss_per_lot_jpy) if loss_per_lot_jpy > 0 else 0.0
 
         c1, c2 = st.columns(2)
         with c1:
             st.error(f"""
-            **💀 限界 (レバレッジ25倍)**
-            - 必要証拠金/枚: ¥{required_margin_per_lot:,.0f}
+            **💀 限界 (レバレッジ{leverage}倍)**
+            - 対象ペア価格: {pair_price:.6f} ({unit_label})
+            - 必要証拠金/枚({margin_mode}): ¥{required_margin_per_lot:,.0f}
             - **最大発注可能数: {max_lots} 枚**
             """)
         with c2:
             st.success(f"""
-            **🛡️ 推奨 (安全重視)**
+            **🛡️ 推奨 (安全重視: {risk_percent:.1f}%)**
             - 許容損失額: ¥{risk_amount:,.0f}
-            - **推奨発注数量: {safe_lots:.1f} 枚**
+            - 1枚の想定損失: ¥{loss_per_lot_jpy:,.0f}
+            - **推奨発注数量: {safe_lots:.2f} 枚**
             """)
 
-        if safe_lots > max_lots:
-            st.warning("⚠️ 注意：リスク許容範囲内ですが、証拠金不足で発注できない可能性があります。")
+        if safe_lots > max_lots and max_lots > 0:
+            st.warning("⚠️ 注意：リスク許容内でも証拠金不足で発注できない可能性があります。")
         elif safe_lots < 0.1:
-            st.warning("⚠️ 注意：損切幅が広すぎるか資金不足のため、取引推奨外です。")
+            st.warning("⚠️ 注意：損切幅が広すぎる/資金が小さいため、この条件では取引推奨外です（あなたの2%ルールに従うなら見送りが安全）。")
+
 
 # --- 5. 通貨強弱 ---
 if strength is not None and not strength.empty:
@@ -496,6 +1010,7 @@ ctx = {
     "current_time": q_time.strftime("%H:%M") if q_time else "不明",
     "is_gotobi": datetime.now(TOKYO).day in [5, 10, 15, 20, 25, 30],
     "capital": capital,
+    "active_positions": st.session_state.portfolio_positions,
     "entry_price": entry_price,
     "trade_type": trade_type
 }
@@ -525,6 +1040,10 @@ with tab2:
                     ctx["panel_short"] = diag['short']['status'] if diag else "不明"
                     ctx["panel_mid"] = diag['mid']['status'] if diag else "不明"
                     st.session_state.last_strategy = logic.get_ai_order_strategy(api_key, ctx)
+                    # ✅ ロット計算機は「直近に生成した注文書のペア」に自動追従
+                    st.session_state.calc_pair_label = "USD/JPY (ドル円)"
+                    st.session_state.calc_ctx = dict(ctx)
+                    st.session_state.calc_strategy = st.session_state.last_strategy
                     # 注文命令書を作り直したら、代替ペア関連のキャッシュはリセット（誤爆防止）
                     st.session_state.last_alt = None
                     st.session_state.last_alt_strategy = None
@@ -532,19 +1051,68 @@ with tab2:
             st.warning("Gemini API Key を入力してください。")
 
     # --- 直近の注文命令書を表示（ボタン押下後も表示が残る） ---
+    simple_view = st.checkbox('✅ 表示をシンプルにする（推奨）', value=True, key='simple_view')
     strategy = st.session_state.get("last_strategy") or {}
     if strategy:
         st.info("AI診断およびパネル診断との整合性を確認しました。")
-        if isinstance(strategy, dict):
-            st.json(jpize_json(strategy))
+        if simple_view and isinstance(strategy, dict):
+            render_order_summary(jpize_json(strategy), pair_name="USD/JPY (ドル円)", title="📌 注文サマリー")
+            with st.expander("詳細（JSON）"):
+                st.json(jpize_json(strategy))
         else:
-            st.markdown(strategy)
+            if isinstance(strategy, dict):
+                st.json(jpize_json(strategy))
+            else:
+                st.markdown(strategy)
 
         decision = ""
         try:
             decision = strategy.get("decision") if isinstance(strategy, dict) else ""
         except Exception:
             decision = ""
+
+        # ✅ USD/JPYがTRADEなら、そのままポートフォリオに登録（週末判断/翌週制限のため）
+        if decision == "TRADE" and isinstance(strategy, dict):
+            if st.button("➕ ポートフォリオに登録: USD/JPY (ドル円)", key="btn_add_usdjpy_to_portfolio"):
+                # ✅ 2%ルールに沿った「実行可能lots」を自動で保存（SBIは1枚=1万通貨）
+                usd_jpy_now = float(current_rate)
+                used_m = _portfolio_margin_used_jpy(st.session_state.portfolio_positions, usd_jpy_now, leverage=leverage)
+                remain_m = float(capital) - float(used_m)
+                if remain_m < 0:
+                    remain_m = 0.0
+
+                e = float(strategy.get("entry") or ctx.get("price", 0.0) or 0.0)
+                sl = float(strategy.get("stop_loss") or 0.0)
+                tp = float(strategy.get("take_profit") or 0.0)
+
+                lots_int, risk_actual_pct, req_margin_per_lot, loss_per_lot_jpy, stop_w, quote_ccy = _recommend_lots_int_and_risk(
+                    "USD/JPY (ドル円)", e, sl, float(capital), float(risk_percent), usd_jpy_now, remain_m, leverage=leverage
+                )
+
+                if lots_int < 1:
+                    st.error(
+                        "❌ 登録不可：2%ルール（損切幅）または余力（証拠金）から算出すると『発注できる枚数が0枚』です。"
+                        f"（損切幅={stop_w:.6f} / 1枚想定損失=¥{loss_per_lot_jpy:,.0f} / 余力=¥{remain_m:,.0f}）"
+                    )
+                else:
+                    if not logic.can_open_under_weekly_cap(st.session_state.portfolio_positions, float(risk_actual_pct), float(weekly_dd_cap_percent)):
+                        st.error("週単位DDキャップを超えるため登録できません。")
+                    elif logic.violates_currency_concentration("USD/JPY (ドル円)", st.session_state.portfolio_positions, int(max_positions_per_currency)):
+                        st.error("通貨集中フィルタにより登録できません。")
+                    else:
+                        st.session_state.portfolio_positions.append({
+                            "pair": "USD/JPY (ドル円)",
+                            "direction": "LONG" if strategy.get("side") == "LONG" else "SHORT",
+                            "risk_percent": float(risk_actual_pct),  # 実質リスク%（整数lotsに丸めた後）
+                            "lots": float(lots_int),
+                            "entry_price": float(e),
+                            "stop_loss": float(sl),
+                            "take_profit": float(tp),
+                            "horizon": str(strategy.get("horizon") or "WEEK"),
+                            "entry_time": datetime.now(TOKYO).isoformat(),
+                        })
+                        st.success(f"ポートフォリオに登録しました（{lots_int}枚 / 実質リスク={risk_actual_pct:.2f}% / 必要証拠金=¥{req_margin_per_lot*lots_int:,.0f}）。")
+                        st.rerun()
 
         # ✅ ドル円が見送りなら、代替ペア提案（週DDキャップ＆通貨集中フィルタ適用）
         effective_no_trade = (decision == "NO_TRADE") or bool(force_no_trade_debug)
@@ -567,7 +1135,12 @@ with tab2:
                 )
 
             alt = st.session_state.get("last_alt") or {}
-            st.json(jpize_json(alt))
+            if simple_view and isinstance(alt, dict):
+                render_alt_summary(jpize_json(alt))
+                with st.expander("詳細（JSON）"):
+                    st.json(jpize_json(alt))
+            else:
+                st.json(jpize_json(alt))
 
             if isinstance(alt, dict) and alt.get("best_pair_name"):
                 best_pair = alt["best_pair_name"]
@@ -582,31 +1155,72 @@ with tab2:
                     if not alt_ctx.get("_pair_ctx_ok"):
                         st.warning("⚠️ 代替ペアの最新テクニカル（RSI/ATR等）が取得できませんでした。精度が落ちるため、原則ノートレ推奨です。")
                     st.session_state.last_alt_strategy = logic.get_ai_order_strategy(api_key, alt_ctx)
+                    # ✅ ロット計算機は「代替ペアの注文書」に自動追従
+                    st.session_state.calc_pair_label = best_pair
+                    st.session_state.calc_ctx = dict(alt_ctx)
+                    st.session_state.calc_strategy = st.session_state.last_alt_strategy
 
                 alt_strategy = st.session_state.get("last_alt_strategy")
                 if alt_strategy:
                     st.subheader("代替ペアの注文戦略")
-                    if isinstance(alt_strategy, dict):
-                        st.json(jpize_json(alt_strategy))
+                    if simple_view and isinstance(alt_strategy, dict):
+                        render_order_summary(jpize_json(alt_strategy), pair_name=best_pair, title="📌 代替ペア注文サマリー")
+                        with st.expander("詳細（JSON）"):
+                            st.json(jpize_json(alt_strategy))
                     else:
-                        st.markdown(alt_strategy)
+                        if isinstance(alt_strategy, dict):
+                            st.json(jpize_json(alt_strategy))
+                        else:
+                            st.markdown(alt_strategy)
 
                     # 代替ペアがTRADEならワンクリックでポートフォリオに登録
                     if isinstance(alt_strategy, dict) and alt_strategy.get("decision") == "TRADE":
                         if st.button(f"➕ ポートフォリオに登録: {best_pair}", key="btn_add_alt_to_portfolio"):
-                            if not logic.can_open_under_weekly_cap(st.session_state.portfolio_positions, float(risk_percent), float(weekly_dd_cap_percent)):
-                                st.error("週単位DDキャップを超えるため登録できません。")
-                            elif logic.violates_currency_concentration(best_pair, st.session_state.portfolio_positions, int(max_positions_per_currency)):
-                                st.error("通貨集中フィルタにより登録できません。")
+                            # ✅ 代替ペアでも、2%ルールに沿って「実行可能lots」を自動保存
+                            usd_jpy_now = float(current_rate)
+                            used_m = _portfolio_margin_used_jpy(st.session_state.portfolio_positions, usd_jpy_now, leverage=leverage)
+                            remain_m = float(capital) - float(used_m)
+                            if remain_m < 0:
+                                remain_m = 0.0
+
+                            # 直近の代替ペアctxを優先（価格/指標が正しい）
+                            if st.session_state.get("calc_pair_label") == best_pair and isinstance(st.session_state.get("calc_ctx"), dict):
+                                alt_ctx_reg = st.session_state.get("calc_ctx")
                             else:
-                                st.session_state.portfolio_positions.append({
-                                    "pair": best_pair,
-                                    "direction": "LONG" if (isinstance(alt_strategy, dict) and alt_strategy.get("side") == "LONG") else "SHORT",
-                                    "risk_percent": float(risk_percent),
-                                    "entry_price": float((alt_strategy.get("entry") if isinstance(alt_strategy, dict) else 0.0) or ctx.get("price", 0.0) or 0.0),
-                                    "entry_time": datetime.now(TOKYO).isoformat()
-                                })
-                                st.success("ポートフォリオに登録しました。")
+                                alt_ctx_reg = _build_ctx_for_pair(best_pair, ctx, us10y_raw)
+
+                            e = float((alt_strategy.get("entry") if isinstance(alt_strategy, dict) else 0.0) or alt_ctx_reg.get("price", 0.0) or 0.0)
+                            sl = float((alt_strategy.get("stop_loss") if isinstance(alt_strategy, dict) else 0.0) or 0.0)
+                            tp = float((alt_strategy.get("take_profit") if isinstance(alt_strategy, dict) else 0.0) or 0.0)
+
+                            lots_int, risk_actual_pct, req_margin_per_lot, loss_per_lot_jpy, stop_w, quote_ccy = _recommend_lots_int_and_risk(
+                                best_pair, e, sl, float(capital), float(risk_percent), usd_jpy_now, remain_m, leverage=leverage
+                            )
+
+                            if lots_int < 1:
+                                st.error(
+                                    "❌ 登録不可：2%ルール（損切幅）または余力（証拠金）から算出すると『発注できる枚数が0枚』です。"
+                                    f"（損切幅={stop_w:.6f} / 1枚想定損失=¥{loss_per_lot_jpy:,.0f} / 余力=¥{remain_m:,.0f}）"
+                                )
+                            else:
+                                if not logic.can_open_under_weekly_cap(st.session_state.portfolio_positions, float(risk_actual_pct), float(weekly_dd_cap_percent)):
+                                    st.error("週単位DDキャップを超えるため登録できません。")
+                                elif logic.violates_currency_concentration(best_pair, st.session_state.portfolio_positions, int(max_positions_per_currency)):
+                                    st.error("通貨集中フィルタにより登録できません。")
+                                else:
+                                    st.session_state.portfolio_positions.append({
+                                        "pair": best_pair,
+                                        "direction": "LONG" if (isinstance(alt_strategy, dict) and alt_strategy.get("side") == "LONG") else "SHORT",
+                                        "risk_percent": float(risk_actual_pct),
+                                        "lots": float(lots_int),
+                                        "entry_price": float(e),
+                                        "stop_loss": float(sl),
+                                        "take_profit": float(tp),
+                                        "horizon": str((alt_strategy.get("horizon") if isinstance(alt_strategy, dict) else "WEEK") or "WEEK"),
+                                        "entry_time": datetime.now(TOKYO).isoformat(),
+                                    })
+                                    st.success(f"ポートフォリオに登録しました（{lots_int}枚 / 実質リスク={risk_actual_pct:.2f}% / 必要証拠金=¥{req_margin_per_lot*lots_int:,.0f}）。")
+                                    st.rerun()
             else:
                 st.info("条件を満たす代替ペアがないため、今週は完全ノートレ推奨です。")
 with tab3:
