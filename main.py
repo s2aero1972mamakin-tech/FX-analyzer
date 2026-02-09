@@ -119,6 +119,60 @@ def _build_ctx_for_pair(pair_label: str, base_ctx: dict, us10y_raw):
 
 
 
+
+def _get_df_for_pair(pair_label: str, us10y_raw):
+    """
+    チャート表示用に、指定ペアのOHLCを取得して指標計算したDataFrameを返す。
+    - USD/JPY以外の代替ペアでも「グラフ1」を切り替えられるようにするため。
+    - 失敗時は None を返す。
+    """
+    pair_label = _normalize_pair_label(pair_label)
+    sym = None
+    try:
+        sym = getattr(logic, "PAIR_MAP", {}).get(pair_label)
+    except Exception:
+        sym = None
+    if not sym:
+        try:
+            if hasattr(logic, "_pair_label_to_symbol"):
+                sym = logic._pair_label_to_symbol(pair_label)
+        except Exception:
+            sym = None
+    if not sym:
+        return None
+
+    try:
+        raw = None
+        if hasattr(logic, "_fetch_ohlc"):
+            raw = logic._fetch_ohlc(sym, period="1y", interval="1d")
+        elif hasattr(logic, "_yahoo_chart"):
+            raw = logic._yahoo_chart(sym, rng="1y", interval="1d")
+        df2 = logic.calculate_indicators(raw, us10y_raw) if raw is not None else None
+        if df2 is None or df2.empty:
+            return None
+        df2.index = pd.to_datetime(df2.index)
+        return df2
+    except Exception:
+        return None
+
+
+def _strategy_to_overlay(pair_label: str, strategy: dict):
+    """注文戦略dictから、チャートに重ねるEntry/TP/SLライン情報を抽出してsessionに保持する。"""
+    if not isinstance(strategy, dict):
+        return None
+    if strategy.get("decision") != "TRADE":
+        return None
+    try:
+        entry = float(strategy.get("entry", 0) or 0)
+        tp = float(strategy.get("take_profit", 0) or 0)
+        sl = float(strategy.get("stop_loss", 0) or 0)
+    except Exception:
+        return None
+    if entry <= 0 or tp <= 0 or sl <= 0:
+        return None
+    return {"pair_label": _normalize_pair_label(pair_label), "entry": entry, "tp": tp, "sl": sl}
+
+
 # --- 表示用: JSONキーを日本語化（注文命令書・代替提案の表示専用）---
 _KEY_JP = {
     # 注文命令書
@@ -141,6 +195,9 @@ _KEY_JP = {
     "blocked_by": "ブロック理由",
     "candidates": "候補",
     "pair": "ペア",
+    "status": "状態",
+    "rejected_by": "落選理由",
+    "source": "出典",
 
     # 参考（ctx / ポートフォリオ表示などで使う可能性）
     "pair_label": "ペア",
@@ -332,6 +389,37 @@ def render_alt_summary(alt: dict, title: str = "🔁 代替ペア提案サマリ
             r = r[:240] + " …"
         st.caption(f"理由: {r}")
 
+
+    # ✅ 候補（最大3）と「落選理由」を表示（学習＋監査＝事故防止）
+    cand = alt.get("候補") if isinstance(alt.get("候補"), list) else alt.get("candidates")
+    if isinstance(cand, list) and cand:
+        st.markdown("**候補（最大3）**")
+        for i, c in enumerate(cand[:3], start=1):
+            if not isinstance(c, dict):
+                continue
+            p = _dget(c, "ペア", "pair", default="")
+            conf2 = _dget(c, "確信度", "confidence", default="")
+            stt = _dget(c, "状態", "status", default="")
+            rej = _dget(c, "落選理由", "rejected_by", default=[])
+            if isinstance(rej, list):
+                rej_txt = ", ".join([str(x) for x in rej if str(x).strip()])
+            else:
+                rej_txt = str(rej).strip()
+            # ステータスの日本語化
+            if stt == "SELECTED":
+                stt_jp = "採用"
+            elif stt == "REJECTED":
+                stt_jp = "落選"
+            elif stt == "CANDIDATE":
+                stt_jp = "候補"
+            else:
+                stt_jp = str(stt) if stt else "候補"
+
+            line = f"{i}. {p}（{stt_jp} / 確信度:{conf2}）"
+            if rej_txt:
+                line += f" / 落選理由: {rej_txt}"
+            st.caption(line)
+
 # --- 状態保持の初期化 ---
 if "ai_range" not in st.session_state:
     st.session_state.ai_range = None
@@ -364,6 +452,20 @@ if "last_weekend" not in st.session_state:
 if "portfolio_positions" not in st.session_state:
     # 各要素: {"pair": str, "direction": "LONG/SHORT", "risk_percent": float, "entry_price": float, "entry_time": iso}
     st.session_state.portfolio_positions = []
+
+# ✅【追加】チャート表示の対象ペア（USD/JPY or 代替ペア）
+if "chart_pair_label" not in st.session_state:
+    st.session_state.chart_pair_label = "USD/JPY (ドル円)"
+# ✅【追加】チャート重ね表示ライン（entry/tp/sl）
+if "chart_overlay" not in st.session_state:
+    st.session_state.chart_overlay = None
+
+# ✅【追加】代替候補の評価（最大3）を表示するための保持
+if "last_alt" not in st.session_state:
+    st.session_state.last_alt = None
+if "last_alt_strategy" not in st.session_state:
+    st.session_state.last_alt_strategy = None
+
 
 # --- APIキー取得 ---
 try:
@@ -586,7 +688,7 @@ except Exception:
 if "USD/JPY (ドル円)" not in pair_options:
     pair_options = ["USD/JPY (ドル円)"] + pair_options
 
-with st.sidebar.expander("➕ ポジションを追加", expanded=False):
+with st.sidebar.expander("➕ ポジションを追加（手入力）", expanded=False):
     add_pair = st.selectbox("ペア", pair_options, index=0)
     add_dir = st.radio("方向", ["LONG（買い）", "SHORT（売り）"], horizontal=True)
     add_risk = st.number_input("このポジのリスク（%）", min_value=0.0, max_value=10.0, value=float(risk_percent), step=0.1)
@@ -675,6 +777,7 @@ with st.sidebar.expander("📋 一覧（編集/削除）", expanded=False):
         with c3:
             if st.button("全クリア", key="btn_clear_portfolio"):
                 st.session_state.portfolio_positions = []
+
                 st.warning("全ポジションをクリアしました。")
                 st.rerun()
     else:
@@ -758,7 +861,7 @@ y_min_view = float(df_view["Low"].min())
 y_max_view = float(df_view["High"].max())
 
 # ✅ AI予想ラインがチャート範囲外に出ても表示されるよう、Y軸レンジに予想高安を含める
-if st.session_state.ai_range:
+if (chart_pair_label == "USD/JPY (ドル円)") and st.session_state.ai_range:
     try:
         _hi, _lo = st.session_state.ai_range
         y_min_view = min(y_min_view, float(_lo))
@@ -810,19 +913,52 @@ with col_slip:
     st.info(f"🛡️ 推奨スリップロス: **{rec_slip} pips** (ATR:{current_atr:.3f})")
 
 # --- 3. メインチャート (AI予想ライン & ポジション表示対応) ---
+
+# ✅ チャート表示対象（USD/JPY or 代替ペア）を切替
+chart_pair_label = st.session_state.get("chart_pair_label") or "USD/JPY (ドル円)"
+df_chart = df
+chart_title = "USD/JPY & AI予想"
+
+if chart_pair_label != "USD/JPY (ドル円)":
+    df_alt_chart = _get_df_for_pair(chart_pair_label, us10y_raw)
+    if df_alt_chart is not None and not df_alt_chart.empty:
+        df_chart = df_alt_chart
+        chart_title = f"{chart_pair_label}（代替チャート）"
+    else:
+        st.warning("⚠️ 代替ペアのチャートデータ取得に失敗したため、USD/JPYへ戻しました。")
+        chart_pair_label = "USD/JPY (ドル円)"
+        st.session_state.chart_pair_label = chart_pair_label
+        df_chart = df
+        chart_title = "USD/JPY & AI予想"
+
+# チャート用の表示レンジ（45日）
+chart_last_date = df_chart.index[-1]
+chart_start_view = chart_last_date - timedelta(days=45)
+df_chart_view = df_chart.loc[df_chart.index >= chart_start_view]
+y_min_view_chart = float(df_chart_view["Low"].min())
+y_max_view_chart = float(df_chart_view["High"].max())
+
+st.caption(f"📈 表示チャート: **{chart_pair_label}**")
+if chart_pair_label != "USD/JPY (ドル円)":
+    if st.button("↩️ USD/JPYチャートに戻す", key="btn_chart_back_usdjpy"):
+        st.session_state.chart_pair_label = "USD/JPY (ドル円)"
+        st.session_state.chart_overlay = None
+        st.rerun()
+
+
 fig_main = make_subplots(
     rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
-    subplot_titles=("USD/JPY & AI予想", "米国債10年物利回り"), row_heights=[0.7, 0.3]
+    subplot_titles=(chart_title, "米国債10年物利回り"), row_heights=[0.7, 0.3]
 )
-fig_main.add_trace(go.Candlestick(x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name="価格"), row=1, col=1)
-fig_main.add_trace(go.Scatter(x=df.index, y=df["SMA_5"], name="5日線", line=dict(color="#00ff00", width=1.5)), row=1, col=1)
-fig_main.add_trace(go.Scatter(x=df.index, y=df["SMA_25"], name="25日線", line=dict(color="orange", width=2)), row=1, col=1)
-fig_main.add_trace(go.Scatter(x=df.index, y=df["SMA_75"], name="75日線", line=dict(color="gray", width=1, dash="dot")), row=1, col=1)
+fig_main.add_trace(go.Candlestick(x=df_chart.index, open=df_chart["Open"], high=df_chart["High"], low=df_chart["Low"], close=df_chart["Close"], name="価格"), row=1, col=1)
+fig_main.add_trace(go.Scatter(x=df_chart.index, y=df_chart["SMA_5"], name="5日線", line=dict(color="#00ff00", width=1.5)), row=1, col=1)
+fig_main.add_trace(go.Scatter(x=df_chart.index, y=df_chart["SMA_25"], name="25日線", line=dict(color="orange", width=2)), row=1, col=1)
+fig_main.add_trace(go.Scatter(x=df_chart.index, y=df_chart["SMA_75"], name="75日線", line=dict(color="gray", width=1, dash="dot")), row=1, col=1)
 
 # ★ AI予想ライン表示機能 (赤・緑点線)
-if st.session_state.ai_range:
+if (chart_pair_label == "USD/JPY (ドル円)") and st.session_state.ai_range:
     high_val, low_val = st.session_state.ai_range
-    view_x = [start_view, last_date]
+    view_x = [chart_start_view, chart_last_date]
     fig_main.add_trace(go.Scatter(x=view_x, y=[high_val, high_val], name=f"予想最高:{high_val:.2f}", line=dict(color="red", width=2, dash="dash")), row=1, col=1)
     fig_main.add_trace(go.Scatter(x=view_x, y=[low_val, low_val], name=f"予想最低:{low_val:.2f}", line=dict(color="green", width=2, dash="dash")), row=1, col=1)
 
@@ -841,7 +977,7 @@ try:
         pos_name = f"{pair} 保有:{ep:.2f}"
         fig_main.add_trace(
             go.Scatter(
-                x=[start_view, last_date],
+                x=[chart_start_view, chart_last_date],
                 y=[ep, ep],
                 name=pos_name,
                 line=dict(color=line_color, width=2, dash="dashdot"),
@@ -852,11 +988,26 @@ except Exception:
     pass
 
 
-fig_main.add_trace(go.Scatter(x=df.index, y=df["US10Y"], name="米10年債", line=dict(color="cyan"), showlegend=True), row=2, col=1)
 
-fig_main.update_xaxes(range=[start_view, last_date], row=1, col=1)
-fig_main.update_xaxes(range=[start_view, last_date], matches='x', row=2, col=1)
-fig_main.update_yaxes(range=[y_min_view * 0.998, y_max_view * 1.002], autorange=False, row=1, col=1)
+# ✅ 注文戦略（Entry/TP/SL）をチャートに重ね表示（代替ペア切替対応）
+overlay = st.session_state.get("chart_overlay")
+if isinstance(overlay, dict) and _normalize_pair_label(overlay.get("pair_label", "")) == _normalize_pair_label(chart_pair_label):
+    try:
+        e = float(overlay.get("entry", 0))
+        tp = float(overlay.get("tp", 0))
+        sl = float(overlay.get("sl", 0))
+        view_x2 = [chart_start_view, chart_last_date]
+        fig_main.add_trace(go.Scatter(x=view_x2, y=[e, e], name=f"Entry:{e:.3f}", line=dict(color="yellow", width=2, dash="dot")), row=1, col=1)
+        fig_main.add_trace(go.Scatter(x=view_x2, y=[tp, tp], name=f"TP:{tp:.3f}", line=dict(color="lime", width=2, dash="dot")), row=1, col=1)
+        fig_main.add_trace(go.Scatter(x=view_x2, y=[sl, sl], name=f"SL:{sl:.3f}", line=dict(color="orange", width=2, dash="dot")), row=1, col=1)
+    except Exception:
+        pass
+
+fig_main.add_trace(go.Scatter(x=df_chart.index, y=df_chart["US10Y"], name="米10年債", line=dict(color="cyan"), showlegend=True), row=2, col=1)
+
+fig_main.update_xaxes(range=[chart_start_view, chart_last_date], row=1, col=1)
+fig_main.update_xaxes(range=[chart_start_view, chart_last_date], matches='x', row=2, col=1)
+fig_main.update_yaxes(range=[y_min_view_chart * 0.998, y_max_view_chart * 1.002], autorange=False, row=1, col=1)
 fig_main.update_layout(height=650, template="plotly_dark", xaxis_rangeslider_visible=False, showlegend=True, margin=dict(r=10, l=10))
 st.plotly_chart(fig_main, use_container_width=True)
 
@@ -1071,6 +1222,12 @@ with tab2:
                     ctx["panel_short"] = diag['short']['status'] if diag else "不明"
                     ctx["panel_mid"] = diag['mid']['status'] if diag else "不明"
                     st.session_state.last_strategy = logic.get_ai_order_strategy(api_key, ctx, generation_policy=gen_policy)
+                    # ✅ USD/JPY注文のEntry/TP/SLをチャートに重ね表示
+                    _ov = _strategy_to_overlay("USD/JPY (ドル円)", st.session_state.last_strategy)
+                    if _ov:
+                        st.session_state.chart_pair_label = "USD/JPY (ドル円)"
+                        st.session_state.chart_overlay = _ov
+
                     st.session_state.last_strategy_policy = gen_policy
 
                     # ✅ ロット計算機は「直近に生成した注文書のペア」に自動追従
@@ -1083,7 +1240,7 @@ with tab2:
                     st.session_state.last_alt_strategy = None
         else:
             st.warning("Gemini API Key を入力してください。")# --- 直近の注文命令書を表示（ボタン押下後も表示が残る） ---
-    simple_view = st.checkbox('表示をシンプルにする（推奨）', value=True, key='simple_view')
+    simple_view = st.checkbox('✅ 表示をシンプルにする（推奨）', value=True, key='simple_view')
     strategy = st.session_state.get("last_strategy") or {}
     if strategy:
         st.info("AI診断およびパネル診断との整合性を確認しました。")
@@ -1187,6 +1344,11 @@ with tab2:
                     if not alt_ctx.get("_pair_ctx_ok"):
                         st.warning("⚠️ 代替ペアの最新テクニカル（RSI/ATR等）が取得できませんでした。精度が落ちるため、原則ノートレ推奨です。")
                     st.session_state.last_alt_strategy = logic.get_ai_order_strategy(api_key, alt_ctx, generation_policy='AUTO_HIERARCHY')
+                    # ✅ 代替ペア注文のEntry/TP/SLをチャートに重ね表示（自動で代替チャートへ切替）
+                    _ov2 = _strategy_to_overlay(best_pair, st.session_state.last_alt_strategy)
+                    st.session_state.chart_pair_label = best_pair
+                    st.session_state.chart_overlay = _ov2
+
                     # ✅ ロット計算機は「代替ペアの注文書」に自動追従
                     st.session_state.calc_pair_label = best_pair
                     st.session_state.calc_ctx = dict(alt_ctx)
@@ -1311,5 +1473,3 @@ with tab3:
                 }))
         except Exception:
             pass
-
-
