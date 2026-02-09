@@ -1382,29 +1382,14 @@ def suggest_alternative_pair_if_usdjpy_stay(
     risk_percent_per_trade: float,
     weekly_dd_cap_percent: float = 2.0,
     max_positions_per_currency: int = 1,
-    exclude_pair_label: str = "USD/JPY (ドル円)",
-    display_top_k: int = 3
+    exclude_pair_label: str = "USD/JPY (ドル円)"
 ) -> dict:
     """
     If USD/JPY is NO_TRADE (STAY), suggest an alternative pair.
-
-    Returns:
-      {
-        "best_pair_name": str,
-        "reason": str,
-        "confidence": float,
-        "blocked": bool,
-        "blocked_by": str,
-        "source": "ai" | "numeric_scan" | "fallback",
-        "candidates": [
-            {"pair": str, "confidence": float, "status": "SELECTED"|"REJECTED", "rejected_by": [str], "reason": str}
-        ]
-      }
-
-    Notes:
-    - We keep the original AI prompt and filtering logic.
-    - We additionally expose up to `display_top_k` evaluated candidates with rejection reasons
-      so main.py can explain "なぜそれしか出ないのか" without changing trading rules.
+    - Uses an AI-ranked list (top N) and then applies:
+      (1) weekly DD cap
+      (2) currency concentration filter
+    Returns dict or {}.
     """
     model_name = get_active_model(api_key)
     if not model_name:
@@ -1417,9 +1402,7 @@ def suggest_alternative_pair_if_usdjpy_stay(
             "reason": "週単位DDキャップを超えるため今週は新規不可",
             "confidence": 1.0,
             "blocked": True,
-            "blocked_by": "weekly_dd_cap",
-            "source": "filters",
-            "candidates": []
+            "blocked_by": "weekly_dd_cap"
         }
 
     market_summary = _build_market_summary_for_pairs()
@@ -1439,28 +1422,23 @@ def suggest_alternative_pair_if_usdjpy_stay(
 【出力JSON】
 {{
   "candidates": [
-    {{"pair": "EUR/USD (ユーロドル)", "reason": "...", "confidence": 0.0}},
-    {{"pair": "AUD/JPY (豪ドル円)", "reason": "...", "confidence": 0.0}}
+{{"pair": "EUR/USD (ユーロドル)", "reason": "...", "confidence": 0.0}},
+{{"pair": "AUD/JPY (豪ドル円)", "reason": "...", "confidence": 0.0}}
   ]
 }}
 """
 
-    candidates = []
-    source = "ai"
-    ai_error = ""
     try:
         model = genai.GenerativeModel(model_name)
         resp = model.generate_content(prompt)
         txt = (resp.text or "").strip()
         data = safe_json_loads(txt) if 'safe_json_loads' in globals() else json.loads(_extract_json(txt))
-        candidates = data.get("candidates", []) or []
-    except Exception as e:
-        ai_error = str(e)
+        candidates = data.get("candidates", [])
+    except Exception:
         # fallback: reuse existing scan_best_pair single answer
         fn = globals().get('scan_best_pair')
         single = fn(api_key) if callable(fn) else {}
         candidates = []
-        source = "fallback"
         if isinstance(single, dict) and single.get("best_pair_name"):
             candidates.append({
                 "pair": single.get("best_pair_name"),
@@ -1468,92 +1446,20 @@ def suggest_alternative_pair_if_usdjpy_stay(
                 "confidence": single.get("confidence", 0.5)
             })
 
-    # Normalize list shape
-    norm = []
+    # Filter + pick
     for c in candidates:
-        if not isinstance(c, dict):
-            continue
-        pair = (c.get("pair") or "").strip()
+        pair = c.get("pair", "")
         if not pair:
             continue
-        norm.append({
-            "pair": pair,
-            "reason": c.get("reason", ""),
-            "confidence": _fx_safe_float(c.get("confidence", 0.5), 0.5)
-        })
-    candidates = norm
-
-    # Evaluate (explainable) filtering
-    evals = []
-    selected = None
-
-    # If portfolio is empty, do NOT block on currency concentration (first position is allowed)
-    active_nonempty = bool(active_positions) and len(active_positions) > 0
-
-    for c in candidates:
-        pair = c["pair"]
-        rejected_by = []
         if pair == exclude_pair_label:
-            rejected_by.append("excluded_pair")
-        if active_nonempty and violates_currency_concentration(pair, active_positions, max_positions_per_currency=max_positions_per_currency):
-            rejected_by.append("currency_concentration")
-        status = "REJECTED" if rejected_by else "CANDIDATE"
-        if (selected is None) and (status == "CANDIDATE"):
-            status = "SELECTED"
-            selected = c
-        evals.append({
-            "pair": pair,
-            "confidence": c.get("confidence", 0.5),
-            "status": status,
-            "rejected_by": rejected_by,
-            "reason": c.get("reason", "")
-        })
-        if len(evals) >= max(1, int(display_top_k or 3)):
-            # we still want to show why top candidates are rejected/selected
             continue
-
-    # If none selected from AI list, try numeric scan as a last resort (kept conservative)
-    if selected is None:
-        try:
-            fn = globals().get("scan_best_pair_numeric")
-            # scan_best_pair_numeric may exist in some builds; if not, fall back to scan_best_pair
-            if callable(fn):
-                numeric = fn(api_key, topn=5)  # expected list of dicts
-            else:
-                numeric = []
-        except Exception:
-            numeric = []
-
-        # Numeric scan: pick first that passes currency concentration (if any)
-        if isinstance(numeric, list):
-            source = "numeric_scan"
-            for item in numeric:
-                try:
-                    pair = (item.get("pair") or item.get("best_pair_name") or "").strip()
-                    if not pair:
-                        continue
-                    if pair == exclude_pair_label:
-                        continue
-                    rejected_by = []
-                    if active_nonempty and violates_currency_concentration(pair, active_positions, max_positions_per_currency=max_positions_per_currency):
-                        rejected_by.append("currency_concentration")
-                    if not rejected_by:
-                        selected = {"pair": pair, "reason": item.get("reason", ""), "confidence": _fx_safe_float(item.get("confidence", 0.65), 0.65)}
-                        break
-                except Exception:
-                    continue
-
-    # Compose return
-    if selected is not None:
+        if violates_currency_concentration(pair, active_positions, max_positions_per_currency=max_positions_per_currency):
+            continue
         return {
-            "best_pair_name": selected["pair"],
-            "reason": selected.get("reason", ""),
-            "confidence": selected.get("confidence", 0.5),
-            "blocked": False,
-            "blocked_by": "",
-            "source": source,
-            "candidates": evals[: max(1, int(display_top_k or 3))],
-            "debug": {"ai_candidate_error": ai_error} if ai_error else {}
+            "best_pair_name": pair,
+            "reason": c.get("reason", ""),
+            "confidence": c.get("confidence", 0.5),
+            "blocked": False
         }
 
     return {
@@ -1561,12 +1467,8 @@ def suggest_alternative_pair_if_usdjpy_stay(
         "reason": "条件（DDキャップ/通貨分散）を満たす代替ペアが見つかりませんでした",
         "confidence": 0.0,
         "blocked": True,
-        "blocked_by": "filters",
-        "source": source,
-        "candidates": evals[: max(1, int(display_top_k or 3))],
-        "debug": {"ai_candidate_error": ai_error} if ai_error else {}
+        "blocked_by": "filters"
     }
-
 
 # =============================
 # 100% TOOL ADDITIONS
