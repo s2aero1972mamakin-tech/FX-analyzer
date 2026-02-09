@@ -790,10 +790,9 @@ def get_ai_analysis(api_key, context_data):
         ep = context_data.get("entry_price", 0.0)
         tt = context_data.get("trade_type", "なし")
 
-        # ✅ プロンプト修正：選挙「後」の本格運用フェーズに対応
+        # ✅ プロンプト本格運用フェーズに対応
         base_prompt = f"""
 あなたはFP1級を保持する、極めて優秀な為替戦略家です。
-特に現在は「衆議院選挙の結果」を受けた直後の、極めて重要な局面であることを強く認識してください。
 
 【市場データ】
 - ドル円価格: {p:.3f}円
@@ -808,7 +807,7 @@ def get_ai_analysis(api_key, context_data):
 2. 【地政学・外部要因】選挙後の政治的安定性や、インフレ・景気後退への影響を分析
    特に「選挙結果」が市場にサプライズを与えたか、安定をもたらしたかを判断してください。
 3. 【テクニカル】乖離率とRSI({r:.1f})、および「窓開け」の状況から見て、今は「割安」か「割高」か。
-4. 【具体的戦略】NISAや外貨建資産のバランスを考える際のアアドバイスのように、
+4. 【具体的戦略】NISAや外貨建資産のバランスを考える際のアドバイスのように、
    出口戦略（利確）を含めた今後1週間の戦略を提示
 
 【レポート構成：必ず以下の4項目に沿って記述してください】
@@ -2778,3 +2777,4 @@ def get_ai_order_strategy(
     # 最終手段：数値フォールバック
     fb = _build_numeric_fallback_order(ctx, market_regime, regime_why, pair_name=pair_name or "")
     return fb
+
