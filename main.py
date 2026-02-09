@@ -258,6 +258,22 @@ def render_order_summary(order: dict, pair_name: str = "", title: str = "📌 �
     method = _dget(order, "bundle_hint_jp", "order_bundle", "entry_price_kind_jp", default="")
     rr = _dget(order, "rr_ratio", default="")
 
+
+    gen = _dget(order, "生成経路", "generator_path", default="")
+
+
+    gen_map = {
+            "ai_strict": "AI(1回)",
+            "ai": "AI",
+            "ai_retry": "AI再生成",
+            "ai_retry_failed": "AI再生成(失敗)",
+            "numeric_fallback": "数値フォールバック",
+            "numeric_fallback_failed": "数値フォールバック(失敗)",
+            "numeric_fallback_blocked": "数値フォールバック(ブロック)",
+            "error": "エラー",
+    }
+    gen_disp = gen_map.get(str(gen), str(gen)) if gen else ""
+
     why = _dget(order, "理由", "why", default="")
     regime = _dget(order, "相場モード", "market_regime", default="")
     regime_why = _dget(order, "モード理由", "regime_why", default="")
@@ -268,9 +284,9 @@ def render_order_summary(order: dict, pair_name: str = "", title: str = "📌 �
     st.subheader(head)
 
     if str(decision) in ["取引", "TRADE"]:
-        st.success(f"✅ 判定: {decision} / 方向: {side} / 期間: {horizon} / 確信度: {conf}")
+        st.success(f"✅ 判定: {decision} / 方向: {side} / 期間: {horizon} / 確信度: {conf}" + (f" / 生成: {gen_disp}" if gen_disp else ""))
     else:
-        st.warning(f"⛔ 判定: {decision} / 方向: {side} / 期間: {horizon} / 確信度: {conf}")
+        st.warning(f"⛔ 判定: {decision} / 方向: {side} / 期間: {horizon} / 確信度: {conf}" + (f" / 生成: {gen_disp}" if gen_disp else ""))
 
     try:
         entry_f = float(entry)
@@ -545,10 +561,10 @@ used_margin_jpy = _portfolio_margin_used_jpy(st.session_state.portfolio_position
 remain_margin_jpy = float(capital) - float(used_margin_jpy)
 
 st.sidebar.markdown(
-    f"**現在の保有数:** {len(st.session_state.portfolio_positions)}  /  "
-    f"**合計リスク%:** {total_risk_pct:.2f}%  /  "
-    f"**残り枠:** {remain_risk_pct:.2f}%\n"
-    f"**総必要証拠金（概算）:** ¥{used_margin_jpy:,.0f}  /  "
+    f"**現在の保有数:** {len(st.session_state.portfolio_positions)}  \n"
+    f"**合計リスク%:** {total_risk_pct:.2f}%  \n"
+    f"**残り枠:** {remain_risk_pct:.2f}%  \n"
+    f"**総必要証拠金（概算）:** ¥{used_margin_jpy:,.0f}  \n"
     f"**余力（概算）:** ¥{remain_margin_jpy:,.0f}"
 )
 
@@ -1030,7 +1046,22 @@ with tab1:
 
 with tab2:
     # --- 注文命令書（週1運用の中核） ---
-    if st.button("📝 注文命令書作成", key="btn_make_order"):
+    col_make_a, col_make_b = st.columns(2)
+    with col_make_a:
+        btn_make_auto = st.button(
+            "📝 注文命令書作成（自動階層化・推奨）",
+            key="btn_make_order_auto",
+            help="AI生成→（失敗時）AI再生成→（さらに失敗時）数値フォールバックの順で、迷わず最終案を出します。"
+        )
+    with col_make_b:
+        btn_make_strict = st.button(
+            "🧠 注文命令書作成（AI厳格）",
+            key="btn_make_order_strict",
+            help="AIの出力が不正/失敗した場合は『見送り』で止めます（安全最優先）。"
+        )
+
+    if btn_make_auto or btn_make_strict:
+        gen_policy = "AUTO_HIERARCHY" if btn_make_auto else "AI_STRICT"
         if api_key:
             if not st.session_state.last_ai_report:
                 st.warning("先に『詳細レポート』を生成してください。")
@@ -1039,18 +1070,19 @@ with tab2:
                     ctx["last_report"] = st.session_state.last_ai_report
                     ctx["panel_short"] = diag['short']['status'] if diag else "不明"
                     ctx["panel_mid"] = diag['mid']['status'] if diag else "不明"
-                    st.session_state.last_strategy = logic.get_ai_order_strategy(api_key, ctx)
+                    st.session_state.last_strategy = logic.get_ai_order_strategy(api_key, ctx, generation_policy=gen_policy)
+                    st.session_state.last_strategy_policy = gen_policy
+
                     # ✅ ロット計算機は「直近に生成した注文書のペア」に自動追従
                     st.session_state.calc_pair_label = "USD/JPY (ドル円)"
                     st.session_state.calc_ctx = dict(ctx)
                     st.session_state.calc_strategy = st.session_state.last_strategy
+
                     # 注文命令書を作り直したら、代替ペア関連のキャッシュはリセット（誤爆防止）
                     st.session_state.last_alt = None
                     st.session_state.last_alt_strategy = None
         else:
-            st.warning("Gemini API Key を入力してください。")
-
-    # --- 直近の注文命令書を表示（ボタン押下後も表示が残る） ---
+            st.warning("Gemini API Key を入力してください。")# --- 直近の注文命令書を表示（ボタン押下後も表示が残る） ---
     simple_view = st.checkbox('✅ 表示をシンプルにする（推奨）', value=True, key='simple_view')
     strategy = st.session_state.get("last_strategy") or {}
     if strategy:
@@ -1154,7 +1186,7 @@ with tab2:
                     alt_ctx = _build_ctx_for_pair(best_pair, ctx, us10y_raw)
                     if not alt_ctx.get("_pair_ctx_ok"):
                         st.warning("⚠️ 代替ペアの最新テクニカル（RSI/ATR等）が取得できませんでした。精度が落ちるため、原則ノートレ推奨です。")
-                    st.session_state.last_alt_strategy = logic.get_ai_order_strategy(api_key, alt_ctx)
+                    st.session_state.last_alt_strategy = logic.get_ai_order_strategy(api_key, alt_ctx, generation_policy='AUTO_HIERARCHY')
                     # ✅ ロット計算機は「代替ペアの注文書」に自動追従
                     st.session_state.calc_pair_label = best_pair
                     st.session_state.calc_ctx = dict(alt_ctx)
