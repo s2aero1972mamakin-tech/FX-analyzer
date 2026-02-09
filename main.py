@@ -586,7 +586,7 @@ except Exception:
 if "USD/JPY (ドル円)" not in pair_options:
     pair_options = ["USD/JPY (ドル円)"] + pair_options
 
-with st.sidebar.expander("➕ ポジションを追加（手入力）", expanded=False):
+with st.sidebar.expander("➕ ポジションを追加", expanded=False):
     add_pair = st.selectbox("ペア", pair_options, index=0)
     add_dir = st.radio("方向", ["LONG（買い）", "SHORT（売り）"], horizontal=True)
     add_risk = st.number_input("このポジのリスク（%）", min_value=0.0, max_value=10.0, value=float(risk_percent), step=0.1)
@@ -1311,4 +1311,5 @@ with tab3:
                 }))
         except Exception:
             pass
+
 
