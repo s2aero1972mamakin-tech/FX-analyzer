@@ -2778,3 +2778,234 @@ def get_ai_order_strategy(
     # 最終手段：数値フォールバック
     fb = _build_numeric_fallback_order(ctx, market_regime, regime_why, pair_name=pair_name or "")
     return fb
+
+
+# ==========================================================
+# PATCH (2026-02-10)
+# - suggest_alternative_pair_if_usdjpy_stay: return up to 3 candidates with accepted/rejected reasons
+#   so main.py's「候補（最大3）＋落選理由」UIが常に埋まる
+# ==========================================================
+
+try:
+    _SUGGEST_ALT_CORE = suggest_alternative_pair_if_usdjpy_stay  # type: ignore
+except Exception:
+    _SUGGEST_ALT_CORE = None
+
+def _alt_reject(code: str, extra=None):
+    out = [code]
+    if extra:
+        if isinstance(extra, list):
+            out.extend([str(x) for x in extra if str(x).strip()])
+        else:
+            out.append(str(extra))
+    # unique while keeping order
+    seen = set()
+    dedup = []
+    for x in out:
+        if x not in seen:
+            seen.add(x)
+            dedup.append(x)
+    return dedup
+
+def _build_numeric_top_candidates(active_positions, exclude_pair_label, max_positions_per_currency, topn=3):
+    """Deterministic top list for UI when AI is unavailable."""
+    items = []
+    exclude_head = (exclude_pair_label or "").split()[0]
+    for pair_label in (PAIR_MAP or {}).keys():
+        try:
+            if (pair_label or "").split()[0] == exclude_head:
+                continue
+            if active_positions:
+                if violates_currency_concentration(pair_label, active_positions, max_positions_per_currency=max_positions_per_currency):
+                    continue
+            ok, dbg = _alt_pair_tradeable_precheck(pair_label)
+            if not ok:
+                continue
+            score = float(dbg.get("trend_score") or -1e9)
+            items.append((score, pair_label, dbg))
+        except Exception:
+            continue
+    items.sort(key=lambda x: x[0], reverse=True)
+    out = []
+    for score, pair_label, dbg in items[:topn]:
+        out.append({
+            "pair": pair_label,
+            "reason": f"数値スキャン: tradeable（trend_score={float(dbg.get('trend_score') or 0.0):.2f}）",
+            "confidence": 0.65,
+            "status": "CANDIDATE",
+            "rejected_by": [],
+            "meta": dbg,
+        })
+    return out
+
+def suggest_alternative_pair_if_usdjpy_stay(
+    api_key: str,
+    active_positions: list,
+    risk_percent_per_trade: float,
+    weekly_dd_cap_percent: float = 2.0,
+    max_positions_per_currency: int = 1,
+    exclude_pair_label: str = "USD/JPY (ドル円)",
+) -> dict:
+    """USD/JPYが見送りの時の代替ペア提案（最大3候補＋落選理由つき）。"""
+
+    active_positions = active_positions or []
+
+    # 1) Weekly DD cap gate
+    if not can_open_under_weekly_cap(active_positions, risk_percent_per_trade, weekly_dd_cap_percent):
+        return {
+            "best_pair_name": "",
+            "reason": "週単位DDキャップを超えるため今週は新規不可",
+            "confidence": 1.0,
+            "blocked": True,
+            "blocked_by": "weekly_dd_cap",
+            "candidates": [
+                {"pair": "", "reason": "weekly_dd_cap", "confidence": 1.0, "status": "REJECTED", "rejected_by": ["weekly_dd_cap"]}
+            ],
+        }
+
+    # 2) Build AI candidates (up to 5)
+    candidates_raw = []
+    model_name = None
+    try:
+        model_name = get_active_model(api_key)
+    except Exception:
+        model_name = None
+
+    if model_name:
+        try:
+            market_summary = _build_market_summary_for_pairs()
+            bias_note = "（現在ノーポジのため、JPYクロスも候補に含めてOK）" if not active_positions else "（既存ポジとの通貨重複を避ける）"
+            allowed_labels = list((PAIR_MAP or {}).keys())
+            prompt = f"""
+あなたはプロのFXファンドマネージャーです。
+以下の市場データから「今週、USD/JPYが見送りのときに代替として最も利益チャンスがありそうなペア」を最大5つ、優先順で提案してください。
+{bias_note}
+
+【市場概況】
+{market_summary}
+
+【必須制約】
+- 可能なら {exclude_pair_label} 以外から選ぶ
+- 出力はJSONのみ
+- pair は必ず次の候補のいずれかから選ぶ（表記は完全一致）:
+{allowed_labels}
+
+【出力JSON】
+{{
+  "candidates": [
+    {{"pair": "EUR/USD (ユーロドル)", "reason": "...", "confidence": 0.0}},
+    {{"pair": "AUD/JPY (豪ドル円)", "reason": "...", "confidence": 0.0}}
+  ]
+}}
+""".strip()
+            model = genai.GenerativeModel(model_name)
+            resp = model.generate_content(prompt)
+            txt = (resp.text or "").strip()
+            data = safe_json_loads(txt) if callable(globals().get("safe_json_loads")) else json.loads(txt)
+            candidates_raw = data.get("candidates", []) if isinstance(data, dict) else []
+        except Exception:
+            candidates_raw = []
+
+    # 3) Evaluate candidates with explicit reasons
+    exclude_head = (exclude_pair_label or "").split()[0]
+    evaluated = []
+    selected = None
+
+    def _push_eval(pair, reason, conf):
+        nonlocal selected, evaluated
+        item = {
+            "pair": pair,
+            "reason": str(reason or ""),
+            "confidence": float(conf) if conf is not None else 0.5,
+            "status": "CANDIDATE",
+            "rejected_by": [],
+        }
+
+        # basic filter
+        if not pair or (pair.split()[0] == exclude_head):
+            item["status"] = "REJECTED"
+            item["rejected_by"] = _alt_reject("excluded_pair")
+            evaluated.append(item)
+            return
+
+        # currency concentration
+        if active_positions:
+            try:
+                if violates_currency_concentration(pair, active_positions, max_positions_per_currency=max_positions_per_currency):
+                    item["status"] = "REJECTED"
+                    item["rejected_by"] = _alt_reject("currency_concentration")
+                    evaluated.append(item)
+                    return
+            except Exception:
+                pass
+
+        # tradeable precheck (trend_only + no_trade_gate conservative)
+        try:
+            ok, dbg = _alt_pair_tradeable_precheck(pair)
+        except Exception as e:
+            ok, dbg = False, {"why": f"precheck_error:{type(e).__name__}", "notes": []}
+
+        item["meta"] = dbg
+        if not ok:
+            why = str((dbg or {}).get("why", "precheck_block"))
+            notes = (dbg or {}).get("notes", [])
+            item["status"] = "REJECTED"
+            # map common reasons to user-facing keys
+            if why == "trend_only_gate_block":
+                item["rejected_by"] = _alt_reject("trend_only_gate", notes[:2] if isinstance(notes, list) else notes)
+            elif why == "no_trade_gate_block":
+                item["rejected_by"] = _alt_reject("no_trade_gate", notes[:2] if isinstance(notes, list) else notes)
+            else:
+                item["rejected_by"] = _alt_reject(why, notes[:1] if isinstance(notes, list) else notes)
+            evaluated.append(item)
+            return
+
+        # eligible
+        if selected is None:
+            item["status"] = "SELECTED"
+            selected = item
+        evaluated.append(item)
+
+    # AI candidates first
+    for c in (candidates_raw or []):
+        if len(evaluated) >= 5:
+            break
+        if not isinstance(c, dict):
+            continue
+        _push_eval((c.get("pair") or ""), c.get("reason"), c.get("confidence", 0.5))
+
+    # If AI produced nothing usable, make a deterministic candidate list
+    if not evaluated:
+        evaluated = _build_numeric_top_candidates(active_positions, exclude_pair_label, max_positions_per_currency, topn=3)
+        if evaluated:
+            evaluated[0]["status"] = "SELECTED"
+            selected = evaluated[0]
+
+    # If still not selected, try numeric scan best as final fallback (keeps existing behavior)
+    if selected is None:
+        try:
+            fb = numeric_scan_best_pair(
+                active_positions=active_positions,
+                exclude_pair_label=exclude_pair_label,
+                max_positions_per_currency=max_positions_per_currency,
+            )
+        except Exception:
+            fb = {}
+        if isinstance(fb, dict) and fb.get("best_pair_name"):
+            _push_eval(fb.get("best_pair_name"), fb.get("reason"), fb.get("confidence", 0.65))
+            # ensure selected is set if last push was eligible
+            for it in evaluated:
+                if it.get("status") == "SELECTED":
+                    selected = it
+                    break
+
+    # Compose output (max 3 for UI)
+    out = {
+        "best_pair_name": (selected or {}).get("pair", "") if selected else "",
+        "reason": (selected or {}).get("reason", "") if selected else "条件（トレンド/荒れ相場/分散）を満たす代替ペアが見つかりませんでした",
+        "confidence": float((selected or {}).get("confidence", 0.0) if selected else 0.0),
+        "blocked": (selected is None),
+        "blocked_by": "filters" if selected is None else "",
+        "candidates": evaluated[:3],
+    }
+    return out
