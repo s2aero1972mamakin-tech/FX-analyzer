@@ -68,6 +68,10 @@ def _week_meta_jst():
 def _json_bytes(obj) -> bytes:
     return json.dumps(obj, ensure_ascii=False, indent=2, default=str).encode("utf-8")
 
+# download_buttonが環境によってはbytesで落ちにくいケースがあるため、文字列版も用意
+def _json_str(obj) -> str:
+    return json.dumps(obj, ensure_ascii=False, indent=2, default=str)
+
 def _build_decision_log(*, event: str, week_id: str, week_start_date, pair_label: str,
                         ctx: dict, strategy: dict, settings: dict, portfolio_positions: list,
                         last_ai_report: str = "", gen_policy: str = "") -> dict:
@@ -505,6 +509,38 @@ def render_order_summary(order: dict, pair_name: str = "", title: str = "📌 �
             if regime_why:
                 st.write(regime_why)
 
+
+# --- 落選理由コード → 日本語（運用向け） ---
+# 表示は「日本語（code）」の併記にして、運用・開発どちらも迷わないようにします。
+_REASON_JA = {
+    "trend_only_gate": "トレンド相場限定の条件に合わない",
+    "trend_gate_direction_not_aligned": "方向条件が一致しない（上昇/下降の並び不一致）",
+    "trend_score_below_threshold": "トレンド強度が不足（trend_score不足）",
+    "ma_converge_too_close": "移動平均線が接近しすぎ（レンジ寄り）",
+    "rsi_neutral_zone": "RSIが中立帯（レンジ寄り）",
+    "no_trade_gate": "見送りゲートに該当",
+    "volatility_too_high_atr_spike": "ボラ急騰（ATRスパイク）で危険",
+    "weekly_dd_cap": "週DDキャップ超過",
+    "currency_concentration": "通貨集中ルール違反",
+    "insufficient_margin": "必要証拠金不足",
+    "risk_limit": "リスク上限に抵触",
+}
+
+def reasons_to_ja_with_code(reasons) -> str:
+    if not reasons:
+        return ""
+    out = []
+    for r in reasons:
+        if r is None:
+            continue
+        s = str(r).strip()
+        if not s:
+            continue
+        ja = _REASON_JA.get(s)
+        out.append(f"{ja}（{s}）" if ja else s)
+    return " / ".join(out)
+
+
 def render_alt_summary(alt: dict, title: str = "🔁 代替ペア提案サマリー"):
     if not isinstance(alt, dict):
         st.markdown(alt)
@@ -536,10 +572,8 @@ def render_alt_summary(alt: dict, title: str = "🔁 代替ペア提案サマリ
             conf2 = _dget(c, "確信度", "confidence", default="")
             stt = _dget(c, "状態", "status", default="")
             rej = _dget(c, "落選理由", "rejected_by", default=[])
-            if isinstance(rej, list):
-                rej_txt = ", ".join([str(x) for x in rej if str(x).strip()])
-            else:
-                rej_txt = str(rej).strip()
+            rej_list = rej if isinstance(rej, list) else ([rej] if rej else [])
+            rej_txt = reasons_to_ja_with_code(rej_list)
             # ステータスの日本語化
             if stt == "SELECTED":
                 stt_jp = "採用"
@@ -1444,27 +1478,37 @@ with tab2:
         _baseline = _st.get("baseline", {}).get(_wk_id)
         _wed = _st.get("wed_payload", {}).get(_wk_id)
         with st.expander("📁 週次ログ（保存）", expanded=False):
+            st.caption("※保存先はサーバではなく、この端末のブラウザのダウンロードです。iPhone/iPadはダウンロード後にブラウザの↓から「ファイルに保存」を選ぶとiCloud経由でMacでも見られます。")
             if _baseline:
-                st.download_button(
+                _dl1 = st.download_button(
                     "📥 BASELINE（今週のベース判定）を保存",
-                    data=_json_bytes(_baseline),
+                    data=_json_str(_baseline),
                     file_name=_week_file_name("baseline", _wk_id),
                     mime="application/json",
-                    key="dl_baseline"
+                    key=f"dl_baseline_{_wk_id}"
                 )
+                if _dl1:
+                    st.success("BASELINEログのダウンロードを開始しました（ブラウザのダウンロード一覧をご確認ください）。")
+                with st.expander("うまく保存できない時（コピー用：JSON）", expanded=False):
+                    st.code(_json_str(_baseline), language="json")
             else:
                 st.caption("今週のBASELINEログは未作成です（注文命令書作成後に自動生成されます）。")
 
             if _wed:
-                st.download_button(
+                _dl2 = st.download_button(
                     "📥 WED_RECHECK（水曜再判定）を保存",
-                    data=_json_bytes(_wed),
+                    data=_json_str(_wed),
                     file_name=_week_file_name("wed_recheck", _wk_id),
                     mime="application/json",
-                    key="dl_wed"
+                    key=f"dl_wed_{_wk_id}"
                 )
+                if _dl2:
+                    st.success("WED_RECHECKログのダウンロードを開始しました（ブラウザのダウンロード一覧をご確認ください）。")
+                with st.expander("うまく保存できない時（コピー用：JSON）", expanded=False):
+                    st.code(_json_str(_wed), language="json")
             else:
                 st.caption("水曜再判定ログは未作成です。")
+
         decision = ""
         try:
             decision = strategy.get("decision") if isinstance(strategy, dict) else ""
