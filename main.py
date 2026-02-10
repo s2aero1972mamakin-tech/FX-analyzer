@@ -5,7 +5,22 @@ import pandas as pd
 import math
 from datetime import datetime, timedelta
 import pytz
+import os
+import json
 import logic  # ← logic.pyが必要
+
+
+def _is_dev_mode() -> bool:
+    """運用時の誤操作を防ぐため、開発者モードは明示的にONにしない限り表示しない。"""
+    v = str(os.getenv("AI_FX_DEV_MODE", "")).strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    try:
+        return bool(st.secrets.get("DEV_MODE", False))
+    except Exception:
+        return False
+
+DEV_MODE = _is_dev_mode()
 
 # --- 起動時セルフチェック（logic.pyの差し替えミスを即検知） ---
 _REQUIRED_LOGIC = [
@@ -370,6 +385,71 @@ def render_order_summary(order: dict, pair_name: str = "", title: str = "📌 �
             if regime_why:
                 st.write(regime_why)
 
+
+def render_decision_visibility(strategy: dict, ctx: dict, dev_mode: bool = False, title: str = "🔎 判定根拠（見える化）"):
+    """判定ロジックを『変更せず』、根拠の数値だけを可視化する（事故防止・調整の物差し）。"""
+    if not isinstance(strategy, dict):
+        return
+    ctx = ctx or {}
+
+    # 主要値（欠損に強く）
+    price = float(ctx.get("price") or 0.0)
+    sma25 = float(ctx.get("sma25") or 0.0)
+    sma75 = float(ctx.get("sma75") or 0.0)
+    atr = float(ctx.get("atr") or 0.0)
+    atr_avg60 = float(ctx.get("atr_avg60") or 0.0)
+    rsi = float(ctx.get("rsi") or 0.0)
+
+    sma_diff = abs(sma25 - sma75)
+    sma_diff_pct = (sma_diff / price * 100.0) if price else 0.0
+    atr_ratio = (atr / atr_avg60) if atr_avg60 else 0.0
+    trend_score = (sma_diff / atr) if atr else 0.0
+
+    why = str(strategy.get("why", "") or "")
+    notes = strategy.get("notes", [])
+    if not isinstance(notes, list):
+        notes = [str(notes)]
+
+    # 表示（運用は折りたたみ、開発者は展開でもOK）
+    with st.expander(title, expanded=bool(dev_mode)):
+        c1, c2, c3 = st.columns(3)
+        c1.metric("RSI", f"{rsi:.1f}")
+        c2.metric("MA差(%)", f"{sma_diff_pct:.2f}%")
+        c3.metric("trend_score", f"{trend_score:.2f}")
+
+        c4, c5, c6 = st.columns(3)
+        c4.metric("ATR", f"{atr:.4f}")
+        c5.metric("ATR比(ATR/avg60)", f"{atr_ratio:.2f}")
+        c6.metric("価格", f"{price:.3f}")
+
+        if why.strip():
+            st.caption(f"why: {why[:260]}{' …' if len(why) > 260 else ''}")
+
+        if notes:
+            # 運用は上位だけ見えると十分
+            top = notes[:8]
+            st.caption("notes（上位）: " + " / ".join([str(x) for x in top if str(x).strip()]))
+
+        # ✅ AIの“セカンドオピニオン”用に、判定材料をまとめてコピーできるようにする（自動問い合わせはしない）
+        trace = {
+            "pair": ctx.get("pair_label") or ctx.get("pair") or "",
+            "timestamp": str(ctx.get("current_time") or ""),
+            "ctx": ctx,
+            "strategy": strategy,
+        }
+        st.session_state["last_trace"] = trace
+
+        trace_text = json.dumps(trace, ensure_ascii=False, indent=2)
+        st.text_area("コピー用（ctx+strategy）", trace_text, height=180)
+
+        st.download_button(
+            "⬇ 判定トレースJSONをダウンロード",
+            data=trace_text.encode("utf-8"),
+            file_name="decision_trace.json",
+            mime="application/json",
+        )
+
+
 def render_alt_summary(alt: dict, title: str = "🔁 代替ペア提案サマリー"):
     if not isinstance(alt, dict):
         st.markdown(alt)
@@ -493,9 +573,25 @@ max_positions_per_currency = st.sidebar.number_input(
     "同一通貨の最大保有数（通貨集中フィルタ）", min_value=1, max_value=5, value=1, step=1
 )
 
-# ✅【追加】デバッグ（テスト用）
-st.sidebar.subheader("🧪 デバッグ")
-force_no_trade_debug = st.sidebar.checkbox("NO_TRADE分岐を強制表示（テスト用）", value=False, help="代替ペアの動線テスト用。実運用ではOFF。")
+
+# ✅ リスク/分散パラメータが変わったら、代替提案キャッシュを自動リセット（古い候補の誤用防止）
+_alt_params = (float(risk_percent), float(weekly_dd_cap_percent), int(max_positions_per_currency))
+if st.session_state.get("_alt_params") != _alt_params:
+    st.session_state["_alt_params"] = _alt_params
+    st.session_state.last_alt = None
+    st.session_state.last_alt_strategy = None
+
+# ✅【追加】デバッグ（テスト用）※運用時の誤操作防止のため、開発者モード時のみ表示
+if DEV_MODE:
+    st.sidebar.subheader("🧪 開発者モード")
+    st.sidebar.caption("AI_FX_DEV_MODE=1（または st.secrets['DEV_MODE']=True）で有効化。運用ではOFF推奨。")
+    force_no_trade_debug = st.sidebar.checkbox(
+        "NO_TRADE分岐を強制表示（テスト用）",
+        value=False,
+        help="代替ペアの動線テスト用。運用では表示されません。",
+    )
+else:
+    force_no_trade_debug = False
 
 
 leverage = 25  # 固定
@@ -841,7 +937,7 @@ if st.sidebar.button("📈 AI予想ライン反映"):
         with st.spinner("AI予想を取得中..."):
             last_row = df.iloc[-1]
             context = {"price": last_row["Close"], "rsi": last_row["RSI"], "atr": last_row["ATR"]}
-            st.session_state.ai_range = logic.get_ai_range(api_key, context)
+            st.session_state.ai_range = logic.ensure_ai_range(api_key, context)
             st.rerun()
     else:
         st.warning("Gemini API Key を入力してください。")
@@ -1221,7 +1317,16 @@ with tab2:
                     ctx["last_report"] = st.session_state.last_ai_report
                     ctx["panel_short"] = diag['short']['status'] if diag else "不明"
                     ctx["panel_mid"] = diag['mid']['status'] if diag else "不明"
-                    st.session_state.last_strategy = logic.get_ai_order_strategy(api_key, ctx, generation_policy=gen_policy)
+                    st.session_state.last_strategy = logic.get_ai_order_strategy(
+                        api_key=api_key,
+                        context_data=ctx,
+                        pair_name="USD/JPY (ドル円)",
+                        portfolio_positions=st.session_state.portfolio_positions,
+                        weekly_dd_cap_percent=float(weekly_dd_cap_percent),
+                        risk_percent_per_trade=float(risk_percent),
+                        max_positions_per_currency=int(max_positions_per_currency),
+                        generation_policy=gen_policy,
+                    )
                     # ✅ USD/JPY注文のEntry/TP/SLをチャートに重ね表示
                     _ov = _strategy_to_overlay("USD/JPY (ドル円)", st.session_state.last_strategy)
                     if _ov:
@@ -1246,6 +1351,7 @@ with tab2:
         st.info("AI診断およびパネル診断との整合性を確認しました。")
         if simple_view and isinstance(strategy, dict):
             render_order_summary(jpize_json(strategy), pair_name="USD/JPY (ドル円)", title="📌 注文サマリー")
+            render_decision_visibility(strategy, st.session_state.get("calc_ctx") or {}, dev_mode=DEV_MODE)
             with st.expander("詳細（JSON）"):
                 st.json(jpize_json(strategy))
         else:
@@ -1343,7 +1449,16 @@ with tab2:
                     alt_ctx = _build_ctx_for_pair(best_pair, ctx, us10y_raw)
                     if not alt_ctx.get("_pair_ctx_ok"):
                         st.warning("⚠️ 代替ペアの最新テクニカル（RSI/ATR等）が取得できませんでした。精度が落ちるため、原則ノートレ推奨です。")
-                    st.session_state.last_alt_strategy = logic.get_ai_order_strategy(api_key, alt_ctx, generation_policy='AUTO_HIERARCHY')
+                    st.session_state.last_alt_strategy = logic.get_ai_order_strategy(
+                        api_key=api_key,
+                        context_data=alt_ctx,
+                        pair_name=best_pair,
+                        portfolio_positions=st.session_state.portfolio_positions,
+                        weekly_dd_cap_percent=float(weekly_dd_cap_percent),
+                        risk_percent_per_trade=float(risk_percent),
+                        max_positions_per_currency=int(max_positions_per_currency),
+                        generation_policy="AUTO_HIERARCHY",
+                    )
                     # ✅ 代替ペア注文のEntry/TP/SLをチャートに重ね表示（自動で代替チャートへ切替）
                     _ov2 = _strategy_to_overlay(best_pair, st.session_state.last_alt_strategy)
                     st.session_state.chart_pair_label = best_pair
@@ -1359,6 +1474,7 @@ with tab2:
                     st.subheader("代替ペアの注文戦略")
                     if simple_view and isinstance(alt_strategy, dict):
                         render_order_summary(jpize_json(alt_strategy), pair_name=best_pair, title="📌 代替ペア注文サマリー")
+                        render_decision_visibility(alt_strategy, st.session_state.get("calc_ctx") or {}, dev_mode=DEV_MODE, title="🔎 判定根拠（見える化）: 代替ペア")
                         with st.expander("詳細（JSON）"):
                             st.json(jpize_json(alt_strategy))
                     else:
@@ -1473,4 +1589,3 @@ with tab3:
                 }))
         except Exception:
             pass
-
