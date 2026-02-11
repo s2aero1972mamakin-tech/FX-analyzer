@@ -5,6 +5,7 @@ import pandas as pd
 import math
 import os
 import json
+import base64
 from datetime import datetime, timedelta
 import pytz
 import logic  # ← logic.pyが必要
@@ -71,6 +72,23 @@ def _json_bytes(obj) -> bytes:
 # download_buttonが環境によってはbytesで落ちにくいケースがあるため、文字列版も用意
 def _json_str(obj) -> str:
     return json.dumps(obj, ensure_ascii=False, indent=2, default=str)
+
+def _clip_text(s: str, max_len: int = 1600) -> str:
+    try:
+        if s is None:
+            return ""
+        s = str(s)
+        return s if len(s) <= max_len else (s[:max_len] + " …(truncated)")
+    except Exception:
+        return ""
+
+def _download_link(payload_bytes: bytes, file_name: str, label: str = "Safari用：リンクで保存") -> str:
+    """download_buttonが環境で落ちない場合のフォールバック（data: URI）"""
+    try:
+        b64 = base64.b64encode(payload_bytes).decode("ascii")
+        return f'<a href="data:application/json;base64,{b64}" download="{file_name}">⬇️ {label}</a>'
+    except Exception:
+        return ""
 
 def _build_decision_log(*, event: str, week_id: str, week_start_date, pair_label: str,
                         ctx: dict, strategy: dict, settings: dict, portfolio_positions: list,
@@ -507,7 +525,13 @@ def render_order_summary(order: dict, pair_name: str = "", title: str = "📌 �
             if regime:
                 st.write(f"相場モード: {regime}")
             if regime_why:
-                st.write(regime_why)
+                _rw = str(regime_why)
+                if ("ResourceExhausted" in _rw) or ("429" in _rw) or ("quota" in _rw):
+                    st.warning("AIの利用制限(429)などで相場モード判定ができず、安全側（DEFENSIVE）で継続しています。")
+                    with st.expander("詳細（原文）", expanded=False):
+                        st.code(_rw)
+                else:
+                    st.write(regime_why)
 
 
 # --- 落選理由コード → 日本語（運用向け） ---
@@ -524,6 +548,7 @@ _REASON_JA = {
     "currency_concentration": "通貨集中ルール違反",
     "insufficient_margin": "必要証拠金不足",
     "risk_limit": "リスク上限に抵触",
+    "ranked_lower": "優先度が低い（他候補を採用）",
 }
 
 def reasons_to_ja_with_code(reasons) -> str:
@@ -1433,7 +1458,7 @@ with tab2:
                                 "leverage": int(leverage),
                             },
                             portfolio_positions=list(st.session_state.portfolio_positions),
-                            last_ai_report=st.session_state.last_ai_report,
+                            last_ai_report=_clip_text(st.session_state.last_ai_report, 1600),
                             gen_policy=gen_policy,
                         )
                         _store["baseline"][_week_id] = _baseline_payload
@@ -1482,11 +1507,15 @@ with tab2:
             if _baseline:
                 _dl1 = st.download_button(
                     "📥 BASELINE（今週のベース判定）を保存",
-                    data=_json_str(_baseline),
+                    data=_json_bytes(_baseline),
                     file_name=_week_file_name("baseline", _wk_id),
                     mime="application/json",
                     key=f"dl_baseline_{_wk_id}"
                 )
+                _b = _json_bytes(_baseline)
+                _lnk = _download_link(_b, _week_file_name("baseline", _wk_id), label="Safari用リンクで保存")
+                if _lnk:
+                    st.markdown(_lnk, unsafe_allow_html=True)
                 if _dl1:
                     st.success("BASELINEログのダウンロードを開始しました（ブラウザのダウンロード一覧をご確認ください）。")
                 with st.expander("うまく保存できない時（コピー用：JSON）", expanded=False):
@@ -1497,11 +1526,15 @@ with tab2:
             if _wed:
                 _dl2 = st.download_button(
                     "📥 WED_RECHECK（水曜再判定）を保存",
-                    data=_json_str(_wed),
+                    data=_json_bytes(_wed),
                     file_name=_week_file_name("wed_recheck", _wk_id),
                     mime="application/json",
                     key=f"dl_wed_{_wk_id}"
                 )
+                _b2 = _json_bytes(_wed)
+                _lnk2 = _download_link(_b2, _week_file_name("wed_recheck", _wk_id), label="Safari用リンクで保存")
+                if _lnk2:
+                    st.markdown(_lnk2, unsafe_allow_html=True)
                 if _dl2:
                     st.success("WED_RECHECKログのダウンロードを開始しました（ブラウザのダウンロード一覧をご確認ください）。")
                 with st.expander("うまく保存できない時（コピー用：JSON）", expanded=False):
@@ -1790,7 +1823,7 @@ with tab2:
                             "leverage": int(leverage),
                         },
                         portfolio_positions=list(st.session_state.portfolio_positions),
-                        last_ai_report=st.session_state.last_ai_report,
+                        last_ai_report=_clip_text(st.session_state.last_ai_report, 1600),
                         gen_policy="AUTO_HIERARCHY",
                     )
 
