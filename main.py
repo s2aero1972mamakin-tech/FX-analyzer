@@ -90,6 +90,51 @@ def _download_link(payload_bytes: bytes, file_name: str, label: str = "Safari用
     except Exception:
         return ""
 
+
+def _get_user_agent() -> str:
+    """可能ならUser-Agentを取得（Streamlitのバージョンや環境差があるためtryで吸収）"""
+    try:
+        ctx = getattr(st, "context", None)
+        if ctx is not None and hasattr(ctx, "headers"):
+            h = ctx.headers
+            # dict-like
+            if hasattr(h, "get"):
+                return h.get("User-Agent") or h.get("user-agent") or ""
+            # fallback
+            try:
+                return h["User-Agent"]
+            except Exception:
+                try:
+                    return h["user-agent"]
+                except Exception:
+                    return ""
+    except Exception:
+        return ""
+    return ""
+
+def _is_safari_browser() -> bool:
+    """
+    Safariの場合は st.download_button がHTML扱いで失敗するケースがあるため、
+    Safari検出時は data: URI リンクで保存させる。
+    Cloud側で強制したい場合は secrets に:
+      FORCE_SAFARI_DOWNLOAD = true
+    """
+    try:
+        if bool(st.secrets.get("FORCE_SAFARI_DOWNLOAD", False)):
+            return True
+    except Exception:
+        pass
+
+    ua = _get_user_agent()
+    if not ua:
+        return False
+
+    # iOS Chrome = CriOS, Edge = EdgiOS, Firefox = FxiOS 等
+    if ("Safari" in ua) and not any(k in ua for k in ["Chrome", "Chromium", "CriOS", "Edg", "EdgiOS", "OPR", "FxiOS"]):
+        return True
+    return False
+
+
 def _build_decision_log(*, event: str, week_id: str, week_start_date, pair_label: str,
                         ctx: dict, strategy: dict, settings: dict, portfolio_positions: list,
                         last_ai_report: str = "", gen_policy: str = "") -> dict:
@@ -1504,39 +1549,61 @@ with tab2:
         _wed = _st.get("wed_payload", {}).get(_wk_id)
         with st.expander("📁 週次ログ（保存）", expanded=False):
             st.caption("※保存先はサーバではなく、この端末のブラウザのダウンロードです。iPhone/iPadはダウンロード後にブラウザの↓から「ファイルに保存」を選ぶとiCloud経由でMacでも見られます。")
+            is_safari = _is_safari_browser()
+
             if _baseline:
-                _dl1 = st.download_button(
-                    "📥 BASELINE（今週のベース判定）を保存",
-                    data=_json_bytes(_baseline),
-                    file_name=_week_file_name("baseline", _wk_id),
-                    mime="application/json",
-                    key=f"dl_baseline_{_wk_id}"
-                )
                 _b = _json_bytes(_baseline)
-                _lnk = _download_link(_b, _week_file_name("baseline", _wk_id), label="Safari用リンクで保存")
-                if _lnk:
-                    st.markdown(_lnk, unsafe_allow_html=True)
-                if _dl1:
-                    st.success("BASELINEログのダウンロードを開始しました（ブラウザのダウンロード一覧をご確認ください）。")
+                _fname = _week_file_name("baseline", _wk_id)
+
+                if is_safari:
+                    st.caption("SafariではダウンロードボタンがHTML扱いで失敗する場合があるため、リンク保存を既定にしています。")
+                    _lnk = _download_link(_b, _fname, label="Safari: タップして保存")
+                    if _lnk:
+                        st.markdown(_lnk, unsafe_allow_html=True)
+                else:
+                    _dl1 = st.download_button(
+                        "📥 BASELINE（今週のベース判定）を保存",
+                        data=_b,
+                        file_name=_fname,
+                        mime="application/json",
+                        key=f"dl_baseline_{_wk_id}"
+                    )
+                    if _dl1:
+                        st.success("BASELINEログのダウンロードを開始しました（ブラウザのダウンロード一覧をご確認ください）。")
+
+                    _lnk = _download_link(_b, _fname, label="うまくいかない時（リンクで保存）")
+                    if _lnk:
+                        st.markdown(_lnk, unsafe_allow_html=True)
+
                 with st.expander("うまく保存できない時（コピー用：JSON）", expanded=False):
                     st.code(_json_str(_baseline), language="json")
             else:
                 st.caption("今週のBASELINEログは未作成です（注文命令書作成後に自動生成されます）。")
 
             if _wed:
-                _dl2 = st.download_button(
-                    "📥 WED_RECHECK（水曜再判定）を保存",
-                    data=_json_bytes(_wed),
-                    file_name=_week_file_name("wed_recheck", _wk_id),
-                    mime="application/json",
-                    key=f"dl_wed_{_wk_id}"
-                )
                 _b2 = _json_bytes(_wed)
-                _lnk2 = _download_link(_b2, _week_file_name("wed_recheck", _wk_id), label="Safari用リンクで保存")
-                if _lnk2:
-                    st.markdown(_lnk2, unsafe_allow_html=True)
-                if _dl2:
-                    st.success("WED_RECHECKログのダウンロードを開始しました（ブラウザのダウンロード一覧をご確認ください）。")
+                _fname2 = _week_file_name("wed_recheck", _wk_id)
+
+                if is_safari:
+                    st.caption("Safariではリンク保存を既定にしています。")
+                    _lnk2 = _download_link(_b2, _fname2, label="Safari: タップして保存")
+                    if _lnk2:
+                        st.markdown(_lnk2, unsafe_allow_html=True)
+                else:
+                    _dl2 = st.download_button(
+                        "📥 WED_RECHECK（水曜再判定）を保存",
+                        data=_b2,
+                        file_name=_fname2,
+                        mime="application/json",
+                        key=f"dl_wed_{_wk_id}"
+                    )
+                    if _dl2:
+                        st.success("WED_RECHECKログのダウンロードを開始しました（ブラウザのダウンロード一覧をご確認ください）。")
+
+                    _lnk2 = _download_link(_b2, _fname2, label="うまくいかない時（リンクで保存）")
+                    if _lnk2:
+                        st.markdown(_lnk2, unsafe_allow_html=True)
+
                 with st.expander("うまく保存できない時（コピー用：JSON）", expanded=False):
                     st.code(_json_str(_wed), language="json")
             else:
