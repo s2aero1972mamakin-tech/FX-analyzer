@@ -2,10 +2,9 @@ import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import pandas as pd
+import numpy as np
+import yfinance as yf
 import math
-import os
-import json
-import base64
 from datetime import datetime, timedelta
 import pytz
 import logic  # ← logic.pyが必要
@@ -30,160 +29,6 @@ st.title("🤖 AI連携型 USD/JPY 戦略分析ツール (SBI仕様)")
 
 TOKYO = pytz.timezone("Asia/Tokyo")
 
-# --- Dev/Prod モード ---
-def _is_truthy(v):
-    if v is None:
-        return False
-    if isinstance(v, bool):
-        return v
-    s = str(v).strip().lower()
-    return s in ("1", "true", "t", "yes", "y", "on")
-
-def is_dev_mode() -> bool:
-    # 1) Streamlit Cloud Secrets を優先
-    try:
-        if "DEV_MODE" in st.secrets:
-            return _is_truthy(st.secrets.get("DEV_MODE"))
-    except Exception:
-        pass
-    # 2) 環境変数（ローカル用）
-    return _is_truthy(os.getenv("AI_FX_DEV_MODE", ""))
-
-DEV_MODE = is_dev_mode()
-
-# --- 週次（ベース判定 / 水曜再判定）共有ストア（プロセス内で共有） ---
-@st.cache_resource
-def _global_week_store():
-    return {"baseline": {}, "wed_done": set(), "wed_payload": {}, "alt_status": {}}
-
-def _now_jst():
-    return datetime.now(TOKYO)
-
-def _week_meta_jst():
-    now = _now_jst()
-    iso = now.isocalendar()
-    week_id = f"{iso.year}-W{iso.week:02d}"
-    week_start = (now - timedelta(days=now.weekday())).date()  # 月曜
-    return week_id, week_start, now
-
-def _json_bytes(obj) -> bytes:
-    return json.dumps(obj, ensure_ascii=False, indent=2, default=str).encode("utf-8")
-
-# download_buttonが環境によってはbytesで落ちにくいケースがあるため、文字列版も用意
-def _json_str(obj) -> str:
-    return json.dumps(obj, ensure_ascii=False, indent=2, default=str)
-
-def _clip_text(s: str, max_len: int = 1600) -> str:
-    try:
-        if s is None:
-            return ""
-        s = str(s)
-        return s if len(s) <= max_len else (s[:max_len] + " …(truncated)")
-    except Exception:
-        return ""
-
-def _download_link(payload_bytes: bytes, file_name: str, label: str = "Safari用：リンクで保存") -> str:
-    """download_buttonが環境で落ちない場合のフォールバック（data: URI）"""
-    try:
-        b64 = base64.b64encode(payload_bytes).decode("ascii")
-        return f'<a href="data:application/json;base64,{b64}" download="{file_name}">⬇️ {label}</a>'
-    except Exception:
-        return ""
-
-
-def _get_user_agent() -> str:
-    """可能ならUser-Agentを取得（Streamlitのバージョンや環境差があるためtryで吸収）"""
-    try:
-        ctx = getattr(st, "context", None)
-        if ctx is not None and hasattr(ctx, "headers"):
-            h = ctx.headers
-            # dict-like
-            if hasattr(h, "get"):
-                return h.get("User-Agent") or h.get("user-agent") or ""
-            # fallback
-            try:
-                return h["User-Agent"]
-            except Exception:
-                try:
-                    return h["user-agent"]
-                except Exception:
-                    return ""
-    except Exception:
-        return ""
-    return ""
-
-def _is_safari_browser() -> bool:
-    """
-    Safariの場合は st.download_button がHTML扱いで失敗するケースがあるため、
-    Safari検出時は data: URI リンクで保存させる。
-    Cloud側で強制したい場合は secrets に:
-      FORCE_SAFARI_DOWNLOAD = true
-    """
-    try:
-        if bool(st.secrets.get("FORCE_SAFARI_DOWNLOAD", False)):
-            return True
-    except Exception:
-        pass
-
-    ua = _get_user_agent()
-    if not ua:
-        return False
-
-    # iOS Chrome = CriOS, Edge = EdgiOS, Firefox = FxiOS 等
-    if ("Safari" in ua) and not any(k in ua for k in ["Chrome", "Chromium", "CriOS", "Edg", "EdgiOS", "OPR", "FxiOS"]):
-        return True
-    return False
-
-
-def _build_decision_log(*, event: str, week_id: str, week_start_date, pair_label: str,
-                        ctx: dict, strategy: dict, settings: dict, portfolio_positions: list,
-                        last_ai_report: str = "", gen_policy: str = "") -> dict:
-    return {
-        "event": event,
-        "timestamp_jst": _now_jst().isoformat(),
-        "week_id": week_id,
-        "week_start_date_jst": str(week_start_date),
-        "pair": pair_label,
-        "generation_policy": gen_policy,
-        "decision": (strategy or {}).get("decision") if isinstance(strategy, dict) else "",
-        "side": (strategy or {}).get("side") if isinstance(strategy, dict) else "",
-        "entry": (strategy or {}).get("entry") if isinstance(strategy, dict) else None,
-        "tp": (strategy or {}).get("tp") if isinstance(strategy, dict) else None,
-        "sl": (strategy or {}).get("sl") if isinstance(strategy, dict) else None,
-        "lots": (strategy or {}).get("lots") if isinstance(strategy, dict) else None,
-        "why": (strategy or {}).get("why") if isinstance(strategy, dict) else "",
-        "notes": (strategy or {}).get("notes") if isinstance(strategy, dict) else "",
-        "ctx": ctx or {},
-        "strategy": strategy or {},
-        "last_ai_report": last_ai_report or "",
-        "settings": settings or {},
-        "portfolio_positions_min": [
-            {
-                "pair": p.get("pair"),
-                "direction": p.get("direction"),
-                "risk_percent": p.get("risk_percent"),
-                "lots": p.get("lots"),
-                "entry_price": p.get("entry_price"),
-                "entry_time": p.get("entry_time"),
-            }
-            for p in (portfolio_positions or [])
-            if isinstance(p, dict)
-        ],
-    }
-
-
-
-# --- JSON download helper ---
-def _json_bytes(payload: dict) -> bytes:
-    try:
-        return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
-    except Exception:
-        # fallback
-        return str(payload).encode("utf-8")
-
-def _week_file_name(prefix: str, week_id: str) -> str:
-    safe = week_id.replace("/", "-")
-    return f"{prefix}_{safe}.json"
 # --- SBI必要証拠金（1万通貨あたり / JPY） ---
 # ユーザー提示の固定値を優先して「最大発注可能数（枚）」を計算します。
 # ※SBI側の改定があり得るので、数値は必要に応じて更新してください。
@@ -214,49 +59,6 @@ def _normalize_pair_label(label: str) -> str:
     except Exception:
         pass
     return label
-
-
-def _brief_pair_report(pair_label: str, ctx: dict) -> str:
-    """
-    Lightweight, deterministic report so the AI doesn't reuse USD/JPY text for alternative pairs.
-    Uses ctx: price, sma25, sma75, rsi, atr, atr_avg60.
-    """
-    try:
-        price = float(ctx.get("price") or 0.0)
-        sma25 = float(ctx.get("sma25") or 0.0)
-        sma75 = float(ctx.get("sma75") or 0.0)
-        rsi = float(ctx.get("rsi") or 50.0)
-        atr = float(ctx.get("atr") or 0.0)
-        atr_avg60 = float(ctx.get("atr_avg60") or atr or 0.0)
-    except Exception:
-        return f"{pair_label}の指標が十分に取得できませんでした。"
-
-    # trend
-    trend = "レンジ"
-    if price > sma25 > sma75:
-        trend = "上昇トレンド"
-    elif price < sma25 < sma75:
-        trend = "下降トレンド"
-
-    # momentum
-    mom = "中立"
-    if rsi >= 60:
-        mom = "買い優勢"
-    elif rsi <= 40:
-        mom = "売り優勢"
-
-    # volatility
-    vol = "平常"
-    try:
-        ratio = (atr / atr_avg60) if atr_avg60 else 1.0
-    except Exception:
-        ratio = 1.0
-    if ratio >= 1.6:
-        vol = "荒い"
-    elif ratio <= 0.8:
-        vol = "落ち着き"
-
-    return f"{pair_label}は日足ベースで{trend}。RSIは{rsi:.1f}で{mom}、ボラは{vol}（ATR比={ratio:.2f}）。"
 
 def _build_ctx_for_pair(pair_label: str, base_ctx: dict, us10y_raw):
     """Build context_data (price/ATR/RSI/SMA_DIFF) for a specific FX pair label."""
@@ -309,8 +111,6 @@ def _build_ctx_for_pair(pair_label: str, base_ctx: dict, us10y_raw):
                     ctx2["atr_avg60"] = ctx2.get("atr", 0.0)
                 ctx2["us10y"] = _get("US10Y", ctx2.get("us10y", 0.0))
                 ctx2["_pair_ctx_ok"] = True
-                # Override last_report with pair-specific brief to prevent mixing USD/JPY narrative
-                ctx2["last_report"] = _brief_pair_report(pair_label, ctx2)
                 return ctx2
         except Exception:
             pass
@@ -570,46 +370,7 @@ def render_order_summary(order: dict, pair_name: str = "", title: str = "📌 �
             if regime:
                 st.write(f"相場モード: {regime}")
             if regime_why:
-                _rw = str(regime_why)
-                if ("ResourceExhausted" in _rw) or ("429" in _rw) or ("quota" in _rw):
-                    st.warning("AIの利用制限(429)などで相場モード判定ができず、安全側（DEFENSIVE）で継続しています。")
-                    with st.expander("詳細（原文）", expanded=False):
-                        st.code(_rw)
-                else:
-                    st.write(regime_why)
-
-
-# --- 落選理由コード → 日本語（運用向け） ---
-# 表示は「日本語（code）」の併記にして、運用・開発どちらも迷わないようにします。
-_REASON_JA = {
-    "trend_only_gate": "トレンド相場限定の条件に合わない",
-    "trend_gate_direction_not_aligned": "方向条件が一致しない（上昇/下降の並び不一致）",
-    "trend_score_below_threshold": "トレンド強度が不足（trend_score不足）",
-    "ma_converge_too_close": "移動平均線が接近しすぎ（レンジ寄り）",
-    "rsi_neutral_zone": "RSIが中立帯（レンジ寄り）",
-    "no_trade_gate": "見送りゲートに該当",
-    "volatility_too_high_atr_spike": "ボラ急騰（ATRスパイク）で危険",
-    "weekly_dd_cap": "週DDキャップ超過",
-    "currency_concentration": "通貨集中ルール違反",
-    "insufficient_margin": "必要証拠金不足",
-    "risk_limit": "リスク上限に抵触",
-    "ranked_lower": "優先度が低い（他候補を採用）",
-}
-
-def reasons_to_ja_with_code(reasons) -> str:
-    if not reasons:
-        return ""
-    out = []
-    for r in reasons:
-        if r is None:
-            continue
-        s = str(r).strip()
-        if not s:
-            continue
-        ja = _REASON_JA.get(s)
-        out.append(f"{ja}（{s}）" if ja else s)
-    return " / ".join(out)
-
+                st.write(regime_why)
 
 def render_alt_summary(alt: dict, title: str = "🔁 代替ペア提案サマリー"):
     if not isinstance(alt, dict):
@@ -642,8 +403,10 @@ def render_alt_summary(alt: dict, title: str = "🔁 代替ペア提案サマリ
             conf2 = _dget(c, "確信度", "confidence", default="")
             stt = _dget(c, "状態", "status", default="")
             rej = _dget(c, "落選理由", "rejected_by", default=[])
-            rej_list = rej if isinstance(rej, list) else ([rej] if rej else [])
-            rej_txt = reasons_to_ja_with_code(rej_list)
+            if isinstance(rej, list):
+                rej_txt = ", ".join([str(x) for x in rej if str(x).strip()])
+            else:
+                rej_txt = str(rej).strip()
             # ステータスの日本語化
             if stt == "SELECTED":
                 stt_jp = "採用"
@@ -706,12 +469,6 @@ if "last_alt_strategy" not in st.session_state:
     st.session_state.last_alt_strategy = None
 
 
-# ✅【追加】週次ベース判定 / 水曜再判定 状態
-if "week_baseline" not in st.session_state:
-    st.session_state.week_baseline = None
-if "wed_recheck_payload" not in st.session_state:
-    st.session_state.wed_recheck_payload = None
-
 # --- APIキー取得 ---
 try:
     default_key = st.secrets.get("GEMINI_API_KEY", "")
@@ -738,16 +495,9 @@ max_positions_per_currency = st.sidebar.number_input(
     "同一通貨の最大保有数（通貨集中フィルタ）", min_value=1, max_value=5, value=1, step=1
 )
 
-# ✅【追加】デバッグ（テスト用）※DEV_MODE のときだけ表示（誤操作ゼロ）
-if DEV_MODE:
-    st.sidebar.subheader("🧪 デバッグ")
-    force_no_trade_debug = st.sidebar.checkbox(
-        "NO_TRADE分岐を強制表示（テスト用）",
-        value=False,
-        help="代替ペアの動線テスト用。実運用ではOFF。"
-    )
-else:
-    force_no_trade_debug = False
+# ✅【追加】デバッグ（テスト用）
+st.sidebar.subheader("🧪 デバッグ")
+force_no_trade_debug = st.sidebar.checkbox("NO_TRADE分岐を強制表示（テスト用）", value=False, help="代替ペアの動線テスト用。実運用ではOFF。")
 
 
 leverage = 25  # 固定
@@ -1473,42 +1223,7 @@ with tab2:
                     ctx["last_report"] = st.session_state.last_ai_report
                     ctx["panel_short"] = diag['short']['status'] if diag else "不明"
                     ctx["panel_mid"] = diag['mid']['status'] if diag else "不明"
-                    st.session_state.last_strategy = logic.get_ai_order_strategy(
-                        api_key,
-                        ctx,
-                        pair_name="USD/JPY (ドル円)",
-                        portfolio_positions=st.session_state.portfolio_positions,
-                        weekly_dd_cap_percent=float(weekly_dd_cap_percent),
-                        risk_percent_per_trade=float(risk_percent),
-                        max_positions_per_currency=int(max_positions_per_currency),
-                        generation_policy=gen_policy,
-                    )
-
-                    # ✅【週次】ベース判定（その週の最初のUSD/JPY注文命令書）を保存（端末またぎの再判定に利用）
-                    _week_id, _week_start, _now = _week_meta_jst()
-                    _store = _global_week_store()
-                    if _week_id not in _store["baseline"]:
-                        _baseline_payload = _build_decision_log(
-                            event="BASELINE",
-                            week_id=_week_id,
-                            week_start_date=_week_start,
-                            pair_label="USD/JPY (ドル円)",
-                            ctx=dict(ctx),
-                            strategy=st.session_state.last_strategy if isinstance(st.session_state.last_strategy, dict) else {},
-                            settings={
-                                "capital_jpy": float(capital),
-                                "risk_percent_per_trade": float(risk_percent),
-                                "weekly_dd_cap_percent": float(weekly_dd_cap_percent),
-                                "max_positions_per_currency": int(max_positions_per_currency),
-                                "leverage": int(leverage),
-                            },
-                            portfolio_positions=list(st.session_state.portfolio_positions),
-                            last_ai_report=_clip_text(st.session_state.last_ai_report, 1600),
-                            gen_policy=gen_policy,
-                        )
-                        _store["baseline"][_week_id] = _baseline_payload
-                    st.session_state.week_baseline = _store["baseline"].get(_week_id)
-
+                    st.session_state.last_strategy = logic.get_ai_order_strategy(api_key, ctx, generation_policy=gen_policy)
                     # ✅ USD/JPY注文のEntry/TP/SLをチャートに重ね表示
                     _ov = _strategy_to_overlay("USD/JPY (ドル円)", st.session_state.last_strategy)
                     if _ov:
@@ -1540,74 +1255,6 @@ with tab2:
                 st.json(jpize_json(strategy))
             else:
                 st.markdown(strategy)
-
-
-        # --- 📁 週次ログ（1クリック保存） ---
-        _wk_id, _wk_start, _wk_now = _week_meta_jst()
-        _st = _global_week_store()
-        _baseline = _st.get("baseline", {}).get(_wk_id)
-        _wed = _st.get("wed_payload", {}).get(_wk_id)
-        with st.expander("📁 週次ログ（保存）", expanded=False):
-            st.caption("※保存先はサーバではなく、この端末のブラウザのダウンロードです。iPhone/iPadはダウンロード後にブラウザの↓から「ファイルに保存」を選ぶとiCloud経由でMacでも見られます。")
-            is_safari = _is_safari_browser()
-
-            if _baseline:
-                _b = _json_bytes(_baseline)
-                _fname = _week_file_name("baseline", _wk_id)
-
-                if is_safari:
-                    st.caption("SafariではダウンロードボタンがHTML扱いで失敗する場合があるため、リンク保存を既定にしています。")
-                    _lnk = _download_link(_b, _fname, label="Safari: タップして保存")
-                    if _lnk:
-                        st.markdown(_lnk, unsafe_allow_html=True)
-                else:
-                    _dl1 = st.download_button(
-                        "📥 BASELINE（今週のベース判定）を保存",
-                        data=_b,
-                        file_name=_fname,
-                        mime="application/json",
-                        key=f"dl_baseline_{_wk_id}"
-                    )
-                    if _dl1:
-                        st.success("BASELINEログのダウンロードを開始しました（ブラウザのダウンロード一覧をご確認ください）。")
-
-                    _lnk = _download_link(_b, _fname, label="うまくいかない時（リンクで保存）")
-                    if _lnk:
-                        st.markdown(_lnk, unsafe_allow_html=True)
-
-                with st.expander("うまく保存できない時（コピー用：JSON）", expanded=False):
-                    st.code(_json_str(_baseline), language="json")
-            else:
-                st.caption("今週のBASELINEログは未作成です（注文命令書作成後に自動生成されます）。")
-
-            if _wed:
-                _b2 = _json_bytes(_wed)
-                _fname2 = _week_file_name("wed_recheck", _wk_id)
-
-                if is_safari:
-                    st.caption("Safariではリンク保存を既定にしています。")
-                    _lnk2 = _download_link(_b2, _fname2, label="Safari: タップして保存")
-                    if _lnk2:
-                        st.markdown(_lnk2, unsafe_allow_html=True)
-                else:
-                    _dl2 = st.download_button(
-                        "📥 WED_RECHECK（水曜再判定）を保存",
-                        data=_b2,
-                        file_name=_fname2,
-                        mime="application/json",
-                        key=f"dl_wed_{_wk_id}"
-                    )
-                    if _dl2:
-                        st.success("WED_RECHECKログのダウンロードを開始しました（ブラウザのダウンロード一覧をご確認ください）。")
-
-                    _lnk2 = _download_link(_b2, _fname2, label="うまくいかない時（リンクで保存）")
-                    if _lnk2:
-                        st.markdown(_lnk2, unsafe_allow_html=True)
-
-                with st.expander("うまく保存できない時（コピー用：JSON）", expanded=False):
-                    st.code(_json_str(_wed), language="json")
-            else:
-                st.caption("水曜再判定ログは未作成です。")
 
         decision = ""
         try:
@@ -1679,19 +1326,6 @@ with tab2:
                 )
 
             alt = st.session_state.get("last_alt") or {}
-            # ✅【週次】代替提案の有無を週ストアに保存（=水曜再判定の表示条件に利用）
-            _week_id2, _week_start2, _now2 = _week_meta_jst()
-            _store2 = _global_week_store()
-            try:
-                _store2.setdefault("alt_status", {})
-                _store2["alt_status"][_week_id2] = {
-                    "best_pair_name": (alt.get("best_pair_name") if isinstance(alt, dict) else None),
-                    "blocked": (alt.get("blocked") if isinstance(alt, dict) else None),
-                    "reason": (alt.get("reason") if isinstance(alt, dict) else None),
-                }
-            except Exception:
-                pass
-
             if simple_view and isinstance(alt, dict):
                 render_alt_summary(jpize_json(alt))
                 with st.expander("詳細（JSON）"):
@@ -1711,28 +1345,7 @@ with tab2:
                     alt_ctx = _build_ctx_for_pair(best_pair, ctx, us10y_raw)
                     if not alt_ctx.get("_pair_ctx_ok"):
                         st.warning("⚠️ 代替ペアの最新テクニカル（RSI/ATR等）が取得できませんでした。精度が落ちるため、原則ノートレ推奨です。")
-                    st.session_state.last_alt_strategy = logic.get_ai_order_strategy(
-                        api_key,
-                        alt_ctx,
-                        pair_name=best_pair,
-                        portfolio_positions=st.session_state.portfolio_positions,
-                        weekly_dd_cap_percent=float(weekly_dd_cap_percent),
-                        risk_percent_per_trade=float(risk_percent),
-                        max_positions_per_currency=int(max_positions_per_currency),
-                        generation_policy='AUTO_HIERARCHY',
-                    )
-                    # ✅【週次】代替ペアの最終判定（TRADE/NO_TRADE）を週ストアに保存（=水曜再判定条件に利用）
-                    try:
-                        _wkx, _wks, _wkn = _week_meta_jst()
-                        _stx = _global_week_store()
-                        _stx.setdefault("alt_status", {})
-                        _stx["alt_status"].setdefault(_wkx, {})
-                        if isinstance(st.session_state.last_alt_strategy, dict):
-                            _stx["alt_status"][_wkx]["alt_strategy_decision"] = st.session_state.last_alt_strategy.get("decision")
-                            _stx["alt_status"][_wkx]["best_pair_name"] = best_pair
-                    except Exception:
-                        pass
-
+                    st.session_state.last_alt_strategy = logic.get_ai_order_strategy(api_key, alt_ctx, generation_policy='AUTO_HIERARCHY')
                     # ✅ 代替ペア注文のEntry/TP/SLをチャートに重ね表示（自動で代替チャートへ切替）
                     _ov2 = _strategy_to_overlay(best_pair, st.session_state.last_alt_strategy)
                     st.session_state.chart_pair_label = best_pair
@@ -1806,115 +1419,337 @@ with tab2:
                                     st.rerun()
             else:
                 st.info("条件を満たす代替ペアがないため、今週は完全ノートレ推奨です。")
-    # --- 🗓 水曜1回だけ再判定（週1回ロック） ---
-    _wk_id3, _wk_start3, _wk_now3 = _week_meta_jst()
-    _st3 = _global_week_store()
-    _baseline3 = _st3.get("baseline", {}).get(_wk_id3)
-    _alt_stat = _st3.get("alt_status", {}).get(_wk_id3) if isinstance(_st3.get("alt_status", {}), dict) else None
-    _baseline_dec = ""
-    try:
-        if isinstance(_baseline3, dict):
-            _baseline_dec = _baseline3.get("decision") or (_baseline3.get("strategy") or {}).get("decision") or ""
-    except Exception:
-        _baseline_dec = ""
-
-    _is_wed_jst = (_wk_now3.weekday() == 2)  # Monday=0, Wednesday=2
-    _wed_done = (_wk_id3 in _st3.get("wed_done", set()))
-
-    # 「月曜NO_TRADEで代替ペアも無」の週にだけ出す（=候補なし/ブロック）
-    _alt_has_candidate = False
-    try:
-        if isinstance(_alt_stat, dict):
-            _alt_has_candidate = bool(_alt_stat.get("best_pair_name"))
-    except Exception:
-        _alt_has_candidate = False
-
-    _alt_decision = ""
-    try:
-        if isinstance(_alt_stat, dict):
-            _alt_decision = str(_alt_stat.get("alt_strategy_decision") or "")
-    except Exception:
-        _alt_decision = ""
-
-    # 表示条件:
-    # - 今週BASELINEがNO_TRADE
-    # - 水曜（JST）
-    # - まだ今週実行していない
-    # - さらに「代替候補が無い」または「代替ペアでもNO_TRADEが確定している」週のみ表示
-    show_wed_recheck = bool(_baseline3) and (_baseline_dec == "NO_TRADE") and _is_wed_jst and (not _wed_done) and ( (not _alt_has_candidate) or (_alt_decision == "NO_TRADE") )
-
-    st.markdown("---")
-    st.subheader("🗓 水曜再判定（今週1回のみ）")
-    if not _baseline3:
-        st.caption("今週のベース判定（BASELINE）が未保存です。先に『注文命令書作成』を1回実行してください。")
-    else:
-        st.caption(f"今週のベース判定: **{_baseline_dec or '不明'}** / 代替候補: **{'あり' if _alt_has_candidate else 'なし'}** / 代替判定: **{_alt_decision or '未確定'}** / 水曜: **{'はい' if _is_wed_jst else 'いいえ'}** / 既に実行済み: **{'はい' if _wed_done else 'いいえ'}**")
-
-    if show_wed_recheck:
-        if st.button("🔁 水曜再判定を実行（今週1回のみ）", key="btn_wed_recheck"):
-            if not api_key:
-                st.warning("Gemini API Key を入力してください。")
-            elif not st.session_state.last_ai_report:
-                st.warning("先に『詳細レポート』を生成してください。")
-            else:
-                with st.spinner("水曜再判定中..."):
-                    # 最新のctx（この実行時点の価格/指標）で再判定
-                    ctx_re = dict(ctx)
-                    ctx_re["last_report"] = st.session_state.last_ai_report
-                    ctx_re["panel_short"] = diag['short']['status'] if diag else "不明"
-                    ctx_re["panel_mid"] = diag['mid']['status'] if diag else "不明"
-
-                    wed_strategy = logic.get_ai_order_strategy(
-                        api_key,
-                        ctx_re,
-                        pair_name="USD/JPY (ドル円)",
-                        portfolio_positions=st.session_state.portfolio_positions,
-                        weekly_dd_cap_percent=float(weekly_dd_cap_percent),
-                        risk_percent_per_trade=float(risk_percent),
-                        max_positions_per_currency=int(max_positions_per_currency),
-                        generation_policy="AUTO_HIERARCHY",
-                    )
-
-                    wed_payload = _build_decision_log(
-                        event="WED_RECHECK",
-                        week_id=_wk_id3,
-                        week_start_date=_wk_start3,
-                        pair_label="USD/JPY (ドル円)",
-                        ctx=dict(ctx_re),
-                        strategy=wed_strategy if isinstance(wed_strategy, dict) else {},
-                        settings={
-                            "capital_jpy": float(capital),
-                            "risk_percent_per_trade": float(risk_percent),
-                            "weekly_dd_cap_percent": float(weekly_dd_cap_percent),
-                            "max_positions_per_currency": int(max_positions_per_currency),
-                            "leverage": int(leverage),
-                        },
-                        portfolio_positions=list(st.session_state.portfolio_positions),
-                        last_ai_report=_clip_text(st.session_state.last_ai_report, 1600),
-                        gen_policy="AUTO_HIERARCHY",
-                    )
-
-                    _st3.setdefault("wed_payload", {})
-                    _st3["wed_payload"][_wk_id3] = wed_payload
-                    _st3.setdefault("wed_done", set())
-                    _st3["wed_done"].add(_wk_id3)
-                    st.session_state.wed_recheck_payload = wed_payload
-
-                    # 画面にも結果を出す
-                    st.success("水曜再判定を保存しました（週1回ロック済み）。下の『週次ログ（保存）』からダウンロードできます。")
-
-                    # チャート重ね表示（TRADEなら）
-                    _ov3 = _strategy_to_overlay("USD/JPY (ドル円)", wed_strategy)
-                    if _ov3:
-                        st.session_state.chart_pair_label = "USD/JPY (ドル円)"
-                        st.session_state.chart_overlay = _ov3
-
-                    st.rerun()
-    else:
-        st.caption("水曜再判定ボタンは条件を満たしたときだけ表示されます（BASELINE=NO_TRADE かつ 代替候補なし かつ 水曜 かつ 未実行）。")
-
 with tab3:
     st.markdown("##### ✅ 週末・月末判断（完全自動） & スワップ運用")
+
+    # ================================
+    # 🧪 Opportunity Audit（エントリー機会の見える化）
+    # 目的：過去データで「月曜（＋水曜救済）に、数値ゲート上“入れる週”がどれだけあるか」を数値化
+    # ※AIの最終判断（NO_TRADE返し）や実約定スプレッドは含めない＝“機会の上限”を見る
+    # ================================
+    with st.expander("🧪 Opportunity Audit（エントリー機会の見える化 / DEV）", expanded=False):
+        st.caption("過去の価格データ（日足）から、あなたの数値ゲート（NO_TRADEゲート＋トレンド週ゲート）を満たす週の頻度を集計します。"
+                   "AI出力の可否（AIがNO_TRADEを返す等）は含めないため、ここで出る件数は『最大の機会数』です。")
+        col_aud1, col_aud2, col_aud3 = st.columns([1, 1, 1])
+        with col_aud1:
+            years = st.slider("対象期間（年）", min_value=1, max_value=15, value=10, step=1)
+        with col_aud2:
+            regime_mode = st.selectbox("NO_TRADEゲートのモード", ["DEFENSIVE（保守）", "OPPORTUNITY（攻め）", "両方"], index=2)
+        with col_aud3:
+            use_wed = st.checkbox("水曜救済（週中1回）も集計", value=True)
+
+        # 対象ペア
+        pair_map = getattr(logic, "PAIR_MAP", {
+            "USD/JPY (ドル円)": "JPY=X",
+            "EUR/USD (ユーロドル)": "EURUSD=X",
+            "GBP/USD (ポンドドル)": "GBPUSD=X",
+            "AUD/USD (豪ドル米ドル)": "AUDUSD=X",
+            "EUR/JPY (ユーロ円)": "EURJPY=X",
+            "GBP/JPY (ポンド円)": "GBPJPY=X",
+            "AUD/JPY (豪ドル円)": "AUDJPY=X",
+        })
+        all_pairs = list(pair_map.keys())
+        default_pairs = all_pairs[:]  # 全部
+        pairs = st.multiselect("監査するペア", options=all_pairs, default=default_pairs)
+
+        st.markdown("**実行**：データ取得があるため最初の1回は少し時間がかかります（結果はキャッシュされます）。")
+        run_audit = st.button("📈 Opportunity Audit を実行（過去データで機会数を集計）", key="btn_opportunity_audit_run")
+
+        @st.cache_data(ttl=6*60*60, show_spinner=False)
+        def _audit_download(symbol: str, start_date: str):
+            try:
+                df = yf.download(symbol, start=start_date, interval="1d", progress=False, threads=False)
+            except Exception:
+                df = None
+            if df is None or getattr(df, "empty", True):
+                return None
+            try:
+                if getattr(df.index, "tz", None) is not None:
+                    df = df.copy()
+                    df.index = df.index.tz_localize(None)
+            except Exception:
+                pass
+            return df
+
+        def _week_start(dt: pd.Timestamp) -> pd.Timestamp:
+            try:
+                return (dt - pd.Timedelta(days=int(dt.weekday()))).normalize()
+            except Exception:
+                return dt.normalize()
+
+        def _pick_row_for_week(g: pd.DataFrame, target_weekday: int):
+            """指定曜日の行があればそれ。なければ同週内の最も近い次営業日を返す（無ければNone）。"""
+            if g is None or g.empty:
+                return None
+            try:
+                g2 = g.sort_index()
+                # まず指定曜日
+                m = g2[g2.index.weekday == target_weekday]
+                if not m.empty:
+                    return m.iloc[-1]  # その曜日の終値（最後）
+                # 次の営業日（指定曜日以降）
+                m2 = g2[g2.index.weekday > target_weekday]
+                if not m2.empty:
+                    return m2.iloc[0]
+                return None
+            except Exception:
+                return None
+
+        def _build_ctx_from_row(row, atr_avg60):
+            try:
+                return {
+                    "price": float(row["Close"]),
+                    "sma25": float(row["SMA_25"]) if "SMA_25" in row else float("nan"),
+                    "sma75": float(row["SMA_75"]) if "SMA_75" in row else float("nan"),
+                    "rsi": float(row["RSI"]) if "RSI" in row else float("nan"),
+                    "atr": float(row["ATR"]) if "ATR" in row else float("nan"),
+                    "atr_avg60": float(atr_avg60) if atr_avg60 == atr_avg60 else float("nan"),
+                    "panel_short": "",
+                    "panel_mid": "",
+                }
+            except Exception:
+                return {}
+
+        def _eval_numeric_gate(ctx: dict, market_regime: str, force_defensive: bool):
+            nt, used_regime, nt_reasons = logic.no_trade_gate(ctx, market_regime=market_regime, force_defensive=force_defensive)
+            tr_ok, side, score, tr_reasons = logic.trend_only_gate(ctx)
+            ok = (not nt) and bool(tr_ok)
+            reasons = []
+            try:
+                reasons.extend(nt_reasons or [])
+            except Exception:
+                pass
+            try:
+                reasons.extend(tr_reasons or [])
+            except Exception:
+                pass
+            return ok, side, score, used_regime, reasons
+
+        def _audit_for_regime(market_regime: str):
+            """market_regime: 'DEFENSIVE' or 'OPPORTUNITY'"""
+            start_date = (pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=int(years)*365)).date().isoformat()
+
+            pair_results = {}
+            for pair_label in pairs:
+                symbol = pair_map.get(pair_label)
+                if not symbol:
+                    continue
+
+                raw = _audit_download(symbol, start_date)
+                if raw is None or getattr(raw, "empty", True):
+                    pair_results[pair_label] = None
+                    continue
+
+                ind = logic.calculate_indicators(raw, us10y=None)
+                if ind is None or getattr(ind, "empty", True):
+                    pair_results[pair_label] = None
+                    continue
+
+                ind = ind.dropna(subset=["Close"]).copy()
+                ind["ATR_AVG60"] = ind["ATR"].rolling(60).mean()
+
+                # 週グループ
+                ind["WEEK_START"] = ind.index.map(_week_start)
+                rows = []
+                for ws, g in ind.groupby("WEEK_START"):
+                    mon = _pick_row_for_week(g, 0)  # Monday
+                    wed = _pick_row_for_week(g, 2) if use_wed else None
+
+                    # 月曜（ベース）
+                    mon_ok = False
+                    mon_side = "NONE"
+                    mon_score = None
+                    mon_reasons = []
+                    if mon is not None:
+                        ctx_m = _build_ctx_from_row(mon, g.loc[mon.name, "ATR_AVG60"] if "ATR_AVG60" in g.columns else np.nan)
+                        force_def = (pair_label != "USD/JPY (ドル円)")  # 代替は保守（ツール仕様を踏襲）
+                        mon_ok, mon_side, mon_score, used_reg, mon_reasons = _eval_numeric_gate(ctx_m, market_regime=market_regime, force_defensive=force_def)
+
+                    # 水曜救済
+                    wed_ok = False
+                    wed_side = "NONE"
+                    wed_score = None
+                    wed_reasons = []
+                    if (not mon_ok) and (wed is not None):
+                        ctx_w = _build_ctx_from_row(wed, g.loc[wed.name, "ATR_AVG60"] if "ATR_AVG60" in g.columns else np.nan)
+                        force_def = (pair_label != "USD/JPY (ドル円)")
+                        wed_ok, wed_side, wed_score, used_reg, wed_reasons = _eval_numeric_gate(ctx_w, market_regime=market_regime, force_defensive=force_def)
+
+                    rows.append({
+                        "week_start": ws.date().isoformat() if hasattr(ws, "date") else str(ws),
+                        "monday_ok": bool(mon_ok),
+                        "wednesday_ok": bool(wed_ok),
+                        "side_mon": mon_side,
+                        "side_wed": wed_side,
+                        "trend_score_mon": float(mon_score) if (mon_score is not None and mon_score == mon_score) else None,
+                        "trend_score_wed": float(wed_score) if (wed_score is not None and wed_score == wed_score) else None,
+                        "reasons_mon": mon_reasons,
+                        "reasons_wed": wed_reasons,
+                    })
+
+                pair_results[pair_label] = pd.DataFrame(rows)
+
+            # === ツール全体としての「今週入れるか」評価 ===
+            # 優先順位：USD/JPY（月）→ 代替（月）→ USD/JPY（水）→ 代替（水）
+            base = pair_results.get("USD/JPY (ドル円)")
+            alt_labels = [p for p in pairs if p != "USD/JPY (ドル円)"]
+
+            if base is None or base.empty:
+                return {"market_regime": market_regime, "pair_results": pair_results, "tool_weeks": None}
+
+            tool_rows = []
+            for _, r in base.iterrows():
+                ws = r["week_start"]
+                entry = "NO_TRADE"
+                entry_when = ""
+                entry_pair = ""
+                entry_side = ""
+                entry_score = None
+                reasons = []
+
+                # Base Monday
+                if bool(r["monday_ok"]):
+                    entry = "TRADE"
+                    entry_when = "MON_BASE"
+                    entry_pair = "USD/JPY (ドル円)"
+                    entry_side = r["side_mon"]
+                    entry_score = r["trend_score_mon"]
+                else:
+                    reasons.extend(r.get("reasons_mon") or [])
+
+                    # Alt Monday
+                    alt_hit = None
+                    for al in alt_labels:
+                        df_al = pair_results.get(al)
+                        if df_al is None or df_al.empty:
+                            continue
+                        rr = df_al[df_al["week_start"] == ws]
+                        if rr.empty:
+                            continue
+                        rr = rr.iloc[0]
+                        if bool(rr["monday_ok"]):
+                            alt_hit = (al, rr)
+                            break
+                    if alt_hit:
+                        entry = "TRADE"
+                        entry_when = "MON_ALT"
+                        entry_pair = alt_hit[0]
+                        entry_side = alt_hit[1]["side_mon"]
+                        entry_score = alt_hit[1]["trend_score_mon"]
+                    elif use_wed:
+                        # Base Wed
+                        if bool(r["wednesday_ok"]):
+                            entry = "TRADE"
+                            entry_when = "WED_BASE"
+                            entry_pair = "USD/JPY (ドル円)"
+                            entry_side = r["side_wed"]
+                            entry_score = r["trend_score_wed"]
+                        else:
+                            reasons.extend(r.get("reasons_wed") or [])
+                            # Alt Wed
+                            alt_hit2 = None
+                            for al in alt_labels:
+                                df_al = pair_results.get(al)
+                                if df_al is None or df_al.empty:
+                                    continue
+                                rr = df_al[df_al["week_start"] == ws]
+                                if rr.empty:
+                                    continue
+                                rr = rr.iloc[0]
+                                if bool(rr["wednesday_ok"]):
+                                    alt_hit2 = (al, rr)
+                                    break
+                            if alt_hit2:
+                                entry = "TRADE"
+                                entry_when = "WED_ALT"
+                                entry_pair = alt_hit2[0]
+                                entry_side = alt_hit2[1]["side_wed"]
+                                entry_score = alt_hit2[1]["trend_score_wed"]
+
+                tool_rows.append({
+                    "week_start": ws,
+                    "entry": entry,
+                    "when": entry_when,
+                    "pair": entry_pair,
+                    "side": entry_side,
+                    "trend_score": entry_score,
+                    "reject_reasons": reasons[:6],  # 代表だけ
+                })
+
+            tool_weeks = pd.DataFrame(tool_rows)
+            return {"market_regime": market_regime, "pair_results": pair_results, "tool_weeks": tool_weeks}
+
+        if run_audit:
+            with st.spinner("Opportunity Audit 実行中（データ取得・指標計算・集計）..."):
+                regimes = []
+                if regime_mode.startswith("DEFENSIVE"):
+                    regimes = ["DEFENSIVE"]
+                elif regime_mode.startswith("OPPORTUNITY"):
+                    regimes = ["OPPORTUNITY"]
+                else:
+                    regimes = ["DEFENSIVE", "OPPORTUNITY"]
+
+                results = []
+                for reg in regimes:
+                    results.append(_audit_for_regime(reg))
+
+            # 表示
+            for res in results:
+                reg = res["market_regime"]
+                st.subheader(f"📌 集計結果：{reg}")
+                tool_weeks = res.get("tool_weeks")
+                if tool_weeks is None or tool_weeks.empty:
+                    st.warning("十分なデータが取得できませんでした（通信/データ欠損の可能性）。")
+                    continue
+
+                total = len(tool_weeks)
+                trade = int((tool_weeks["entry"] == "TRADE").sum())
+                mon_base = int((tool_weeks["when"] == "MON_BASE").sum())
+                mon_alt = int((tool_weeks["when"] == "MON_ALT").sum())
+                wed_base = int((tool_weeks["when"] == "WED_BASE").sum())
+                wed_alt = int((tool_weeks["when"] == "WED_ALT").sum())
+                no_trade = total - trade
+
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.metric("週数", f"{total}")
+                c2.metric("TRADE週（機会）", f"{trade}", f"{(trade/total*100):.1f}%")
+                c3.metric("月曜・主軸", f"{mon_base}")
+                c4.metric("月曜・代替", f"{mon_alt}")
+                c5.metric("水曜救済", f"{wed_base + wed_alt}")
+
+                st.caption("※ここでのTRADE週は『数値ゲート上は入れる週』です。AIがNO_TRADEを返す/運用フィルタで弾く場合、実トレードは少なくなります。")
+
+                # 年別集計
+                try:
+                    tw = tool_weeks.copy()
+                    tw["year"] = pd.to_datetime(tw["week_start"]).dt.year
+                    ysum = tw.groupby("year").agg(
+                        weeks=("week_start","count"),
+                        trade_weeks=("entry", lambda s: int((s=="TRADE").sum())),
+                        mon_base=("when", lambda s: int((s=="MON_BASE").sum())),
+                        mon_alt=("when", lambda s: int((s=="MON_ALT").sum())),
+                        wed_salvage=("when", lambda s: int(((s=="WED_BASE")|(s=="WED_ALT")).sum())),
+                    ).reset_index()
+                    st.markdown("##### 年別サマリー")
+                    st.dataframe(ysum, use_container_width=True)
+                except Exception:
+                    pass
+
+                st.markdown("##### 週次一覧（先頭200件）")
+                st.dataframe(tool_weeks.head(200), use_container_width=True)
+
+                # 落選理由ランキング（主軸の月曜NG理由中心）
+                st.markdown("##### 落選理由TOP（主軸USD/JPY・月曜NG週）")
+                try:
+                    base_df = res["pair_results"].get("USD/JPY (ドル円)")
+                    if base_df is not None and not base_df.empty:
+                        ng = base_df[~base_df["monday_ok"]]
+                        rc = (ng["reasons_mon"].explode().dropna().astype(str).value_counts().head(12)).reset_index()
+                        rc.columns = ["reason", "count"]
+                        st.dataframe(rc, use_container_width=True)
+                except Exception:
+                    pass
+
 
     # 週末判断（JSON命令）: 人が解釈しないための最重要ボタン
     col_w1, col_w2 = st.columns([1.2, 1.0])
