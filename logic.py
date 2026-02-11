@@ -320,6 +320,153 @@ def trend_only_gate(context_data: dict):
     allowed = (len(reasons) == 0)
     return allowed, side_hint, trend_score, reasons
 
+
+# -----------------------------
+# B+：条件付きAI veto（NO_TRADE）検証
+# - 数値ゲート合格後でも、AIが「見送り」を返すことがある
+# - ただしLLMの慎重バイアス/429等で機会が消えるのを防ぐため、
+#   AI vetoは「検証できる数値根拠がある場合のみ」採用する
+# -----------------------------
+_BPLUS_VETO_POLICY = {
+    # veto_confidence がこれ未満なら原則採用しない
+    "min_confidence": 0.55,
+    # 既存ゲート（厳）より少し手前の「警戒域」（soft）を用意して、そこに入った時のみ veto を許可
+    "soft": {
+        "atr_ratio": 1.40,        # gate(1.70)より手前
+        "sma_diff_pct": 0.25,     # gate(0.20/0.15等)より少し広め
+        "trend_score": 1.20,      # gate(1.00)より手前
+        "rsi_overbought": 68.0,   # gate(70)より手前
+        "rsi_oversold": 32.0,     # gate(30)より手前
+        "rsi_neutral_lo": 45.0,
+        "rsi_neutral_hi": 55.0,
+    }
+}
+
+def _bplus_normalize_veto_codes(v) -> list:
+    """AIが返す veto_reason_codes を正規化して list[str] にする。"""
+    if v is None:
+        return []
+    if isinstance(v, str):
+        # "a,b,c" 形式も許容
+        parts = re.split(r"[\s,]+", v.strip())
+        v = [p for p in parts if p]
+    if not isinstance(v, list):
+        return []
+    out = []
+    for x in v:
+        s = str(x).strip()
+        if not s:
+            continue
+        # 記号は "_" と英数字だけ残す
+        s = re.sub(r"[^A-Za-z0-9_\-:]", "", s)
+        out.append(s.lower())
+    # 重複除去（順序維持）
+    uniq = []
+    seen = set()
+    for s in out:
+        if s in seen:
+            continue
+        seen.add(s)
+        uniq.append(s)
+    return uniq[:6]
+
+def _bplus_compute_metrics(ctx: dict, side_hint: str) -> dict:
+    """veto検証用の数値メトリクスを計算。"""
+    price = _safe_float(ctx.get("price"))
+    sma25 = _safe_float(ctx.get("sma25"))
+    sma75 = _safe_float(ctx.get("sma75"))
+    rsi = _safe_float(ctx.get("rsi"))
+    atr = _safe_float(ctx.get("atr"))
+    atr_avg60 = _safe_float(ctx.get("atr_avg60"))
+    metrics = {}
+
+    if price and sma25 is not None and sma75 is not None:
+        try:
+            metrics["sma_diff_pct"] = abs(float(sma25) - float(sma75)) / max(float(price), 1e-6) * 100.0
+        except Exception:
+            pass
+    if atr and sma25 is not None and sma75 is not None:
+        try:
+            metrics["trend_score"] = abs(float(sma25) - float(sma75)) / max(float(atr), 1e-9)
+        except Exception:
+            pass
+    if atr and atr_avg60 and float(atr_avg60) > 0:
+        try:
+            metrics["atr_ratio"] = float(atr) / float(atr_avg60)
+        except Exception:
+            pass
+    if rsi is not None:
+        metrics["rsi"] = float(rsi)
+    metrics["side_hint"] = side_hint if side_hint in ("LONG","SHORT") else "NONE"
+    return metrics
+
+def _bplus_verify_ai_veto(obj: dict, ctx: dict, side_hint: str, market_regime: str) -> tuple:
+    """AIが decision=NO_TRADE を返した時に、その veto を採用して良いか判定する。
+    Returns: (accept: bool, detail: dict)
+    """
+    veto_codes = _bplus_normalize_veto_codes(obj.get("veto_reason_codes") or obj.get("veto_codes"))
+    veto_conf = _safe_float(obj.get("veto_confidence"), default=None)
+    if veto_conf is None:
+        veto_conf = _safe_float(obj.get("confidence"), default=0.0)  # 最低限の代替
+    veto_conf = float(veto_conf or 0.0)
+
+    metrics = _bplus_compute_metrics(ctx or {}, side_hint)
+    soft = _BPLUS_VETO_POLICY["soft"]
+
+    # 既存ゲートの閾値（参考）
+    th = _NO_TRADE_THRESHOLDS.get(market_regime if market_regime in _NO_TRADE_THRESHOLDS else "DEFENSIVE", _NO_TRADE_THRESHOLDS["DEFENSIVE"])
+
+    def cond(code: str) -> bool:
+        sd = metrics.get("sma_diff_pct")
+        ts = metrics.get("trend_score")
+        ar = metrics.get("atr_ratio")
+        r = metrics.get("rsi")
+        sh = metrics.get("side_hint")
+
+        if code in ("atr_spike_soft","volatility_soft","atr_ratio_soft"):
+            return (ar is not None) and (float(ar) >= float(soft["atr_ratio"]))
+        if code in ("atr_spike","volatility_too_high_atr_spike","atr_ratio_hard"):
+            # ハード条件（本来は前段ゲートで止まるはずだが、念のため）
+            return (ar is not None) and (float(ar) >= float(th.get("atr_mult", 1.6)))
+        if code in ("ma_converge_soft","no_direction_soft"):
+            return (sd is not None) and (float(sd) < float(soft["sma_diff_pct"])) and (r is not None) and (soft["rsi_neutral_lo"] <= float(r) <= soft["rsi_neutral_hi"])
+        if code in ("ma25_ma75_too_close","ma_too_close"):
+            return (sd is not None) and (float(sd) < float(th.get("ma_close_pct", 0.10)))
+        if code in ("trend_score_low_soft","weak_trend_soft"):
+            return (ts is not None) and (float(ts) < float(soft["trend_score"]))
+        if code in ("trend_score_low","weak_trend"):
+            return (ts is not None) and (float(ts) < float(_TREND_ONLY_RULES.get("trend_score_min", 1.0)))
+        if code in ("rsi_near_extreme","rsi_extreme_soft"):
+            if r is None:
+                return False
+            rr = float(r)
+            if sh == "LONG":
+                return rr >= float(soft["rsi_overbought"])
+            if sh == "SHORT":
+                return rr <= float(soft["rsi_oversold"])
+            return False
+        if code in ("rsi_neutral","rsi_mid"):
+            return (r is not None) and (soft["rsi_neutral_lo"] <= float(r) <= soft["rsi_neutral_hi"])
+        return False
+
+    matched = []
+    for c in veto_codes:
+        if cond(c):
+            matched.append(c)
+
+    accept = (veto_conf >= float(_BPLUS_VETO_POLICY["min_confidence"])) and (len(matched) > 0)
+
+    detail = {
+        "policy": "BPLUS_CONDITIONAL_VETO",
+        "requested": bool(veto_codes),
+        "confidence": veto_conf,
+        "codes": veto_codes,
+        "matched": matched,
+        "metrics": metrics,
+        "accepted": accept,
+    }
+    return accept, detail
+
 def _recommended_stop_entry(context_data: dict, side_hint: str):
     """トレンド週の逆指値（ブレイク）用推奨エントリー価格を返す。無ければNone。"""
     price = _safe_float(context_data.get("price"))
@@ -768,7 +915,7 @@ last_report_summary={report[:700]}
         return {
             "market_regime": "DEFENSIVE",
             "confidence": 0.0,
-            "why": f"AI利用制限/エラーで相場モード判定に失敗（{type(e).__name__}）。安全側のDEFENSIVEで続行します。",
+            "why": f"market_regime 判定で例外。保守的にDEFENSIVEへ。({type(e).__name__})",
             "notes": []
         }
 
@@ -793,6 +940,7 @@ def get_ai_analysis(api_key, context_data):
         # ✅ プロンプト修正：選挙「後」の本格運用フェーズに対応
         base_prompt = f"""
 あなたはFP1級を保持する、極めて優秀な為替戦略家です。
+特に現在は「衆議院選挙の結果」を受けた直後の、極めて重要な局面であることを強く認識してください。
 
 【市場データ】
 - ドル円価格: {p:.3f}円
@@ -803,14 +951,15 @@ def get_ai_analysis(api_key, context_data):
 - 五十日判定: {gotobi_text}
 
 【分析依頼：以下の4項目に沿ってFPに分かりやすく回答してください】
-1. 【ファンダメンタルズ】日米金利差の現状と日銀の金融政策決定会合、FOMC（連邦公開市場委員会）金融政策
+1. 【ファンダメンタルズ】日米金利差の現状と、選挙結果（市場の織り込み状況）を踏まえて解説
 2. 【地政学・外部要因】選挙後の政治的安定性や、インフレ・景気後退への影響を分析
+   特に「選挙結果」が市場にサプライズを与えたか、安定をもたらしたかを判断してください。
 3. 【テクニカル】乖離率とRSI({r:.1f})、および「窓開け」の状況から見て、今は「割安」か「割高」か。
 4. 【具体的戦略】NISAや外貨建資産のバランスを考える際のアアドバイスのように、
    出口戦略（利確）を含めた今後1週間の戦略を提示
 
 【レポート構成：必ず以下の4項目に沿って記述してください】
-1. 現在の相場環境の要約
+1. 現在の相場環境の要約（選挙結果の影響含む）
 2. 上記データ（特に金利差とボラティリティ）から読み解くリスク
 3. 具体的な戦略（エントリー・利確・損切の目安価格を具体的に提示）
 4. 経済カレンダーを踏まえた、今週の警戒イベントへの助言
@@ -1096,6 +1245,10 @@ last_report_summary={report[:1200]}
   confidence: 0.0〜1.0
   why: 1〜3文（日本語）
   notes: 0〜6個の配列（日本語）
+- decision="NO_TRADE" の場合は追加で必ず含める（B+ 条件付きAI veto）：
+  veto_reason_codes: ["atr_spike_soft"|"ma_converge_soft"|"trend_score_low_soft"|"rsi_near_extreme"|"rsi_neutral"|"atr_spike"|"ma25_ma75_too_close"|"trend_score_low"]
+  veto_confidence: 0.0〜1.0
+- 重要: 上記コードに該当する**数値根拠がない**なら、decision は "TRADE" を選ぶこと（曖昧な慎重さで見送りにしない）。
 - 追加必須キー（注文方式の自動化）：
   order_bundle: "IFD_OCO" | "OCO" | "NONE"
   entry_type: "STOP" | "LIMIT" | "MARKET" | "NONE"
@@ -1136,6 +1289,26 @@ last_report_summary={report[:1200]}
         # 正常時：regimeを付与
         obj["market_regime"] = market_regime
         obj["regime_why"] = regime_why
+
+        # --- B+：条件付きAI veto（decision=NO_TRADEの扱い） ---
+        # 数値ゲート（NO_TRADEゲート + トレンド週ゲート）を通過している前提でも、
+        # LLMが慎重に倒れて NO_TRADE を返すことがある。
+        # ただし機会損失を減らすため、veto は「数値で検証できる根拠」がある場合のみ採用。
+        try:
+            if str(obj.get("decision", "") or "").upper() == "NO_TRADE":
+                accept_veto, veto_detail = _bplus_verify_ai_veto(obj, context_data, side_hint, market_regime)
+                if accept_veto:
+                    obj.setdefault("notes", []).append("ai_veto_verified")
+                    obj["ai_veto"] = veto_detail
+                else:
+                    # veto不採用：数値フォールバックでTRADE（止まらない）
+                    fb = _build_numeric_fallback_order(context_data, market_regime, regime_why, pair_name=str((context_data or {}).get("pair_label","") or ""))
+                    fb.setdefault("notes", []).append("ai_veto_unverified")
+                    fb.setdefault("notes", []).append("ai_veto_unverified_overridden")
+                    fb["ai_veto"] = veto_detail
+                    obj = fb
+        except Exception:
+            pass
 
         # --- 注文方式の確定（週1放置運用：トレンド週のみ + 逆指値IFD-OCO固定） ---
         try:
@@ -2776,258 +2949,3 @@ def get_ai_order_strategy(
     # 最終手段：数値フォールバック
     fb = _build_numeric_fallback_order(ctx, market_regime, regime_why, pair_name=pair_name or "")
     return fb
-
-
-# ==========================================================
-# PATCH (2026-02-10)
-# - suggest_alternative_pair_if_usdjpy_stay: return up to 3 candidates with accepted/rejected reasons
-#   so main.py's「候補（最大3）＋落選理由」UIが常に埋まる
-# ==========================================================
-
-try:
-    _SUGGEST_ALT_CORE = suggest_alternative_pair_if_usdjpy_stay  # type: ignore
-except Exception:
-    _SUGGEST_ALT_CORE = None
-
-def _alt_reject(code: str, extra=None):
-    out = [code]
-    if extra:
-        if isinstance(extra, list):
-            out.extend([str(x) for x in extra if str(x).strip()])
-        else:
-            out.append(str(extra))
-    # unique while keeping order
-    seen = set()
-    dedup = []
-    for x in out:
-        if x not in seen:
-            seen.add(x)
-            dedup.append(x)
-    return dedup
-
-def _build_numeric_top_candidates(active_positions, exclude_pair_label, max_positions_per_currency, topn=3):
-    """Deterministic top list for UI when AI is unavailable."""
-    items = []
-    exclude_head = (exclude_pair_label or "").split()[0]
-    for pair_label in (PAIR_MAP or {}).keys():
-        try:
-            if (pair_label or "").split()[0] == exclude_head:
-                continue
-            if active_positions:
-                if violates_currency_concentration(pair_label, active_positions, max_positions_per_currency=max_positions_per_currency):
-                    continue
-            ok, dbg = _alt_pair_tradeable_precheck(pair_label)
-            if not ok:
-                continue
-            score = float(dbg.get("trend_score") or -1e9)
-            items.append((score, pair_label, dbg))
-        except Exception:
-            continue
-    items.sort(key=lambda x: x[0], reverse=True)
-    out = []
-    for score, pair_label, dbg in items[:topn]:
-        out.append({
-            "pair": pair_label,
-            "reason": f"数値スキャン: tradeable（trend_score={float(dbg.get('trend_score') or 0.0):.2f}）",
-            "confidence": 0.65,
-            "status": "CANDIDATE",
-            "rejected_by": [],
-            "meta": dbg,
-        })
-    return out
-
-def suggest_alternative_pair_if_usdjpy_stay(
-    api_key: str,
-    active_positions: list,
-    risk_percent_per_trade: float,
-    weekly_dd_cap_percent: float = 2.0,
-    max_positions_per_currency: int = 1,
-    exclude_pair_label: str = "USD/JPY (ドル円)",
-) -> dict:
-    """USD/JPYが見送りの時の代替ペア提案（最大3候補＋落選理由つき）。
-    重要:
-      - AIが候補を1つしか返さない場合でも、UI透明性のため「合計3件」になるまで数値候補で補完する
-      - 候補は SELECTED / REJECTED を明示し、REJECTED には rejected_by を入れる
-    """
-
-    active_positions = active_positions or []
-
-    # 1) Weekly DD cap gate
-    if not can_open_under_weekly_cap(active_positions, risk_percent_per_trade, weekly_dd_cap_percent):
-        return {
-            "best_pair_name": "",
-            "reason": "週単位DDキャップを超えるため今週は新規不可",
-            "confidence": 1.0,
-            "blocked": True,
-            "blocked_by": "weekly_dd_cap",
-            "candidates": [
-                {"pair": "", "reason": "weekly_dd_cap", "confidence": 1.0, "status": "REJECTED", "rejected_by": ["weekly_dd_cap"]}
-            ],
-        }
-
-    # 2) Build AI candidates (up to 5)
-    candidates_raw = []
-    model_name = None
-    try:
-        model_name = get_active_model(api_key)
-    except Exception:
-        model_name = None
-
-    if model_name:
-        try:
-            market_summary = _build_market_summary_for_pairs()
-            bias_note = "（現在ノーポジのため、JPYクロスも候補に含めてOK）" if not active_positions else "（既存ポジとの通貨重複を避ける）"
-            allowed_labels = list((PAIR_MAP or {}).keys())
-            prompt = f"""
-あなたはプロのFXファンドマネージャーです。
-以下の市場データから「今週、USD/JPYが見送りのときに代替として最も利益チャンスがありそうなペア」を最大5つ、優先順で提案してください。
-{bias_note}
-
-【市場概況】
-{market_summary}
-
-【必須制約】
-- 可能なら {exclude_pair_label} 以外から選ぶ
-- 出力はJSONのみ
-- pair は必ず次の候補のいずれかから選ぶ（表記は完全一致）:
-{allowed_labels}
-
-【出力JSON】
-{{
-  "candidates": [
-    {{"pair": "EUR/USD (ユーロドル)", "reason": "...", "confidence": 0.0}},
-    {{"pair": "AUD/JPY (豪ドル円)", "reason": "...", "confidence": 0.0}}
-  ]
-}}
-""".strip()
-            model = genai.GenerativeModel(model_name)
-            resp = model.generate_content(prompt)
-            txt = (resp.text or "").strip()
-            data = safe_json_loads(txt) if callable(globals().get("safe_json_loads")) else json.loads(_extract_json(txt))
-            candidates_raw = data.get("candidates", []) if isinstance(data, dict) else []
-        except Exception:
-            candidates_raw = []
-
-    # 3) Evaluate candidates with explicit reasons
-    exclude_head = (exclude_pair_label or "").split()[0]
-    evaluated = []
-    selected = None
-
-    def _already_in(pair_label: str) -> bool:
-        try:
-            return any(isinstance(x, dict) and x.get("pair") == pair_label for x in evaluated)
-        except Exception:
-            return False
-
-    def _push_eval(pair, reason, conf):
-        nonlocal selected, evaluated
-        if not pair:
-            return
-        if _already_in(pair):
-            return
-
-        item = {
-            "pair": pair,
-            "reason": str(reason or ""),
-            "confidence": float(conf) if conf is not None else 0.5,
-            "status": "CANDIDATE",
-            "rejected_by": [],
-        }
-
-        # basic filter
-        if (pair.split()[0] == exclude_head):
-            item["status"] = "REJECTED"
-            item["rejected_by"] = _alt_reject("excluded_pair")
-            evaluated.append(item)
-            return
-
-        # currency concentration
-        if active_positions:
-            try:
-                if violates_currency_concentration(pair, active_positions, max_positions_per_currency=max_positions_per_currency):
-                    item["status"] = "REJECTED"
-                    item["rejected_by"] = _alt_reject("currency_concentration")
-                    evaluated.append(item)
-                    return
-            except Exception:
-                pass
-
-        # tradeable precheck (trend_only + no_trade_gate conservative)
-        try:
-            ok, dbg = _alt_pair_tradeable_precheck(pair)
-        except Exception as e:
-            ok, dbg = False, {"why": f"precheck_error:{type(e).__name__}", "notes": []}
-
-        item["meta"] = dbg
-        if not ok:
-            why = str((dbg or {}).get("why", "precheck_block"))
-            notes = (dbg or {}).get("notes", [])
-            item["status"] = "REJECTED"
-            # map common reasons to user-facing keys
-            if why == "trend_only_gate_block":
-                item["rejected_by"] = _alt_reject("trend_only_gate", notes[:3] if isinstance(notes, list) else notes)
-            elif why == "no_trade_gate_block":
-                item["rejected_by"] = _alt_reject("no_trade_gate", notes[:3] if isinstance(notes, list) else notes)
-            else:
-                item["rejected_by"] = _alt_reject(why, notes[:2] if isinstance(notes, list) else notes)
-            evaluated.append(item)
-            return
-
-        # eligible
-        if selected is None:
-            item["status"] = "SELECTED"
-            selected = item
-        else:
-            # 採用は1つだけにして、他のtradeableは「優先度が低い」扱いで落選理由を付与（透明性）
-            item["status"] = "REJECTED"
-            item["rejected_by"] = _alt_reject("ranked_lower")
-        evaluated.append(item)
-
-    # AI candidates first
-    for c in (candidates_raw or []):
-        if len(evaluated) >= 5:
-            break
-        if not isinstance(c, dict):
-            continue
-        _push_eval((c.get("pair") or ""), c.get("reason"), c.get("confidence", 0.5))
-
-    # 4) Fill up to 3 entries for UI transparency (even if AI returns only 1)
-    #    Use deterministic universe order: PAIR_MAP order (excluding base), then numeric best.
-    for pair_label in (PAIR_MAP or {}).keys():
-        if len(evaluated) >= 3:
-            break
-        if not pair_label or (pair_label.split()[0] == exclude_head):
-            continue
-        # Give a neutral reason if it wasn't from AI
-        _push_eval(pair_label, "補完候補（数値ゲート判定）", 0.55)
-
-    # If still fewer than 3 (very rare), try numeric scan best as final fill
-    if len(evaluated) < 3:
-        try:
-            fb = numeric_scan_best_pair(
-                active_positions=active_positions,
-                exclude_pair_label=exclude_pair_label,
-                max_positions_per_currency=max_positions_per_currency,
-            )
-        except Exception:
-            fb = {}
-        if isinstance(fb, dict) and fb.get("best_pair_name"):
-            _push_eval(fb.get("best_pair_name"), fb.get("reason"), fb.get("confidence", 0.65))
-
-    # Ensure selected set if any eligible exists
-    if selected is None:
-        for it in evaluated:
-            if isinstance(it, dict) and it.get("status") == "SELECTED":
-                selected = it
-                break
-
-    # Compose output (max 3 for UI)
-    out = {
-        "best_pair_name": (selected or {}).get("pair", "") if selected else "",
-        "reason": (selected or {}).get("reason", "") if selected else "条件（トレンド/荒れ相場/分散）を満たす代替ペアが見つかりませんでした",
-        "confidence": float((selected or {}).get("confidence", 0.0) if selected else 0.0),
-        "blocked": (selected is None),
-        "blocked_by": "filters" if selected is None else "",
-        "candidates": evaluated[:3],
-    }
-    return out
