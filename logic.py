@@ -768,7 +768,7 @@ last_report_summary={report[:700]}
         return {
             "market_regime": "DEFENSIVE",
             "confidence": 0.0,
-            "why": f"market_regime 判定で例外。保守的にDEFENSIVEへ。({type(e).__name__})",
+            "why": f"AI利用制限/エラーで相場モード判定に失敗（{type(e).__name__}）。安全側のDEFENSIVEで続行します。",
             "notes": []
         }
 
@@ -793,7 +793,6 @@ def get_ai_analysis(api_key, context_data):
         # ✅ プロンプト修正：選挙「後」の本格運用フェーズに対応
         base_prompt = f"""
 あなたはFP1級を保持する、極めて優秀な為替戦略家です。
-特に現在は「衆議院選挙の結果」を受けた直後の、極めて重要な局面であることを強く認識してください。
 
 【市場データ】
 - ドル円価格: {p:.3f}円
@@ -804,15 +803,14 @@ def get_ai_analysis(api_key, context_data):
 - 五十日判定: {gotobi_text}
 
 【分析依頼：以下の4項目に沿ってFPに分かりやすく回答してください】
-1. 【ファンダメンタルズ】日米金利差の現状と、選挙結果（市場の織り込み状況）を踏まえて解説
+1. 【ファンダメンタルズ】日米金利差の現状と日銀の金融政策決定会合、FOMC（連邦公開市場委員会）金融政策
 2. 【地政学・外部要因】選挙後の政治的安定性や、インフレ・景気後退への影響を分析
-   特に「選挙結果」が市場にサプライズを与えたか、安定をもたらしたかを判断してください。
 3. 【テクニカル】乖離率とRSI({r:.1f})、および「窓開け」の状況から見て、今は「割安」か「割高」か。
 4. 【具体的戦略】NISAや外貨建資産のバランスを考える際のアアドバイスのように、
    出口戦略（利確）を含めた今後1週間の戦略を提示
 
 【レポート構成：必ず以下の4項目に沿って記述してください】
-1. 現在の相場環境の要約（選挙結果の影響含む）
+1. 現在の相場環境の要約
 2. 上記データ（特に金利差とボラティリティ）から読み解くリスク
 3. 具体的な戦略（エントリー・利確・損切の目安価格を具体的に提示）
 4. 経済カレンダーを踏まえた、今週の警戒イベントへの助言
@@ -2846,7 +2844,11 @@ def suggest_alternative_pair_if_usdjpy_stay(
     max_positions_per_currency: int = 1,
     exclude_pair_label: str = "USD/JPY (ドル円)",
 ) -> dict:
-    """USD/JPYが見送りの時の代替ペア提案（最大3候補＋落選理由つき）。"""
+    """USD/JPYが見送りの時の代替ペア提案（最大3候補＋落選理由つき）。
+    重要:
+      - AIが候補を1つしか返さない場合でも、UI透明性のため「合計3件」になるまで数値候補で補完する
+      - 候補は SELECTED / REJECTED を明示し、REJECTED には rejected_by を入れる
+    """
 
     active_positions = active_positions or []
 
@@ -2901,7 +2903,7 @@ def suggest_alternative_pair_if_usdjpy_stay(
             model = genai.GenerativeModel(model_name)
             resp = model.generate_content(prompt)
             txt = (resp.text or "").strip()
-            data = safe_json_loads(txt) if callable(globals().get("safe_json_loads")) else json.loads(txt)
+            data = safe_json_loads(txt) if callable(globals().get("safe_json_loads")) else json.loads(_extract_json(txt))
             candidates_raw = data.get("candidates", []) if isinstance(data, dict) else []
         except Exception:
             candidates_raw = []
@@ -2911,8 +2913,19 @@ def suggest_alternative_pair_if_usdjpy_stay(
     evaluated = []
     selected = None
 
+    def _already_in(pair_label: str) -> bool:
+        try:
+            return any(isinstance(x, dict) and x.get("pair") == pair_label for x in evaluated)
+        except Exception:
+            return False
+
     def _push_eval(pair, reason, conf):
         nonlocal selected, evaluated
+        if not pair:
+            return
+        if _already_in(pair):
+            return
+
         item = {
             "pair": pair,
             "reason": str(reason or ""),
@@ -2922,7 +2935,7 @@ def suggest_alternative_pair_if_usdjpy_stay(
         }
 
         # basic filter
-        if not pair or (pair.split()[0] == exclude_head):
+        if (pair.split()[0] == exclude_head):
             item["status"] = "REJECTED"
             item["rejected_by"] = _alt_reject("excluded_pair")
             evaluated.append(item)
@@ -2952,11 +2965,11 @@ def suggest_alternative_pair_if_usdjpy_stay(
             item["status"] = "REJECTED"
             # map common reasons to user-facing keys
             if why == "trend_only_gate_block":
-                item["rejected_by"] = _alt_reject("trend_only_gate", notes[:2] if isinstance(notes, list) else notes)
+                item["rejected_by"] = _alt_reject("trend_only_gate", notes[:3] if isinstance(notes, list) else notes)
             elif why == "no_trade_gate_block":
-                item["rejected_by"] = _alt_reject("no_trade_gate", notes[:2] if isinstance(notes, list) else notes)
+                item["rejected_by"] = _alt_reject("no_trade_gate", notes[:3] if isinstance(notes, list) else notes)
             else:
-                item["rejected_by"] = _alt_reject(why, notes[:1] if isinstance(notes, list) else notes)
+                item["rejected_by"] = _alt_reject(why, notes[:2] if isinstance(notes, list) else notes)
             evaluated.append(item)
             return
 
@@ -2964,6 +2977,10 @@ def suggest_alternative_pair_if_usdjpy_stay(
         if selected is None:
             item["status"] = "SELECTED"
             selected = item
+        else:
+            # 採用は1つだけにして、他のtradeableは「優先度が低い」扱いで落選理由を付与（透明性）
+            item["status"] = "REJECTED"
+            item["rejected_by"] = _alt_reject("ranked_lower")
         evaluated.append(item)
 
     # AI candidates first
@@ -2974,15 +2991,18 @@ def suggest_alternative_pair_if_usdjpy_stay(
             continue
         _push_eval((c.get("pair") or ""), c.get("reason"), c.get("confidence", 0.5))
 
-    # If AI produced nothing usable, make a deterministic candidate list
-    if not evaluated:
-        evaluated = _build_numeric_top_candidates(active_positions, exclude_pair_label, max_positions_per_currency, topn=3)
-        if evaluated:
-            evaluated[0]["status"] = "SELECTED"
-            selected = evaluated[0]
+    # 4) Fill up to 3 entries for UI transparency (even if AI returns only 1)
+    #    Use deterministic universe order: PAIR_MAP order (excluding base), then numeric best.
+    for pair_label in (PAIR_MAP or {}).keys():
+        if len(evaluated) >= 3:
+            break
+        if not pair_label or (pair_label.split()[0] == exclude_head):
+            continue
+        # Give a neutral reason if it wasn't from AI
+        _push_eval(pair_label, "補完候補（数値ゲート判定）", 0.55)
 
-    # If still not selected, try numeric scan best as final fallback (keeps existing behavior)
-    if selected is None:
+    # If still fewer than 3 (very rare), try numeric scan best as final fill
+    if len(evaluated) < 3:
         try:
             fb = numeric_scan_best_pair(
                 active_positions=active_positions,
@@ -2993,11 +3013,13 @@ def suggest_alternative_pair_if_usdjpy_stay(
             fb = {}
         if isinstance(fb, dict) and fb.get("best_pair_name"):
             _push_eval(fb.get("best_pair_name"), fb.get("reason"), fb.get("confidence", 0.65))
-            # ensure selected is set if last push was eligible
-            for it in evaluated:
-                if it.get("status") == "SELECTED":
-                    selected = it
-                    break
+
+    # Ensure selected set if any eligible exists
+    if selected is None:
+        for it in evaluated:
+            if isinstance(it, dict) and it.get("status") == "SELECTED":
+                selected = it
+                break
 
     # Compose output (max 3 for UI)
     out = {
