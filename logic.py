@@ -320,153 +320,6 @@ def trend_only_gate(context_data: dict):
     allowed = (len(reasons) == 0)
     return allowed, side_hint, trend_score, reasons
 
-
-# -----------------------------
-# B+：条件付きAI veto（NO_TRADE）検証
-# - 数値ゲート合格後でも、AIが「見送り」を返すことがある
-# - ただしLLMの慎重バイアス/429等で機会が消えるのを防ぐため、
-#   AI vetoは「検証できる数値根拠がある場合のみ」採用する
-# -----------------------------
-_BPLUS_VETO_POLICY = {
-    # veto_confidence がこれ未満なら原則採用しない
-    "min_confidence": 0.55,
-    # 既存ゲート（厳）より少し手前の「警戒域」（soft）を用意して、そこに入った時のみ veto を許可
-    "soft": {
-        "atr_ratio": 1.40,        # gate(1.70)より手前
-        "sma_diff_pct": 0.25,     # gate(0.20/0.15等)より少し広め
-        "trend_score": 1.20,      # gate(1.00)より手前
-        "rsi_overbought": 68.0,   # gate(70)より手前
-        "rsi_oversold": 32.0,     # gate(30)より手前
-        "rsi_neutral_lo": 45.0,
-        "rsi_neutral_hi": 55.0,
-    }
-}
-
-def _bplus_normalize_veto_codes(v) -> list:
-    """AIが返す veto_reason_codes を正規化して list[str] にする。"""
-    if v is None:
-        return []
-    if isinstance(v, str):
-        # "a,b,c" 形式も許容
-        parts = re.split(r"[\s,]+", v.strip())
-        v = [p for p in parts if p]
-    if not isinstance(v, list):
-        return []
-    out = []
-    for x in v:
-        s = str(x).strip()
-        if not s:
-            continue
-        # 記号は "_" と英数字だけ残す
-        s = re.sub(r"[^A-Za-z0-9_\-:]", "", s)
-        out.append(s.lower())
-    # 重複除去（順序維持）
-    uniq = []
-    seen = set()
-    for s in out:
-        if s in seen:
-            continue
-        seen.add(s)
-        uniq.append(s)
-    return uniq[:6]
-
-def _bplus_compute_metrics(ctx: dict, side_hint: str) -> dict:
-    """veto検証用の数値メトリクスを計算。"""
-    price = _safe_float(ctx.get("price"))
-    sma25 = _safe_float(ctx.get("sma25"))
-    sma75 = _safe_float(ctx.get("sma75"))
-    rsi = _safe_float(ctx.get("rsi"))
-    atr = _safe_float(ctx.get("atr"))
-    atr_avg60 = _safe_float(ctx.get("atr_avg60"))
-    metrics = {}
-
-    if price and sma25 is not None and sma75 is not None:
-        try:
-            metrics["sma_diff_pct"] = abs(float(sma25) - float(sma75)) / max(float(price), 1e-6) * 100.0
-        except Exception:
-            pass
-    if atr and sma25 is not None and sma75 is not None:
-        try:
-            metrics["trend_score"] = abs(float(sma25) - float(sma75)) / max(float(atr), 1e-9)
-        except Exception:
-            pass
-    if atr and atr_avg60 and float(atr_avg60) > 0:
-        try:
-            metrics["atr_ratio"] = float(atr) / float(atr_avg60)
-        except Exception:
-            pass
-    if rsi is not None:
-        metrics["rsi"] = float(rsi)
-    metrics["side_hint"] = side_hint if side_hint in ("LONG","SHORT") else "NONE"
-    return metrics
-
-def _bplus_verify_ai_veto(obj: dict, ctx: dict, side_hint: str, market_regime: str) -> tuple:
-    """AIが decision=NO_TRADE を返した時に、その veto を採用して良いか判定する。
-    Returns: (accept: bool, detail: dict)
-    """
-    veto_codes = _bplus_normalize_veto_codes(obj.get("veto_reason_codes") or obj.get("veto_codes"))
-    veto_conf = _safe_float(obj.get("veto_confidence"), default=None)
-    if veto_conf is None:
-        veto_conf = _safe_float(obj.get("confidence"), default=0.0)  # 最低限の代替
-    veto_conf = float(veto_conf or 0.0)
-
-    metrics = _bplus_compute_metrics(ctx or {}, side_hint)
-    soft = _BPLUS_VETO_POLICY["soft"]
-
-    # 既存ゲートの閾値（参考）
-    th = _NO_TRADE_THRESHOLDS.get(market_regime if market_regime in _NO_TRADE_THRESHOLDS else "DEFENSIVE", _NO_TRADE_THRESHOLDS["DEFENSIVE"])
-
-    def cond(code: str) -> bool:
-        sd = metrics.get("sma_diff_pct")
-        ts = metrics.get("trend_score")
-        ar = metrics.get("atr_ratio")
-        r = metrics.get("rsi")
-        sh = metrics.get("side_hint")
-
-        if code in ("atr_spike_soft","volatility_soft","atr_ratio_soft"):
-            return (ar is not None) and (float(ar) >= float(soft["atr_ratio"]))
-        if code in ("atr_spike","volatility_too_high_atr_spike","atr_ratio_hard"):
-            # ハード条件（本来は前段ゲートで止まるはずだが、念のため）
-            return (ar is not None) and (float(ar) >= float(th.get("atr_mult", 1.6)))
-        if code in ("ma_converge_soft","no_direction_soft"):
-            return (sd is not None) and (float(sd) < float(soft["sma_diff_pct"])) and (r is not None) and (soft["rsi_neutral_lo"] <= float(r) <= soft["rsi_neutral_hi"])
-        if code in ("ma25_ma75_too_close","ma_too_close"):
-            return (sd is not None) and (float(sd) < float(th.get("ma_close_pct", 0.10)))
-        if code in ("trend_score_low_soft","weak_trend_soft"):
-            return (ts is not None) and (float(ts) < float(soft["trend_score"]))
-        if code in ("trend_score_low","weak_trend"):
-            return (ts is not None) and (float(ts) < float(_TREND_ONLY_RULES.get("trend_score_min", 1.0)))
-        if code in ("rsi_near_extreme","rsi_extreme_soft"):
-            if r is None:
-                return False
-            rr = float(r)
-            if sh == "LONG":
-                return rr >= float(soft["rsi_overbought"])
-            if sh == "SHORT":
-                return rr <= float(soft["rsi_oversold"])
-            return False
-        if code in ("rsi_neutral","rsi_mid"):
-            return (r is not None) and (soft["rsi_neutral_lo"] <= float(r) <= soft["rsi_neutral_hi"])
-        return False
-
-    matched = []
-    for c in veto_codes:
-        if cond(c):
-            matched.append(c)
-
-    accept = (veto_conf >= float(_BPLUS_VETO_POLICY["min_confidence"])) and (len(matched) > 0)
-
-    detail = {
-        "policy": "BPLUS_CONDITIONAL_VETO",
-        "requested": bool(veto_codes),
-        "confidence": veto_conf,
-        "codes": veto_codes,
-        "matched": matched,
-        "metrics": metrics,
-        "accepted": accept,
-    }
-    return accept, detail
-
 def _recommended_stop_entry(context_data: dict, side_hint: str):
     """トレンド週の逆指値（ブレイク）用推奨エントリー価格を返す。無ければNone。"""
     price = _safe_float(context_data.get("price"))
@@ -855,11 +708,12 @@ def get_active_model(api_key):
 def get_ai_market_regime(api_key, context_data):
     """
     market_regime を AI に出させる（DEFENSIVE / OPPORTUNITY）。
-    ここでの出力は「NO_TRADEゲートの厳しさ」を切替える目的（裁量介入を減らす）。
-    JSONのみ返す。
+    目的：NO_TRADEゲート（数値）の厳しさを切り替える。
+    ※推測でニュースを作らず、数値中心で判断する。
     """
     try:
         model = genai.GenerativeModel(get_active_model(api_key))
+        pair_label = str(context_data.get("pair_label", "USD/JPY"))
         p = context_data.get("price", 0.0)
         rsi = context_data.get("rsi", 0.0)
         sma25 = context_data.get("sma25", 0.0)
@@ -868,14 +722,13 @@ def get_ai_market_regime(api_key, context_data):
         atr_avg60 = context_data.get("atr_avg60", 0.0)
         ps = context_data.get("panel_short", "不明")
         pm = context_data.get("panel_mid", "不明")
-        report = context_data.get("last_report", "なし")
 
         prompt = f"""
 あなたはFX運用の市場環境判定エンジンです。
 目的：今週の市場環境を「守り(DEFENSIVE)」か「機会(OPPORTUNITY)」のどちらかに分類し、
 NO_TRADEゲートの厳しさを切り替えるための判定を出してください。
 
-【入力（USD/JPY）】
+【入力（{pair_label}）】
 price={p}
 rsi={rsi}
 sma25={sma25}
@@ -884,7 +737,6 @@ atr={atr}
 atr_avg60={atr_avg60}
 panel_short={ps}
 panel_mid={pm}
-last_report_summary={report[:700]}
 
 【出力ルール】
 - 出力はJSONオブジェクトのみ（前後に文章を付けない）
@@ -896,8 +748,10 @@ last_report_summary={report[:700]}
 
 【判定の目安】
 - DEFENSIVE: 方向感が弱い/レンジ/ボラが荒い/中期が静観など、期待値が低い
-- OPPORTUNITY: 週足で方向感が比較的明確で、継続/伸びが期待できる
+- OPPORTUNITY: 週足〜日足で方向感が比較的明確で、継続/伸びが期待できる
+※推測で時事ネタ（選挙・ニュース）を作らない。数値データ中心で判断する。
 """
+
         resp = model.generate_content(prompt)
         raw = getattr(resp, "text", "") or ""
         j = _extract_json_block(raw)
@@ -911,6 +765,7 @@ last_report_summary={report[:700]}
                 "notes": ["parse_or_validation_failed", *reasons]
             }
         return obj
+
     except Exception as e:
         return {
             "market_regime": "DEFENSIVE",
@@ -919,71 +774,63 @@ last_report_summary={report[:700]}
             "notes": []
         }
 
+
 def get_ai_analysis(api_key, context_data):
+    """数値中心のAIレポート（推測でニュースを作らない）。"""
     try:
         model = genai.GenerativeModel(get_active_model(api_key))
-        p, u, a, s, r = (
-            context_data.get("price", 0.0),
-            context_data.get("us10y", 0.0),
-            context_data.get("atr", 0.0),
-            context_data.get("sma_diff", 0.0),
-            context_data.get("rsi", 50.0),
-        )
+        pair_label = str(context_data.get("pair_label", "USD/JPY"))
+        p = context_data.get("price", 0.0)
+        u = context_data.get("us10y", 0.0)
+        a = context_data.get("atr", 0.0)
+        s = context_data.get("sma_diff", 0.0)
+        r = context_data.get("rsi", 50.0)
+
         capital = context_data.get("capital", 300000)
-        
-        is_gotobi = context_data.get("is_gotobi", False)
-        gotobi_text = "今日は五十日(ゴトウビ)です。実需のドル買いフローに注意してください。" if is_gotobi else "今日は五十日ではありません。"
+        is_gotobi = bool(context_data.get("is_gotobi", False))
+        has_jpy = ("JPY" in pair_label)
+        gotobi_text = ("今日は五十日(ゴトウビ)です。実需フローに注意。" if is_gotobi else "今日は五十日ではありません。")
+        if not has_jpy:
+            gotobi_text = "（五十日判定はJPY関連ペアのみ参考）"
 
         ep = context_data.get("entry_price", 0.0)
         tt = context_data.get("trade_type", "なし")
 
-        # ✅ プロンプト修正：選挙「後」の本格運用フェーズに対応
         base_prompt = f"""
-あなたはFP1級を保持する、極めて優秀な為替戦略家です。
-特に現在は「衆議院選挙の結果」を受けた直後の、極めて重要な局面であることを強く認識してください。
+あなたはFXの為替戦略家です。**推測で時事ネタ（選挙・要人発言・ニュース）を作らず**、与えられた数値データ中心に分析してください。
 
 【市場データ】
-- ドル円価格: {p:.3f}円
-- 日米金利差(10年債): {u:.2f}%
-- ボラティリティ(ATR): {a:.3f}
+- 通貨ペア: {pair_label}
+- 現在価格: {p:.5f}
+- 米10年金利(US10Y): {u:.2f}%
+- ボラティリティ(ATR): {a:.5f}
 - SMA25乖離率: {s:.2f}%
 - RSI(14日): {r:.1f}
 - 五十日判定: {gotobi_text}
 
-【分析依頼：以下の4項目に沿ってFPに分かりやすく回答してください】
-1. 【ファンダメンタルズ】日米金利差の現状と、選挙結果（市場の織り込み状況）を踏まえて解説
-2. 【地政学・外部要因】選挙後の政治的安定性や、インフレ・景気後退への影響を分析
-   特に「選挙結果」が市場にサプライズを与えたか、安定をもたらしたかを判断してください。
-3. 【テクニカル】乖離率とRSI({r:.1f})、および「窓開け」の状況から見て、今は「割安」か「割高」か。
-4. 【具体的戦略】NISAや外貨建資産のバランスを考える際のアアドバイスのように、
-   出口戦略（利確）を含めた今後1週間の戦略を提示
+【運用前提】
+- 週〜月で放置するトレンド運用（デイトレはしない）
+- 1トレード許容損失: 2%（目安）
+- 週単位DDキャップ: 2%（目安）
 
-【レポート構成：必ず以下の4項目に沿って記述してください】
-1. 現在の相場環境の要約（選挙結果の影響含む）
-2. 上記データ（特に金利差とボラティリティ）から読み解くリスク
-3. 具体的な戦略（エントリー・利確・損切の目安価格を具体的に提示）
-4. 経済カレンダーを踏まえた、今週の警戒イベントへの助言
-
-回答は親しみやすくも、プロの厳格さを感じる日本語でお願いします。
-        """
+【出力】以下の構成で日本語で簡潔に
+1) 相場環境の要約（数値根拠つき）
+2) リスク（何が起きると崩れるか）
+3) 戦略（エントリー/TP/SLの目安と根拠。見送りなら見送りと明記）
+4) 注意点（ボラ急増・レンジ化など）
+"""
 
         add_prompt = f"""
-        【追加コンテキスト：ユーザーの実戦運用情報】
-        ユーザーは現在、軍資金{capital}円（SBI FX/レバレッジ25倍）で運用中です。
-        保有ポジション: {f"{ep}円で{tt}" if ep > 0 else "現在なし"}
+【追加コンテキスト：ユーザー運用情報】
+- 軍資金: {capital}円（レバ25想定）
+- 保有ポジション: {f"{ep}で{tt}" if ep > 0 else "なし"}
 
-        もしポジションがある場合、上記3の「具体的戦略」内で、
-        この保有建玉に対する「選挙後の処理（ホールド/決済）」を具体的に助言してください。
-        
-        また、以下の2点を必ず追記してください。
-        - **推奨スリップロス**: 現在のボラティリティ(ATR)に基づいた、注文を通すための許容値（pips）。
-        - **資金管理**: 30万円を守りながら増やすためのリスク管理アドバイス。
-        """
+※ポジションがある場合は、上の「戦略」にホールド/決済の方向性も1行で添える。
+"""
 
         full_prompt = base_prompt + "\n" + add_prompt
-
         response = model.generate_content(full_prompt)
-        return response.text
+        return getattr(response, "text", "") or ""
 
     except Exception as e:
         return f"AI分析エラー: {str(e)}"
@@ -1224,6 +1071,9 @@ price={p}
 atr={a}
 panel_short={ps}
 panel_mid={pm}
+week_open={context_data.get('week_open','')}
+week_change_pct={context_data.get('week_change_pct','')}
+weekday_jst={context_data.get('weekday_jst','')}
 {pos_instr}
 trend_side_hint={context_data.get('trend_side_hint','NONE')}
 trend_score={context_data.get('trend_score','')}
@@ -1245,10 +1095,9 @@ last_report_summary={report[:1200]}
   confidence: 0.0〜1.0
   why: 1〜3文（日本語）
   notes: 0〜6個の配列（日本語）
-- decision="NO_TRADE" の場合は追加で必ず含める（B+ 条件付きAI veto）：
-  veto_reason_codes: ["atr_spike_soft"|"ma_converge_soft"|"trend_score_low_soft"|"rsi_near_extreme"|"rsi_neutral"|"atr_spike"|"ma25_ma75_too_close"|"trend_score_low"]
-  veto_confidence: 0.0〜1.0
-- 重要: 上記コードに該当する**数値根拠がない**なら、decision は "TRADE" を選ぶこと（曖昧な慎重さで見送りにしない）。
+- decision="NO_TRADE" のとき追加必須キー：
+  veto_reason_codes: 文字列配列（英語コード。例: ["atr_spike_soft","week_trend_reversal"]）
+  veto_confidence: 0.0〜1.0（NO_TRADE判断の確信度）
 - 追加必須キー（注文方式の自動化）：
   order_bundle: "IFD_OCO" | "OCO" | "NONE"
   entry_type: "STOP" | "LIMIT" | "MARKET" | "NONE"
@@ -1258,6 +1107,8 @@ last_report_summary={report[:1200]}
 - decision="TRADE" のとき entry は recommended_entry を優先して使い、entry_type="STOP" とする。
 - decision="TRADE" の場合、必ず stop_loss を含める（欠落禁止）
 - 数値は小数OK、USD/JPYなので 2〜3桁小数で良い
+- weekday_jst が 2以上（=水曜以降）なら、週初からの方向（week_change_pct と trend_side_hint）を特に重視し、
+  逆行が強い場合は decision="NO_TRADE" とし、veto_reason_codes に "week_trend_reversal" を含める。
 - あいまい表現で行動を濁さない。TRADE/NO_TRADEどちらかに決める。
 """
         resp = model.generate_content(prompt)
@@ -1289,26 +1140,6 @@ last_report_summary={report[:1200]}
         # 正常時：regimeを付与
         obj["market_regime"] = market_regime
         obj["regime_why"] = regime_why
-
-        # --- B+：条件付きAI veto（decision=NO_TRADEの扱い） ---
-        # 数値ゲート（NO_TRADEゲート + トレンド週ゲート）を通過している前提でも、
-        # LLMが慎重に倒れて NO_TRADE を返すことがある。
-        # ただし機会損失を減らすため、veto は「数値で検証できる根拠」がある場合のみ採用。
-        try:
-            if str(obj.get("decision", "") or "").upper() == "NO_TRADE":
-                accept_veto, veto_detail = _bplus_verify_ai_veto(obj, context_data, side_hint, market_regime)
-                if accept_veto:
-                    obj.setdefault("notes", []).append("ai_veto_verified")
-                    obj["ai_veto"] = veto_detail
-                else:
-                    # veto不採用：数値フォールバックでTRADE（止まらない）
-                    fb = _build_numeric_fallback_order(context_data, market_regime, regime_why, pair_name=str((context_data or {}).get("pair_label","") or ""))
-                    fb.setdefault("notes", []).append("ai_veto_unverified")
-                    fb.setdefault("notes", []).append("ai_veto_unverified_overridden")
-                    fb["ai_veto"] = veto_detail
-                    obj = fb
-        except Exception:
-            pass
 
         # --- 注文方式の確定（週1放置運用：トレンド週のみ + 逆指値IFD-OCO固定） ---
         try:
@@ -2929,9 +2760,148 @@ def get_ai_order_strategy(
     if str(generation_policy).upper() in ("AI_STRICT","STRICT","AI100"):
         return strict_res
 
-    # 自動階層化：『技術失敗だけ』救済する
+    # B+：条件付きAI veto（数値ゲート合格後のNO_TRADEを、理由コードで検証）
+    # - 数値ゲート由来のNO_TRADEはそのまま（上流で弾く）
+    # - AI由来のNO_TRADEは、veto_reason_codes が数値で検証できる場合だけ採用
+    # - 検証できないNO_TRADEは、最終的に数値フォールバック（IFD-OCO）へ上書き
+    ctx = context_data or {}
+
+    def _bplus_is_gate_no_trade(res: dict) -> bool:
+        try:
+            why = str(res.get("why",""))
+            if "NO_TRADEゲート" in why or "トレンド条件を満たさない" in why:
+                return True
+            if isinstance(res.get("rule"), dict) and res.get("rule"):
+                return True
+            notes = res.get("notes", [])
+            if isinstance(notes, list):
+                for n in notes:
+                    s = str(n)
+                    if s.startswith("no_direction_") or s.startswith("ma25_") or s.startswith("volatility_") or s.startswith("trend_gate_") or s.startswith("side_mismatch_"):
+                        return True
+        except Exception:
+            pass
+        return False
+
+    _BPLUS_VETO_POLICY = {
+        "min_confidence": 0.55,
+        "week_rev_pct": 0.20,   # 0.20% 逆行で「崩れ」疑い（週中のみ）
+        "atr_ratio_soft": 1.55,
+        "atr_ratio_hard": 1.70,
+        "ma_converge_soft": 0.25,  # abs(SMA25-SMA75)/price %
+        "ma_converge_hard": 0.15,
+        "trend_score_soft": 1.05,
+        "rsi_neutral_lo": 45.0,
+        "rsi_neutral_hi": 55.0,
+    }
+
+    def _bplus_metrics(c: dict) -> dict:
+        price = _safe_float(c.get("price"), default=0.0) or 0.0
+        sma25 = _safe_float(c.get("sma25"), default=0.0) or 0.0
+        sma75 = _safe_float(c.get("sma75"), default=0.0) or 0.0
+        atr = _safe_float(c.get("atr"), default=0.0) or 0.0
+        atr_avg60 = _safe_float(c.get("atr_avg60"), default=0.0) or 0.0
+        rsi = _safe_float(c.get("rsi"), default=0.0) or 0.0
+        week_open = _safe_float(c.get("week_open"), default=0.0) or 0.0
+        try:
+            weekday = int(c.get("weekday_jst"))
+        except Exception:
+            weekday = -1
+        side_hint = str(c.get("trend_side_hint","NONE"))
+
+        sma_diff_pct = abs(sma25 - sma75) / max(price, 1e-6) * 100.0 if price > 0 else 999.0
+        atr_ratio = (atr / atr_avg60) if (atr > 0 and atr_avg60 > 0) else 0.0
+        trend_score = abs(sma25 - sma75) / max(atr, 1e-9) if atr > 0 else 0.0
+        week_rev = False
+        if weekday >= 2 and week_open > 0 and side_hint in ("LONG","SHORT") and price > 0:
+            thr = float(_BPLUS_VETO_POLICY["week_rev_pct"]) / 100.0
+            if side_hint == "LONG" and price < week_open * (1.0 - thr):
+                week_rev = True
+            if side_hint == "SHORT" and price > week_open * (1.0 + thr):
+                week_rev = True
+
+        return {
+            "price": price, "sma_diff_pct": sma_diff_pct, "atr_ratio": atr_ratio,
+            "trend_score": trend_score, "rsi": rsi, "week_rev": week_rev,
+            "weekday": weekday, "side_hint": side_hint, "week_open": week_open
+        }
+
+    def _bplus_extract_veto(res: dict):
+        codes = res.get("veto_reason_codes")
+        if codes is None and isinstance(res.get("ai_veto"), dict):
+            codes = res["ai_veto"].get("codes")
+        if isinstance(codes, str):
+            codes = [c.strip() for c in re.split(r"[,\s]+", codes) if c.strip()]
+        if not isinstance(codes, list):
+            codes = []
+        conf = _safe_float(res.get("veto_confidence"))
+        if conf is None and isinstance(res.get("ai_veto"), dict):
+            conf = _safe_float(res["ai_veto"].get("confidence"))
+        if conf is None:
+            conf = _safe_float(res.get("confidence"), default=0.0) or 0.0
+        return [str(c) for c in codes], float(conf)
+
+    def _bplus_verified_codes(codes: list, c: dict) -> list:
+        m = _bplus_metrics(c)
+        verified = []
+        for code in codes:
+            if code == "atr_spike_soft" and m["atr_ratio"] >= _BPLUS_VETO_POLICY["atr_ratio_soft"]:
+                verified.append(code)
+            elif code == "atr_spike_hard" and m["atr_ratio"] >= _BPLUS_VETO_POLICY["atr_ratio_hard"]:
+                verified.append(code)
+            elif code == "ma_converge_soft" and m["sma_diff_pct"] <= _BPLUS_VETO_POLICY["ma_converge_soft"]:
+                verified.append(code)
+            elif code == "ma_converge_hard" and m["sma_diff_pct"] <= _BPLUS_VETO_POLICY["ma_converge_hard"]:
+                verified.append(code)
+            elif code == "rsi_neutral" and (_BPLUS_VETO_POLICY["rsi_neutral_lo"] <= m["rsi"] <= _BPLUS_VETO_POLICY["rsi_neutral_hi"]):
+                verified.append(code)
+            elif code == "trend_score_low_soft" and (m["trend_score"] <= _BPLUS_VETO_POLICY["trend_score_soft"]):
+                verified.append(code)
+            elif code == "week_trend_reversal" and m["week_rev"]:
+                verified.append(code)
+        return verified
+
+    def _bplus_maybe_override(res: dict) -> dict:
+        # 対象：AI由来のNO_TRADEのみ
+        if not isinstance(res, dict) or res.get("decision") != "NO_TRADE":
+            return res
+        if _bplus_is_gate_no_trade(res):
+            return res
+
+        codes, vconf = _bplus_extract_veto(res)
+        verified = _bplus_verified_codes(codes, ctx)
+
+        # verifiedがある場合のみ、AI veto を採用（NO_TRADE維持）
+        if (vconf >= float(_BPLUS_VETO_POLICY["min_confidence"])) and verified:
+            res.setdefault("notes", []).append("ai_veto_verified")
+            res["ai_veto"] = {
+                "applied": True,
+                "override_to_trade": False,
+                "all_codes": codes,
+                "verified_codes": verified,
+                "veto_confidence": vconf,
+            }
+            return res
+
+        # 検証できないNO_TRADEは、数値フォールバックでTRADEへ（止まらない）
+        mr = res.get("market_regime", "DEFENSIVE")
+        rw = res.get("regime_why", "")
+        fb = _build_numeric_fallback_order(ctx, mr, rw, pair_name=pair_name or "")
+        if isinstance(fb, dict):
+            fb.setdefault("notes", []).append("ai_veto_unverified_overridden")
+            fb["ai_veto"] = {
+                "applied": False,
+                "override_to_trade": True,
+                "all_codes": codes,
+                "verified_codes": verified,
+                "veto_confidence": vconf,
+                "ai_why": res.get("why",""),
+            }
+        return fb if isinstance(fb, dict) else res
+
+    # 自動階層化：『技術失敗だけ』救済する（ただしB+はここで介入）
     if not _is_technical_failure_order(strict_res):
-        return strict_res
+        return _bplus_maybe_override(strict_res)
 
     market_regime = strict_res.get("market_regime", "DEFENSIVE")
     regime_why = strict_res.get("regime_why", "")
