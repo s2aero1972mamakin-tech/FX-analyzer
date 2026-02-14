@@ -651,6 +651,8 @@ _REASON_JA = {
     "rsi_overheat": "RSI過熱（反転注意）",
     "rsi_oversold": "RSI売られ過ぎ（反転注意）",
     "week_open_against": "週初方向と逆行（崩れ警戒）",
+    "entry_too_far_pct_market_limit": "エントリーが現値から遠すぎる（3%超）",
+    "entry_too_far_stop_atr": "エントリーが現値から遠すぎる（ATR基準超）",
 
 }
 
@@ -1615,7 +1617,7 @@ with tab2:
 
                 if is_safari:
                     st.caption("SafariではダウンロードボタンがHTML扱いで失敗する場合があるため、リンク保存を既定にしています。")
-                    _lnk = _download_link(_b, _fname, label="Safari: タップして保存")
+                    _lnk = _download_link(_b, _fname, label="Safari: タップしてJSONを開く → 共有→「ファイルに保存」")
                     if _lnk:
                         st.markdown(_lnk, unsafe_allow_html=True)
                 else:
@@ -1644,7 +1646,7 @@ with tab2:
 
                 if is_safari:
                     st.caption("Safariではリンク保存を既定にしています。")
-                    _lnk2 = _download_link(_b2, _fname2, label="Safari: タップして保存")
+                    _lnk2 = _download_link(_b2, _fname2, label="Safari: タップしてJSONを開く → 共有→「ファイルに保存」")
                     if _lnk2:
                         st.markdown(_lnk2, unsafe_allow_html=True)
                 else:
