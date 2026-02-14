@@ -11,6 +11,16 @@ import json  # ✅ JSON固定出力のため
 
 TOKYO = pytz.timezone("Asia/Tokyo")
 
+# =============================
+# Tunables (運用ルール)
+# =============================
+# entry_too_far ルール
+# - MARKET/LIMIT: 現値から±3%以内
+# - STOP(逆指値): ATRベース（現値から±(STOP_MAX_ATR_MULT * ATR)以内）
+ENTRY_MAX_PCT_MARKET_LIMIT = 0.03
+STOP_MAX_ATR_MULT = 4.0
+
+
 # 取得失敗時の理由をここに残す（main.pyで表示できる）
 LAST_FETCH_ERROR = ""
 
@@ -141,9 +151,26 @@ def _validate_order_json(obj: dict, ctx: dict) -> (bool, list):
 
         # 異常値ガード（現値から極端に遠い等）
         p = _safe_float(ctx.get("price"), default=entry)
+        atr = _safe_float(ctx.get("atr"), default=None)
+        entry_type = str(obj.get("entry_type") or "").upper().strip()
         if p is not None:
-            if abs(entry - p) / max(p, 1e-6) > 0.03:  # 3%超乖離は異常
-                reasons.append("entry_too_far_from_price")
+            # entry_type 未指定の場合は従来互換の 3% ルール（保守）
+            if entry_type in ("MARKET", "LIMIT") or not entry_type:
+                if abs(entry - p) / max(p, 1e-6) > ENTRY_MAX_PCT_MARKET_LIMIT:
+                    reasons.append("entry_too_far_pct_market_limit")
+            elif entry_type == "STOP":
+                # STOP（逆指値）は ATR ベース
+                if atr is not None and atr > 0:
+                    if abs(entry - p) > (STOP_MAX_ATR_MULT * atr):
+                        reasons.append("entry_too_far_stop_atr")
+                else:
+                    # ATR が取れない場合のみ保守的に 3%
+                    if abs(entry - p) / max(p, 1e-6) > ENTRY_MAX_PCT_MARKET_LIMIT:
+                        reasons.append("entry_too_far_pct_market_limit")
+            else:
+                # その他（UNKNOWN）は保守的に 3%
+                if abs(entry - p) / max(p, 1e-6) > ENTRY_MAX_PCT_MARKET_LIMIT:
+                    reasons.append("entry_too_far_pct_market_limit")
 
     # why/notes は任意（あると良い）
     if "why" not in obj:
@@ -1049,6 +1076,10 @@ def get_ai_order_strategy(api_key, context_data, override_mode="AUTO", override_
         model = genai.GenerativeModel(get_active_model(api_key))
         p = context_data.get('price', 0.0)
         a = context_data.get('atr', 0.0)
+        try:
+            max_stop_dist = float(a) * float(STOP_MAX_ATR_MULT)
+        except Exception:
+            max_stop_dist = 0.0
         report = context_data.get('last_report', "なし")
         ps = context_data.get("panel_short", "不明")
         pm = context_data.get("panel_mid", "不明")
@@ -1081,6 +1112,8 @@ recent_high20={context_data.get('recent_high20','')}
 recent_low20={context_data.get('recent_low20','')}
 recommended_entry={context_data.get('recommended_entry','')}
 breakout_buffer={context_data.get('breakout_buffer','')}
+max_entry_pct_market_limit={ENTRY_MAX_PCT_MARKET_LIMIT}
+max_stop_distance={max_stop_dist}
 last_report_summary={report[:1200]}
 
 【出力ルール（最重要）】
@@ -1105,6 +1138,9 @@ last_report_summary={report[:1200]}
   bundle_hint_jp: 1行（例: "SBI: 逆指値(IFD-OCO)で放置運用"）
 - トレンド週のみ運用：side は trend_side_hint に必ず合わせる（LONG/SHORT）。
 - decision="TRADE" のとき entry は recommended_entry を優先して使い、entry_type="STOP" とする。
+  - STOP（逆指値）の距離制約: abs(entry - price) <= max_stop_distance（= STOP_MAX_ATR_MULT * ATR）を必ず満たす。
+  - 超える場合は「入れる週でも入れない」事故を避けるため、entry を現実的な範囲に再計算するか、NO_TRADEにする。
+- entry_type が "MARKET" または "LIMIT" の場合: abs(entry - price)/price <= max_entry_pct_market_limit を必ず満たす。
 - decision="TRADE" の場合、必ず stop_loss を含める（欠落禁止）
 - 数値は小数OK、USD/JPYなので 2〜3桁小数で良い
 - weekday_jst が 2以上（=水曜以降）なら、週初からの方向（week_change_pct と trend_side_hint）を特に重視し、
@@ -2251,6 +2287,39 @@ def _alt_pair_tradeable_precheck(pair_label: str):
         dbg["side_hint"] = side_hint
         return False, dbg
 
+    # 3) entry distance precheck (STOP only)
+    # numeric_scan で「入れる」と判定しても、実際の STOP エントリーが現値から遠すぎると
+    # 最終的に entry_too_far で見送りになりやすいので、ここで先に弾いて精度を上げる。
+    try:
+        # enrich ctx with recent high/low for recommended stop entry
+        if "High" in df_ind.columns and df_ind["High"].tail(20).notna().any():
+            ctx["recent_high20"] = float(df_ind["High"].tail(20).max())
+        if "Low" in df_ind.columns and df_ind["Low"].tail(20).notna().any():
+            ctx["recent_low20"] = float(df_ind["Low"].tail(20).min())
+
+        # breakout_buffer の既定（_recommended_stop_entry と合わせる）
+        if "breakout_buffer" not in ctx:
+            atr0 = _safe_float(ctx.get("atr"))
+            if atr0 not in (None, 0):
+                ctx["breakout_buffer"] = max(0.10, float(atr0) * 0.25)
+            else:
+                ctx["breakout_buffer"] = 0.10
+
+        rec_entry, _buf = _recommended_stop_entry(ctx, side_hint)
+        if rec_entry is not None:
+            p0 = _safe_float(ctx.get("price"))
+            a0 = _safe_float(ctx.get("atr"))
+            if p0 is not None and a0 not in (None, 0):
+                maxd = float(STOP_MAX_ATR_MULT) * float(a0)
+                dbg["recommended_entry"] = float(rec_entry)
+                dbg["max_stop_distance"] = float(maxd)
+                if abs(float(rec_entry) - float(p0)) > maxd:
+                    dbg["why"] = "entry_too_far_stop_atr"
+                    dbg["notes"].append("entry_too_far_stop_atr")
+                    return False, dbg
+    except Exception:
+        pass
+
     dbg["ok"] = True
     dbg["why"] = "tradeable"
     dbg["trend_score"] = trend_score
@@ -2337,12 +2406,6 @@ def suggest_alternative_pair_if_usdjpy_stay(
     max_positions_per_currency: int = 1,
     exclude_pair_label: str = "USD/JPY (ドル円)",
 ) -> dict:
-    """USD/JPY が NO_TRADE のとき、代替ペア候補（最大3表示想定）を返す。
-
-    - 返却に candidates（採用/落選＋落選理由コード）を必ず含める
-    - AI候補が使えない（429/ResourceExhausted等）場合も、数値スキャンで candidates を返す
-    """
-
     # Weekly cap first
     if not can_open_under_weekly_cap(active_positions, risk_percent_per_trade, weekly_dd_cap_percent):
         return {
@@ -2351,45 +2414,23 @@ def suggest_alternative_pair_if_usdjpy_stay(
             "confidence": 1.0,
             "blocked": True,
             "blocked_by": "weekly_dd_cap",
-            "candidates": [],
-            "source": "weekly_dd_cap",
         }
 
     model_name = get_active_model(api_key)
-    exclude_head = (exclude_pair_label or "").split()[0]
 
-    def _mk_candidate(pair: str, confidence: float = 0.5, status: str = "CANDIDATE", rejected_by=None, reason: str = "", source: str = ""):
-        d = {
-            "pair": pair,
-            "confidence": float(confidence) if confidence is not None else 0.5,
-            "status": status,
-        }
-        if rejected_by:
-            d["rejected_by"] = rejected_by if isinstance(rejected_by, list) else [rejected_by]
-        if reason:
-            d["reason"] = reason
-        if source:
-            d["source"] = source
-        return d
+    # If model unavailable, deterministic scan
+    if not model_name:
+        return numeric_scan_best_pair(
+            active_positions=active_positions,
+            exclude_pair_label=exclude_pair_label,
+            max_positions_per_currency=max_positions_per_currency,
+        )
 
-    candidates_out = []
-    selected_pair = ""
-    selected_meta = {}
-    selected_reason = ""
-    selected_conf = 0.0
-    source = ""
-    debug = {}
+    market_summary = _build_market_summary_for_pairs()
+    bias_note = "（現在ノーポジのため、JPYクロスも候補に含めてOK）" if not (active_positions or []) else "（既存ポジとの通貨重複を避ける）"
+    allowed_labels = list((PAIR_MAP or {}).keys())
 
-    # ---- 1) AI candidates (if available) ----
-    ai_error = ""
-    ai_candidates = []
-    if model_name:
-        try:
-            market_summary = _build_market_summary_for_pairs()
-            bias_note = "（現在ノーポジのため、JPYクロスも候補に含めてOK）" if not (active_positions or []) else "（既存ポジとの通貨重複を避ける）"
-            allowed_labels = list((PAIR_MAP or {}).keys())
-
-            prompt = f"""
+    prompt = f"""
 あなたはプロのFXファンドマネージャーです。
 以下の市場データから「今週、USD/JPYが見送りのときに代替として最も利益チャンスがありそうなペア」を最大5つ、優先順で提案してください。
 {bias_note}
@@ -2412,147 +2453,74 @@ def suggest_alternative_pair_if_usdjpy_stay(
 }}
 """.strip()
 
-            model = genai.GenerativeModel(model_name)
-            resp = model.generate_content(prompt)
-            txt = (resp.text or "").strip()
-            data = safe_json_loads(txt)
-            ai_candidates = data.get("candidates", []) if isinstance(data, dict) else []
-        except Exception as e:
-            ai_error = f"{type(e).__name__}: {e}"
-            ai_candidates = []
-    else:
-        ai_error = "model_unavailable"
+    candidates = []
+    ai_error = ""
+    try:
+        model = genai.GenerativeModel(model_name)
+        resp = model.generate_content(prompt)
+        txt = (resp.text or "").strip()
+        data = safe_json_loads(txt)
+        candidates = data.get("candidates", []) if isinstance(data, dict) else []
+    except Exception as e:
+        ai_error = f"{type(e).__name__}: {e}"
+        candidates = []
 
-    if ai_error and ai_error != "model_unavailable":
-        debug["ai_candidate_error"] = ai_error
+    exclude_head = (exclude_pair_label or "").split()[0]
 
-    # Evaluate AI candidates
-    for c in (ai_candidates or []):
+    # AI candidates -> apply portfolio filters -> then tradeable precheck
+    for c in candidates or []:
         try:
             pair = (c or {}).get("pair", "")
             if not pair:
                 continue
-
-            # exclude USD/JPY head
             if pair.split()[0] == exclude_head:
-                candidates_out.append(_mk_candidate(pair, (c or {}).get("confidence", 0.5), "REJECTED", ["excluded_pair"], source="ai"))
-                continue
-
-            # currency concentration (only if positions exist)
-            if active_positions:
-                try:
-                    if violates_currency_concentration(pair, active_positions, max_positions_per_currency=max_positions_per_currency):
-                        candidates_out.append(_mk_candidate(pair, (c or {}).get("confidence", 0.5), "REJECTED", ["currency_concentration"], (c or {}).get("reason",""), "ai"))
-                        continue
-                except Exception:
-                    pass
-
-            ok, dbg = _alt_pair_tradeable_precheck(pair)
-            if not ok:
-                # Translate internal why to user-facing codes when possible
-                rej = []
-                why = str(dbg.get("why") or "").strip()
-                notes = dbg.get("notes") or []
-                if why == "trend_only_gate_block":
-                    rej.append("trend_only_gate")
-                elif why == "no_trade_gate_block":
-                    rej.append("no_trade_gate")
-                if isinstance(notes, list):
-                    rej.extend([str(x) for x in notes if x])
-                if not rej and why:
-                    rej.append(why)
-                candidates_out.append(_mk_candidate(pair, (c or {}).get("confidence", 0.5), "REJECTED", rej, (c or {}).get("reason",""), "ai"))
-                continue
-
-            # tradeable
-            if not selected_pair:
-                selected_pair = pair
-                selected_meta = dbg or {}
-                selected_reason = (c or {}).get("reason", "")
-                selected_conf = float((c or {}).get("confidence", 0.5) or 0.5)
-                source = "ai_tradeable"
-                candidates_out.append(_mk_candidate(pair, selected_conf, "SELECTED", None, selected_reason, "ai_tradeable"))
-            else:
-                # ok but ranked lower
-                candidates_out.append(_mk_candidate(pair, (c or {}).get("confidence", 0.5), "REJECTED", ["ranked_lower"], (c or {}).get("reason",""), "ai"))
-        except Exception:
-            continue
-
-    # If selected via AI
-    if selected_pair:
-        return {
-            "best_pair_name": selected_pair,
-            "reason": selected_reason,
-            "confidence": selected_conf,
-            "blocked": False,
-            "source": source or "ai_tradeable",
-            "meta": selected_meta,
-            "candidates": candidates_out,
-            "debug": debug,
-        }
-
-    # ---- 2) Fallback numeric scan: produce top candidates + pick best ----
-    scored = []
-    for pair_label in (PAIR_MAP or {}).keys():
-        try:
-            head = (pair_label or "").split()[0]
-            if head and head == exclude_head:
                 continue
 
             # concentration only when positions exist
             if active_positions:
-                try:
-                    if violates_currency_concentration(pair_label, active_positions, max_positions_per_currency=max_positions_per_currency):
-                        continue
-                except Exception:
-                    pass
+                if violates_currency_concentration(pair, active_positions, max_positions_per_currency=max_positions_per_currency):
+                    continue
 
-            ok, dbg = _alt_pair_tradeable_precheck(pair_label)
+            ok, dbg = _alt_pair_tradeable_precheck(pair)
             if not ok:
+                # skip non-tradeable candidates
                 continue
-            score = float(dbg.get("trend_score") or -1e9)
-            scored.append((score, pair_label, dbg))
+
+            return {
+                "best_pair_name": pair,
+                "reason": (c or {}).get("reason", ""),
+                "confidence": float((c or {}).get("confidence", 0.5) or 0.5),
+                "blocked": False,
+                "source": "ai_tradeable",
+                "meta": dbg,
+            }
         except Exception:
             continue
 
-    scored.sort(reverse=True, key=lambda x: x[0])
-
-    if not scored:
-        fb = numeric_scan_best_pair(
-            active_positions=active_positions,
-            exclude_pair_label=exclude_pair_label,
-            max_positions_per_currency=max_positions_per_currency,
-        )
-        # Ensure candidates field exists for UI
-        fb.setdefault("candidates", candidates_out)
+    # fallback numeric scan (tradeable)
+    fb = numeric_scan_best_pair(
+        active_positions=active_positions,
+        exclude_pair_label=exclude_pair_label,
+        max_positions_per_currency=max_positions_per_currency,
+    )
+    if ai_error:
         fb.setdefault("debug", {})
-        fb["debug"].update(debug)
-        return fb
-
-    # Build top list (up to 5 internally; UI shows 3)
-    top = scored[:5]
-    for i, (score, pair_label, dbg) in enumerate(top):
-        if i == 0:
-            selected_pair = pair_label
-            selected_meta = dbg or {}
-            selected_reason = f"数値スキャンでTRADE可能（trend_score={float(dbg.get('trend_score') or 0):.2f}, ATR比={dbg.get('atr_ratio','?')}）"
-            selected_conf = 0.70
-            candidates_out.append(_mk_candidate(pair_label, selected_conf, "SELECTED", None, selected_reason, "numeric_scan_tradeable"))
-        else:
-            candidates_out.append(_mk_candidate(pair_label, 0.60, "REJECTED", ["ranked_lower"], "", "numeric_scan_tradeable"))
-
-    return {
-        "best_pair_name": selected_pair,
-        "reason": selected_reason,
-        "confidence": selected_conf,
-        "blocked": False,
-        "source": "numeric_scan_tradeable",
-        "meta": selected_meta,
-        "candidates": candidates_out,
-        "debug": debug,
-    }
+        fb["debug"]["ai_candidate_error"] = ai_error
+    return fb
 
 
+
+# ==========================================================
+# AUTO_HIERARCHY_ORDER_GENERATION v1
+#   - 迷わない運用：AI →（失敗時）AI再生成 →（さらに失敗時）数値フォールバック
+#   - 「AI厳格」も残す（generation_policy="AI_STRICT"）
+# ==========================================================
+
+# 既存の get_ai_order_strategy（厳格1回生成）を退避
+try:
+    _STRICT_GET_AI_ORDER_STRATEGY = get_ai_order_strategy
+except Exception:
+    _STRICT_GET_AI_ORDER_STRATEGY = None
 
 def _is_technical_failure_order(result: dict) -> bool:
     """AI出力の整形/検証失敗など『本来は取引可能性があるのに止まった』ケースだけ True。"""
@@ -2724,6 +2692,10 @@ def _ai_retry_order(api_key: str, ctx: dict, market_regime: str, regime_why: str
         ctx = _ensure_trend_fields(ctx or {})
         price = float(_safe_float(ctx.get("price"), default=0.0) or 0.0)
         atr = float(_safe_float(ctx.get("atr"), default=0.0) or 0.0)
+        try:
+            max_stop_dist = float(atr) * float(STOP_MAX_ATR_MULT)
+        except Exception:
+            max_stop_dist = 0.0
         rsi = float(_safe_float(ctx.get("rsi"), default=50.0) or 50.0)
         sma5 = _safe_float(ctx.get("sma5"))
         sma25 = _safe_float(ctx.get("sma25"))
@@ -2737,6 +2709,7 @@ def _ai_retry_order(api_key: str, ctx: dict, market_regime: str, regime_why: str
 【ペア】{pair_name or ctx.get("pair_label","")}
 【現値】{price:.6f}
 【ATR】{atr:.6f}
+【max_stop_distance】{max_stop_dist:.6f}  # STOP距離上限 (= STOP_MAX_ATR_MULT * ATR)
 【RSI】{rsi:.2f}
 【SMA5】{sma5}
 【SMA25】{sma25}
@@ -2748,7 +2721,7 @@ def _ai_retry_order(api_key: str, ctx: dict, market_regime: str, regime_why: str
 - 今週はトレンド週のみ。方向ヒント: {side_hint}
 - エントリーはブレイクアウト用の**逆指値**（STOP）で作る
 - 推奨エントリー: {recommended_entry:.6f} を必ず基準にする
-- entryは現値から3%以内（entry_too_farを回避）
+- STOP（逆指値）のentryは現値から max_stop_distance 以内（= STOP_MAX_ATR_MULT * ATR）（entry_too_farを回避）
 - RRは1.2以上（できれば1.6〜2.4）
 - 数値はすべて number（文字列禁止）
 
@@ -3020,3 +2993,182 @@ def get_ai_order_strategy(
     # 最終手段：数値フォールバック
     fb = _build_numeric_fallback_order(ctx, market_regime, regime_why, pair_name=pair_name or "")
     return fb
+
+# =============================
+# 代替ペア提案（最大3候補＋落選理由の透明化）[RELEASE]
+# - 週DDキャップ/通貨集中を反映
+# - OK候補があれば最上位を採用
+# - OKが無ければ best_pair_name="" で blocked=True（候補リストは返す）
+# =============================
+
+def _numeric_scan_rank_pairs(
+    active_positions: list = None,
+    exclude_pair_label: str = "USD/JPY (ドル円)",
+    max_positions_per_currency: int = 1,
+):
+    """PAIR_MAP をスキャンして、tradeable/blocked の理由付きで並べる（上位候補表示用）。"""
+    active_positions = active_positions or []
+    ranked = []
+    for pair_label in (PAIR_MAP.keys() if "PAIR_MAP" in globals() else []):
+        if not pair_label or pair_label == exclude_pair_label:
+            continue
+
+        reject = []
+        meta = {"pair": pair_label}
+
+        # 通貨集中フィルタ（保有中の同一通貨が多い場合は落選）
+        try:
+            if violates_currency_concentration(
+                pair_label, active_positions, max_positions_per_currency=max_positions_per_currency
+            ):
+                reject.append("currency_concentration")
+        except Exception:
+            pass
+
+        ok = False
+        dbg = {}
+        try:
+            ok, dbg = _alt_pair_tradeable_precheck(pair_label)
+        except Exception as e:
+            ok, dbg = False, {"why": f"precheck_error:{type(e).__name__}", "notes": [f"precheck_error:{type(e).__name__}"]}
+
+        # dbg のメタ情報を整理
+        if isinstance(dbg, dict):
+            for k in ("trend_score", "atr_ratio", "side_hint", "regime", "recommended_entry", "max_stop_distance"):
+                if k in dbg:
+                    meta[k] = dbg.get(k)
+            # notes は理由コードとして流用（重複排除）
+            for n in (dbg.get("notes") or []):
+                if isinstance(n, str) and n and (n not in reject):
+                    reject.append(n)
+
+            # why を代表コードに寄せる（わかりやすさ優先）
+            why = str(dbg.get("why") or "")
+            if (not ok) and why:
+                if "trend_only_gate" in why and "trend_only_gate" not in reject:
+                    reject.insert(0, "trend_only_gate")
+                if "no_trade_gate" in why and "no_trade_gate" not in reject:
+                    reject.insert(0, "no_trade_gate")
+                if "entry_too_far_stop_atr" in why and "entry_too_far_stop_atr" not in reject:
+                    reject.insert(0, "entry_too_far_stop_atr")
+
+        # スコア/確信度
+        score = float(_safe_float(meta.get("trend_score"), default=0.0) or 0.0)
+        atr_ratio = _safe_float(meta.get("atr_ratio"), default=None)
+        # 確信度は trend_score を基準に単調増加（上限0.95）
+        conf = 0.55
+        try:
+            conf = min(0.95, max(0.45, 0.35 + score / 3.0))
+            if atr_ratio is not None:
+                # ATR比が高いほど慎重に
+                conf = float(conf) * float(max(0.75, 1.2 - float(atr_ratio) * 0.15))
+                conf = float(min(0.95, max(0.35, conf)))
+        except Exception:
+            pass
+
+        # 最終OK判定: precheck ok かつ reject が通貨集中以外を含まない
+        ok_final = bool(ok) and (len(reject) == 0)
+
+        ranked.append({
+            "pair": pair_label,
+            "ok": ok_final,
+            "score": score,
+            "confidence": float(conf),
+            "rejected_by": reject,
+            "meta": meta,
+        })
+
+    # ok優先 → score降順 → confidence降順
+    ranked.sort(key=lambda x: (0 if x.get("ok") else 1, -(x.get("score") or 0.0), -(x.get("confidence") or 0.0)))
+    return ranked
+
+
+def suggest_alternative_pair_if_usdjpy_stay(
+    api_key: str,
+    active_positions: list,
+    risk_percent_per_trade: float,
+    weekly_dd_cap_percent: float = 2.0,
+    max_positions_per_currency: int = 1,
+    exclude_pair_label: str = "USD/JPY (ドル円)"
+) -> dict:
+    """
+    USD/JPY が NO_TRADE のとき、代替ペア候補（最大3）を透明化して返す。
+    """
+    active_positions = active_positions or []
+
+    # Weekly cap gate first
+    if not can_open_under_weekly_cap(active_positions, risk_percent_per_trade, weekly_dd_cap_percent):
+        return {
+            "best_pair_name": "",
+            "reason": "週単位DDキャップを超えるため今週は新規不可",
+            "confidence": 1.0,
+            "blocked": True,
+            "blocked_by": "weekly_dd_cap",
+            "candidates": [],
+            "source": "weekly_dd_cap",
+        }
+
+    ranked = _numeric_scan_rank_pairs(
+        active_positions=active_positions,
+        exclude_pair_label=exclude_pair_label,
+        max_positions_per_currency=max_positions_per_currency,
+    )
+    top3 = ranked[:3]
+
+    selected = ""
+    sel_item = None
+    for it in top3:
+        if it.get("ok"):
+            selected = it.get("pair", "")
+            sel_item = it
+            break
+
+    cand_out = []
+    for it in top3:
+        status = "採用" if (selected and it.get("pair") == selected) else "落選"
+        cand_out.append({
+            "pair": it.get("pair"),
+            "status": status,
+            "confidence": float(it.get("confidence", 0.5) or 0.5),
+            "rejected_by": list(it.get("rejected_by") or []),
+            "meta": it.get("meta") or {},
+        })
+
+    if selected:
+        # 理由の文字列を作る（なるべく短く）
+        reason = "数値スキャンでTRADE可能"
+        try:
+            ts = _safe_float((sel_item.get("meta") or {}).get("trend_score"), default=None)
+            ar = _safe_float((sel_item.get("meta") or {}).get("atr_ratio"), default=None)
+            sh = (sel_item.get("meta") or {}).get("side_hint")
+            parts = []
+            if ts is not None:
+                parts.append(f"trend_score={float(ts):.2f}")
+            if ar is not None:
+                parts.append(f"ATR比={float(ar):.3f}")
+            if sh:
+                parts.append(f"side={sh}")
+            if parts:
+                reason = f"数値スキャンでTRADE可能（{', '.join(parts)}）"
+        except Exception:
+            pass
+
+        return {
+            "best_pair_name": selected,
+            "reason": reason,
+            "confidence": float(sel_item.get("confidence", 0.65) or 0.65),
+            "blocked": False,
+            "source": "numeric_scan_tradeable",
+            "meta": sel_item.get("meta") or {},
+            "candidates": cand_out,
+        }
+
+    return {
+        "best_pair_name": "",
+        "reason": "上位候補を評価した結果、全て落選（DDキャップ/通貨集中/NO_TRADEゲート/トレンドゲート/entry距離など）",
+        "confidence": 0.0,
+        "blocked": True,
+        "blocked_by": "no_candidate_after_scan",
+        "source": "numeric_scan_no_tradeable",
+        "candidates": cand_out,
+    }
