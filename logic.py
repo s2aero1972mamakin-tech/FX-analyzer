@@ -2337,6 +2337,12 @@ def suggest_alternative_pair_if_usdjpy_stay(
     max_positions_per_currency: int = 1,
     exclude_pair_label: str = "USD/JPY (ドル円)",
 ) -> dict:
+    """USD/JPY が NO_TRADE のとき、代替ペア候補（最大3表示想定）を返す。
+
+    - 返却に candidates（採用/落選＋落選理由コード）を必ず含める
+    - AI候補が使えない（429/ResourceExhausted等）場合も、数値スキャンで candidates を返す
+    """
+
     # Weekly cap first
     if not can_open_under_weekly_cap(active_positions, risk_percent_per_trade, weekly_dd_cap_percent):
         return {
@@ -2345,23 +2351,45 @@ def suggest_alternative_pair_if_usdjpy_stay(
             "confidence": 1.0,
             "blocked": True,
             "blocked_by": "weekly_dd_cap",
+            "candidates": [],
+            "source": "weekly_dd_cap",
         }
 
     model_name = get_active_model(api_key)
+    exclude_head = (exclude_pair_label or "").split()[0]
 
-    # If model unavailable, deterministic scan
-    if not model_name:
-        return numeric_scan_best_pair(
-            active_positions=active_positions,
-            exclude_pair_label=exclude_pair_label,
-            max_positions_per_currency=max_positions_per_currency,
-        )
+    def _mk_candidate(pair: str, confidence: float = 0.5, status: str = "CANDIDATE", rejected_by=None, reason: str = "", source: str = ""):
+        d = {
+            "pair": pair,
+            "confidence": float(confidence) if confidence is not None else 0.5,
+            "status": status,
+        }
+        if rejected_by:
+            d["rejected_by"] = rejected_by if isinstance(rejected_by, list) else [rejected_by]
+        if reason:
+            d["reason"] = reason
+        if source:
+            d["source"] = source
+        return d
 
-    market_summary = _build_market_summary_for_pairs()
-    bias_note = "（現在ノーポジのため、JPYクロスも候補に含めてOK）" if not (active_positions or []) else "（既存ポジとの通貨重複を避ける）"
-    allowed_labels = list((PAIR_MAP or {}).keys())
+    candidates_out = []
+    selected_pair = ""
+    selected_meta = {}
+    selected_reason = ""
+    selected_conf = 0.0
+    source = ""
+    debug = {}
 
-    prompt = f"""
+    # ---- 1) AI candidates (if available) ----
+    ai_error = ""
+    ai_candidates = []
+    if model_name:
+        try:
+            market_summary = _build_market_summary_for_pairs()
+            bias_note = "（現在ノーポジのため、JPYクロスも候補に含めてOK）" if not (active_positions or []) else "（既存ポジとの通貨重複を避ける）"
+            allowed_labels = list((PAIR_MAP or {}).keys())
+
+            prompt = f"""
 あなたはプロのFXファンドマネージャーです。
 以下の市場データから「今週、USD/JPYが見送りのときに代替として最も利益チャンスがありそうなペア」を最大5つ、優先順で提案してください。
 {bias_note}
@@ -2384,74 +2412,147 @@ def suggest_alternative_pair_if_usdjpy_stay(
 }}
 """.strip()
 
-    candidates = []
-    ai_error = ""
-    try:
-        model = genai.GenerativeModel(model_name)
-        resp = model.generate_content(prompt)
-        txt = (resp.text or "").strip()
-        data = safe_json_loads(txt)
-        candidates = data.get("candidates", []) if isinstance(data, dict) else []
-    except Exception as e:
-        ai_error = f"{type(e).__name__}: {e}"
-        candidates = []
+            model = genai.GenerativeModel(model_name)
+            resp = model.generate_content(prompt)
+            txt = (resp.text or "").strip()
+            data = safe_json_loads(txt)
+            ai_candidates = data.get("candidates", []) if isinstance(data, dict) else []
+        except Exception as e:
+            ai_error = f"{type(e).__name__}: {e}"
+            ai_candidates = []
+    else:
+        ai_error = "model_unavailable"
 
-    exclude_head = (exclude_pair_label or "").split()[0]
+    if ai_error and ai_error != "model_unavailable":
+        debug["ai_candidate_error"] = ai_error
 
-    # AI candidates -> apply portfolio filters -> then tradeable precheck
-    for c in candidates or []:
+    # Evaluate AI candidates
+    for c in (ai_candidates or []):
         try:
             pair = (c or {}).get("pair", "")
             if not pair:
                 continue
+
+            # exclude USD/JPY head
             if pair.split()[0] == exclude_head:
+                candidates_out.append(_mk_candidate(pair, (c or {}).get("confidence", 0.5), "REJECTED", ["excluded_pair"], source="ai"))
+                continue
+
+            # currency concentration (only if positions exist)
+            if active_positions:
+                try:
+                    if violates_currency_concentration(pair, active_positions, max_positions_per_currency=max_positions_per_currency):
+                        candidates_out.append(_mk_candidate(pair, (c or {}).get("confidence", 0.5), "REJECTED", ["currency_concentration"], (c or {}).get("reason",""), "ai"))
+                        continue
+                except Exception:
+                    pass
+
+            ok, dbg = _alt_pair_tradeable_precheck(pair)
+            if not ok:
+                # Translate internal why to user-facing codes when possible
+                rej = []
+                why = str(dbg.get("why") or "").strip()
+                notes = dbg.get("notes") or []
+                if why == "trend_only_gate_block":
+                    rej.append("trend_only_gate")
+                elif why == "no_trade_gate_block":
+                    rej.append("no_trade_gate")
+                if isinstance(notes, list):
+                    rej.extend([str(x) for x in notes if x])
+                if not rej and why:
+                    rej.append(why)
+                candidates_out.append(_mk_candidate(pair, (c or {}).get("confidence", 0.5), "REJECTED", rej, (c or {}).get("reason",""), "ai"))
+                continue
+
+            # tradeable
+            if not selected_pair:
+                selected_pair = pair
+                selected_meta = dbg or {}
+                selected_reason = (c or {}).get("reason", "")
+                selected_conf = float((c or {}).get("confidence", 0.5) or 0.5)
+                source = "ai_tradeable"
+                candidates_out.append(_mk_candidate(pair, selected_conf, "SELECTED", None, selected_reason, "ai_tradeable"))
+            else:
+                # ok but ranked lower
+                candidates_out.append(_mk_candidate(pair, (c or {}).get("confidence", 0.5), "REJECTED", ["ranked_lower"], (c or {}).get("reason",""), "ai"))
+        except Exception:
+            continue
+
+    # If selected via AI
+    if selected_pair:
+        return {
+            "best_pair_name": selected_pair,
+            "reason": selected_reason,
+            "confidence": selected_conf,
+            "blocked": False,
+            "source": source or "ai_tradeable",
+            "meta": selected_meta,
+            "candidates": candidates_out,
+            "debug": debug,
+        }
+
+    # ---- 2) Fallback numeric scan: produce top candidates + pick best ----
+    scored = []
+    for pair_label in (PAIR_MAP or {}).keys():
+        try:
+            head = (pair_label or "").split()[0]
+            if head and head == exclude_head:
                 continue
 
             # concentration only when positions exist
             if active_positions:
-                if violates_currency_concentration(pair, active_positions, max_positions_per_currency=max_positions_per_currency):
-                    continue
+                try:
+                    if violates_currency_concentration(pair_label, active_positions, max_positions_per_currency=max_positions_per_currency):
+                        continue
+                except Exception:
+                    pass
 
-            ok, dbg = _alt_pair_tradeable_precheck(pair)
+            ok, dbg = _alt_pair_tradeable_precheck(pair_label)
             if not ok:
-                # skip non-tradeable candidates
                 continue
-
-            return {
-                "best_pair_name": pair,
-                "reason": (c or {}).get("reason", ""),
-                "confidence": float((c or {}).get("confidence", 0.5) or 0.5),
-                "blocked": False,
-                "source": "ai_tradeable",
-                "meta": dbg,
-            }
+            score = float(dbg.get("trend_score") or -1e9)
+            scored.append((score, pair_label, dbg))
         except Exception:
             continue
 
-    # fallback numeric scan (tradeable)
-    fb = numeric_scan_best_pair(
-        active_positions=active_positions,
-        exclude_pair_label=exclude_pair_label,
-        max_positions_per_currency=max_positions_per_currency,
-    )
-    if ai_error:
+    scored.sort(reverse=True, key=lambda x: x[0])
+
+    if not scored:
+        fb = numeric_scan_best_pair(
+            active_positions=active_positions,
+            exclude_pair_label=exclude_pair_label,
+            max_positions_per_currency=max_positions_per_currency,
+        )
+        # Ensure candidates field exists for UI
+        fb.setdefault("candidates", candidates_out)
         fb.setdefault("debug", {})
-        fb["debug"]["ai_candidate_error"] = ai_error
-    return fb
+        fb["debug"].update(debug)
+        return fb
+
+    # Build top list (up to 5 internally; UI shows 3)
+    top = scored[:5]
+    for i, (score, pair_label, dbg) in enumerate(top):
+        if i == 0:
+            selected_pair = pair_label
+            selected_meta = dbg or {}
+            selected_reason = f"数値スキャンでTRADE可能（trend_score={float(dbg.get('trend_score') or 0):.2f}, ATR比={dbg.get('atr_ratio','?')}）"
+            selected_conf = 0.70
+            candidates_out.append(_mk_candidate(pair_label, selected_conf, "SELECTED", None, selected_reason, "numeric_scan_tradeable"))
+        else:
+            candidates_out.append(_mk_candidate(pair_label, 0.60, "REJECTED", ["ranked_lower"], "", "numeric_scan_tradeable"))
+
+    return {
+        "best_pair_name": selected_pair,
+        "reason": selected_reason,
+        "confidence": selected_conf,
+        "blocked": False,
+        "source": "numeric_scan_tradeable",
+        "meta": selected_meta,
+        "candidates": candidates_out,
+        "debug": debug,
+    }
 
 
-
-# ==========================================================
-# AUTO_HIERARCHY_ORDER_GENERATION v1
-#   - 迷わない運用：AI →（失敗時）AI再生成 →（さらに失敗時）数値フォールバック
-#   - 「AI厳格」も残す（generation_policy="AI_STRICT"）
-# ==========================================================
-
-# 既存の get_ai_order_strategy（厳格1回生成）を退避
-try:
-    _STRICT_GET_AI_ORDER_STRATEGY = get_ai_order_strategy
-except Exception:
-    _STRICT_GET_AI_ORDER_STRATEGY = None
 
 def _is_technical_failure_order(result: dict) -> bool:
     """AI出力の整形/検証失敗など『本来は取引可能性があるのに止まった』ケースだけ True。"""
@@ -2919,260 +3020,3 @@ def get_ai_order_strategy(
     # 最終手段：数値フォールバック
     fb = _build_numeric_fallback_order(ctx, market_regime, regime_why, pair_name=pair_name or "")
     return fb
-
-
-# ============================================================
-# B+ PATCH ADDITIONS (2026-02-11)
-# - Override get_ai_analysis: remove hard-coded election assumptions; structured report; includes week_open context if present
-# - Override suggest_alternative_pair_if_usdjpy_stay: returns up to 3 candidates with adopt/reject + reasons (transparent)
-# ============================================================
-
-def get_ai_analysis(api_key, context_data):
-    """週次運用向けのAI診断レポート（安定版）。
-    - 外部イベント（選挙結果等）は“断定しない”。与えた数値から説明する。
-    - 水曜以降は week_open / week_change_pct を重視して「押し目」か「崩れ」かを明示。
-    """
-    try:
-        model = genai.GenerativeModel(get_active_model(api_key))
-        p = float(context_data.get("price", 0.0) or 0.0)
-        u = float(context_data.get("us10y", 0.0) or 0.0)
-        a = float(context_data.get("atr", 0.0) or 0.0)
-        s = float(context_data.get("sma_diff", 0.0) or 0.0)
-        r = float(context_data.get("rsi", 50.0) or 50.0)
-
-        capital = int(context_data.get("capital", 300000) or 300000)
-        week_open = context_data.get("week_open", None)
-        week_change_pct = context_data.get("week_change_pct", None)
-        weekday_jst = context_data.get("weekday_jst", None)
-
-        gotobi_text = "五十日（ゴトウビ）: 需給フローで短期ブレが出やすい可能性あり" if context_data.get("is_gotobi", False) else "五十日ではない"
-
-        wk_line = ""
-        try:
-            if week_open is not None and week_change_pct is not None:
-                wk_line = f"- 週初始値: {float(week_open):.3f} / 週初比: {float(week_change_pct):+.2f}%"
-        except Exception:
-            wk_line = ""
-
-        prompt = f"""
-あなたはプロの為替戦略家です。週1回（月曜判断＋必要なら水曜再判定）で、心理負担を増やさずに運用できるレポートを日本語で作成してください。
-
-【重要ルール】
-- 与えられた数値以外（選挙結果・要人発言・指標結果など）を断定しない。必要なら「可能性がある」と表現する。
-- 文章は簡潔すぎない。各項目は2〜4行で、合計12〜20行程度。
-- 最後に「今週の結論」を1行で出す（見送りの場合も理由を明示）。
-
-【数値データ】
-- 現在価格: {p:.3f}
-- 日米金利差(10年債): {u:.2f}%
-- ATR(ボラ): {a:.6f}
-- SMA25乖離率: {s:.2f}%
-- RSI(14): {r:.1f}
-- {gotobi_text}
-{wk_line}
-- weekday_jst: {weekday_jst}
-
-【出力フォーマット】
-1) 市場の状態（トレンド/レンジ/ボラ）
-2) ファンダ（“金利差”中心。断定しない）
-3) テクニカル（MA/RSI/乖離/ATR）
-4) 週中（weekday_jst>=2）の場合：週初からの流れが継続か？押し目か崩れか？
-5) 今週の結論（1行）：『順張り候補 / 見送り』＋理由（例：ATR急騰で不安定、など）
-"""
-        resp = model.generate_content(prompt)
-        return (getattr(resp, "text", "") or "").strip() or "（レポート生成に失敗しました）"
-    except Exception as e:
-        return f"（レポート生成エラー: {e}）"
-
-
-def _numeric_scan_rank_pairs(
-    active_positions: list = None,
-    exclude_pair_label: str = "USD/JPY (ドル円)",
-    max_positions_per_currency: int = 1,
-):
-    """PAIR_MAPを走査して、各ペアの可否と理由を返す（上位3表示用）。"""
-    active_positions = active_positions or []
-    exclude_head = (exclude_pair_label or "").split()[0]
-    rows = []
-
-    for pair_label, sym in (PAIR_MAP or {}).items():
-        head = (pair_label or "").split()[0]
-        if head and head == exclude_head:
-            continue
-
-        item = {
-            "pair": pair_label,
-            "confidence": 0.5,
-            "ok": False,
-            "reject_reasons": [],
-            "meta": {},
-        }
-
-        # 通貨集中
-        try:
-            if active_positions and violates_currency_concentration(pair_label, active_positions, max_positions_per_currency=max_positions_per_currency):
-                item["reject_reasons"].append("currency_concentration")
-        except Exception:
-            pass
-
-        # データ取得
-        raw = None
-        try:
-            if "_fetch_ohlc" in globals():
-                raw = _fetch_ohlc(sym, period="1y", interval="1d")
-            else:
-                raw = _yahoo_chart(sym, rng="1y", interval="1d")
-        except Exception:
-            raw = None
-
-        df_ind = None
-        try:
-            df_ind = calculate_indicators(raw, None) if raw is not None else None
-        except Exception:
-            df_ind = None
-
-        if df_ind is None or getattr(df_ind, "empty", True) or len(df_ind) < 80:
-            item["reject_reasons"].append("data_insufficient")
-            rows.append(item)
-            continue
-
-        ctx = _build_ctx_from_indicator_df(df_ind)
-        # ATR比
-        try:
-            atr = float(ctx.get("atr") or 0.0)
-            atr_avg60 = float(ctx.get("atr_avg60") or (atr or 0.0) or 0.0)
-            atr_ratio = (atr / atr_avg60) if (atr and atr_avg60) else None
-        except Exception:
-            atr_ratio = None
-
-        item["meta"].update({
-            "price": ctx.get("price"),
-            "rsi": ctx.get("rsi"),
-            "atr": ctx.get("atr"),
-            "atr_ratio": atr_ratio,
-        })
-
-        # NO_TRADEゲート（OPPORTUNITY基準でスキャン：厳しすぎて候補ゼロになるのを防ぐ）
-        try:
-            is_no, regime_used, gate_reasons = no_trade_gate(ctx, "OPPORTUNITY", force_defensive=False)
-            if is_no:
-                item["reject_reasons"].extend(gate_reasons[:6] if gate_reasons else ["no_trade_gate"])
-        except Exception:
-            # gateが壊れていても続行
-            pass
-
-        # トレンド週ゲート
-        try:
-            allowed_trend, side_hint, trend_score, trend_reasons = trend_only_gate(ctx)
-            item["meta"].update({
-                "trend_score": float(trend_score) if trend_score is not None else None,
-                "side_hint": side_hint,
-            })
-            if not allowed_trend:
-                item["reject_reasons"].extend(["trend_only_gate"] + (trend_reasons[:4] if trend_reasons else []))
-            else:
-                item["ok"] = (len(item["reject_reasons"]) == 0)
-                # trend_scoreでconfidenceを軽く補正
-                ts = float(trend_score) if trend_score is not None else 0.0
-                item["confidence"] = max(0.4, min(0.95, 0.55 + ts * 0.15))
-        except Exception:
-            item["reject_reasons"].append("trend_gate_error")
-
-        rows.append(item)
-
-    # 並び：OK優先 → trend_score降順 → atr_ratioが低い方（安定）を優先
-    def _key(x):
-        ok = 1 if x.get("ok") else 0
-        ts = x.get("meta", {}).get("trend_score") or -1e9
-        ar = x.get("meta", {}).get("atr_ratio")
-        ar_key = -(1.0 / (ar or 9999.0))  # 小さいほど良い
-        return (ok, ts, ar_key)
-
-    rows.sort(key=_key, reverse=True)
-    return rows
-
-
-def suggest_alternative_pair_if_usdjpy_stay(
-    api_key: str,
-    active_positions: list,
-    risk_percent_per_trade: float,
-    weekly_dd_cap_percent: float = 2.0,
-    max_positions_per_currency: int = 1,
-    exclude_pair_label: str = "USD/JPY (ドル円)",
-) -> dict:
-    """
-    代替ペア提案（最大3候補＋落選理由の透明化）
-    - 週DDキャップ/通貨集中を反映
-    - OK候補があれば最上位を採用
-    - OKが無ければ best_pair_name="" で blocked=True（候補リストは返す）
-    """
-    # Weekly cap gate first
-    if not can_open_under_weekly_cap(active_positions, risk_percent_per_trade, weekly_dd_cap_percent):
-        return {
-            "best_pair_name": "",
-            "reason": "週単位DDキャップを超えるため今週は新規不可",
-            "confidence": 1.0,
-            "blocked": True,
-            "blocked_by": "weekly_dd_cap",
-            "candidates": [],
-            "候補": [],
-            "source": "weekly_dd_cap",
-        }
-
-    ranked = _numeric_scan_rank_pairs(
-        active_positions=active_positions,
-        exclude_pair_label=exclude_pair_label,
-        max_positions_per_currency=max_positions_per_currency,
-    )
-
-    top3 = ranked[:3]
-    # status付与
-    selected = ""
-    sel_item = None
-    for it in top3:
-        if it.get("ok"):
-            selected = it.get("pair", "")
-            sel_item = it
-            break
-
-    cand_out = []
-    for it in top3:
-        status = "採用" if (selected and it.get("pair") == selected) else ("落選" if it.get("reject_reasons") else "候補")
-        cand_out.append({
-            "pair": it.get("pair"),
-            "status": status,
-            "confidence": float(it.get("confidence", 0.5) or 0.5),
-            "reject_reasons": list(it.get("reject_reasons") or []),
-            "meta": it.get("meta") or {},
-        })
-
-    if selected:
-        reason = "数値スキャンでTRADE可能"
-        try:
-            ts = sel_item.get("meta", {}).get("trend_score")
-            ar = sel_item.get("meta", {}).get("atr_ratio")
-            sh = sel_item.get("meta", {}).get("side_hint")
-            reason = f"数値スキャンでTRADE可能（trend_score={ts:.2f}, ATR比={ar:.3f}, side={sh}）"
-        except Exception:
-            pass
-        return {
-            "best_pair_name": selected,
-            "reason": reason,
-            "confidence": float(sel_item.get("confidence", 0.65) or 0.65),
-            "blocked": False,
-            "source": "numeric_scan_tradeable",
-            "meta": sel_item.get("meta") or {},
-            "candidates": cand_out,
-            "候補": cand_out,
-        }
-
-    return {
-        "best_pair_name": "",
-        "reason": "上位候補を評価した結果、全て落選（DDキャップ/通貨集中/NO_TRADEゲート/トレンドゲートなど）",
-        "confidence": 0.0,
-        "blocked": True,
-        "blocked_by": "no_candidate_after_scan",
-        "source": "numeric_scan_no_tradeable",
-        "candidates": cand_out,
-        "候補": cand_out,
-    }
