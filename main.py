@@ -1,3 +1,4 @@
+
 import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -495,6 +496,24 @@ max_positions_per_currency = st.sidebar.number_input(
     "同一通貨の最大保有数（通貨集中フィルタ）", min_value=1, max_value=5, value=1, step=1
 )
 
+
+# ✅【追加】固定1建（SBI最小1枚）現実対応
+fixed_1lot_mode = st.sidebar.checkbox(
+    "固定1建運用モード（SBI最小1枚前提）",
+    value=True,
+    help="最小1枚の制約で2%に収まらない場合でも、下の『許容最大リスク%（上限）』以内なら1枚で許可します。"
+)
+max_risk_percent_cap = st.sidebar.slider(
+    "許容最大リスク%（上限）",
+    2.0, 12.0, 6.0, 0.5,
+    help="2%は目標。固定1枚で2%を超える局面は上限以内なら取引可、上限超はNO_TRADE。"
+)
+prefer_pullback_limit = st.sidebar.checkbox(
+    "リスク過大時は押し目LIMIT案を優先（3案生成）",
+    value=True,
+    help="AI案が遠い/損切幅が広い場合に、押し目LIMIT/確認後成行の代替案を自動生成して採用します。"
+)
+
 # ✅【追加】デバッグ（テスト用）
 st.sidebar.subheader("🧪 デバッグ")
 force_no_trade_debug = st.sidebar.checkbox("NO_TRADE分岐を強制表示（テスト用）", value=False, help="代替ペアの動線テスト用。実運用ではOFF。")
@@ -649,6 +668,381 @@ def _recommend_lots_int_and_risk(
     actual_risk_pct = (lots_int * loss_per_lot_jpy / cap * 100.0) if (cap > 0 and lots_int > 0) else 0.0
     return int(lots_int), float(actual_risk_pct), float(req_margin_per_lot), float(loss_per_lot_jpy), float(stop_w), quote_ccy
 
+# =============================
+# 固定1建（SBI最小1枚）前提の実損失・実質リスク計算ユーティリティ
+#  - 2%は「目標」。固定1枚で2%に収まらない局面は上限（max_risk_percent_cap）で制御
+#  - SL幅/最大損失/実質リスク%/必要資金（逆算）を必ず出す
+# =============================
+
+def _pip_size_from_quote(quote_ccy: str) -> float:
+    q = (quote_ccy or "").upper()
+    return 0.01 if q == "JPY" else 0.0001
+
+def _stop_width_to_pips(stop_w: float, quote_ccy: str) -> float:
+    ps = _pip_size_from_quote(quote_ccy)
+    try:
+        return float(stop_w) / ps if ps > 0 else 0.0
+    except Exception:
+        return 0.0
+
+def _needed_capital_for_target(loss_per_lot_jpy: float, risk_percent_target: float) -> float:
+    try:
+        rp = float(risk_percent_target)
+        l = float(loss_per_lot_jpy)
+    except Exception:
+        return 0.0
+    if rp <= 0:
+        return 0.0
+    return l / (rp / 100.0)
+
+def _select_lots_with_fixed_mode(
+    pair_label: str,
+    entry: float,
+    stop_loss: float,
+    capital_jpy: float,
+    risk_percent_target: float,
+    max_risk_percent_cap: float,
+    fixed_1lot_mode: bool,
+    usd_jpy: float,
+    remaining_margin_jpy: float,
+    leverage: int = 25,
+):
+    """
+    返り値:
+      {
+        "lots": int,
+        "risk_actual_pct": float,      # 選択lotsでの実質リスク%
+        "risk_1lot_pct": float,        # 1枚での実質リスク%
+        "loss_per_lot_jpy": float,     # 1枚の最大損失（JPY）
+        "stop_w": float,               # SL幅（価格差）
+        "sl_pips": float,              # SL幅（pips換算）
+        "required_capital_for_target_1lot": float,  # 1枚を目標risk%に収めるのに必要な資金
+        "req_margin_per_lot": float,
+        "quote_ccy": str,
+        "blocked": bool,
+        "blocked_reason": str,
+      }
+    """
+    lots_int, risk_pct_floor, req_margin_per_lot, loss_per_lot_jpy, stop_w, quote_ccy = _recommend_lots_int_and_risk(
+        pair_label, entry, stop_loss, capital_jpy, risk_percent_target, usd_jpy, remaining_margin_jpy, leverage=leverage
+    )
+
+    cap = float(capital_jpy) if capital_jpy else 0.0
+    risk_1lot_pct = (float(loss_per_lot_jpy) / cap * 100.0) if (cap > 0 and loss_per_lot_jpy > 0) else 0.0
+    sl_pips = _stop_width_to_pips(stop_w, quote_ccy)
+    required_cap = _needed_capital_for_target(loss_per_lot_jpy, risk_percent_target)
+
+    # 証拠金上限
+    try:
+        rem_m = float(remaining_margin_jpy)
+    except Exception:
+        rem_m = 0.0
+    max_lots_by_margin = int(math.floor(rem_m / req_margin_per_lot + 1e-9)) if (req_margin_per_lot > 0 and rem_m > 0) else 0
+
+    # 実質リスク上限
+    try:
+        max_rp = float(max_risk_percent_cap)
+    except Exception:
+        max_rp = 0.0
+    max_lots_by_cap = int(math.floor((cap * (max_rp / 100.0)) / loss_per_lot_jpy + 1e-9)) if (cap > 0 and loss_per_lot_jpy > 0 and max_rp > 0) else 0
+
+    # 目標risk%に沿った推奨lots（整数/切り捨て）
+    target_lots = int(lots_int)
+
+    lots_sel = 0
+    blocked_reason = ""
+
+    if fixed_1lot_mode:
+        # 1枚すら上限/余力で無理なら不可
+        if max_lots_by_margin < 1:
+            blocked_reason = "margin"
+            lots_sel = 0
+        elif max_lots_by_cap < 1:
+            blocked_reason = "risk_cap"
+            lots_sel = 0
+        else:
+            lots_sel = max(1, target_lots)  # targetが0でも1枚を検討
+            lots_sel = min(lots_sel, max_lots_by_margin, max_lots_by_cap)
+            lots_sel = max(1, lots_sel)
+    else:
+        lots_sel = target_lots
+        lots_sel = min(lots_sel, max_lots_by_margin) if max_lots_by_margin > 0 else lots_sel
+        lots_sel = min(lots_sel, max_lots_by_cap) if max_lots_by_cap > 0 else lots_sel
+        if lots_sel < 1:
+            blocked_reason = "target_lots_zero"
+            lots_sel = 0
+
+    risk_actual_pct = (lots_sel * loss_per_lot_jpy / cap * 100.0) if (cap > 0 and lots_sel > 0) else 0.0
+
+    return {
+        "lots": int(lots_sel),
+        "risk_actual_pct": float(risk_actual_pct),
+        "risk_1lot_pct": float(risk_1lot_pct),
+        "loss_per_lot_jpy": float(loss_per_lot_jpy),
+        "stop_w": float(stop_w),
+        "sl_pips": float(sl_pips),
+        "required_capital_for_target_1lot": float(required_cap),
+        "req_margin_per_lot": float(req_margin_per_lot),
+        "quote_ccy": str(quote_ccy),
+        "blocked": (lots_sel < 1),
+        "blocked_reason": blocked_reason,
+        "max_lots_by_margin": int(max_lots_by_margin),
+        "max_lots_by_cap": int(max_lots_by_cap),
+    }
+
+def _calc_rr(side: str, entry: float, take_profit: float, stop_loss: float) -> float:
+    try:
+        e = float(entry); tp = float(take_profit); sl = float(stop_loss)
+    except Exception:
+        return 0.0
+    sw = abs(e - sl)
+    if sw <= 0:
+        return 0.0
+    s = (side or "").upper()
+    if s == "SHORT":
+        return (e - tp) / sw
+    return (tp - e) / sw
+
+def _next_weekday_jst(now_dt: datetime, weekday: int) -> datetime:
+    """
+    weekday: Mon=0 ... Sun=6
+    """
+    d = now_dt
+    days_ahead = (weekday - d.weekday()) % 7
+    if days_ahead == 0:
+        days_ahead = 7
+    return d + timedelta(days=days_ahead)
+
+def _derive_pullback_limit_candidate(pair_label: str, base_side: str, ctx: dict, df_src: pd.DataFrame):
+    """
+    押し目/戻りのLIMIT案（コード側で数値決定）
+    """
+    try:
+        price = float(ctx.get("price", 0.0) or 0.0)
+        atr = float(ctx.get("atr", 0.0) or 0.0)
+        sma25 = float(ctx.get("sma25", price) or price)
+        atr_avg60 = float(ctx.get("atr_avg60", atr) or atr)
+    except Exception:
+        return None
+    if price <= 0 or atr <= 0:
+        return None
+
+    side = "SHORT" if str(base_side).upper() == "SHORT" else "LONG"
+    # 直近構造（20日高安）
+    try:
+        recent_high20 = float(df_src["High"].tail(20).max())
+        recent_low20 = float(df_src["Low"].tail(20).min())
+    except Exception:
+        recent_high20 = price
+        recent_low20 = price
+
+    compressed = (atr_avg60 > 0 and atr <= atr_avg60 * 0.95)
+
+    if side == "LONG":
+        entry = sma25 + 0.10 * atr if sma25 < price else price - 0.25 * atr
+        entry = min(entry, price)  # 上から指すのはNG
+        sl_struct = min(recent_low20, entry - 0.80 * atr)
+        stop_loss = sl_struct - 0.05 * atr
+        stop_w = max(1e-6, entry - stop_loss)
+        tp_rr = entry + stop_w * 2.0
+        # 壁（直近高値）の少し手前を優先（RRが崩れる場合はRR優先）
+        tp_wall = recent_high20 - 0.10 * atr if recent_high20 > entry else tp_rr
+        take_profit = tp_rr if _calc_rr("LONG", entry, tp_wall, stop_loss) < 1.2 else min(tp_rr, tp_wall)
+    else:
+        entry = sma25 - 0.10 * atr if sma25 > price else price + 0.25 * atr
+        entry = max(entry, price)
+        sl_struct = max(recent_high20, entry + 0.80 * atr)
+        stop_loss = sl_struct + 0.05 * atr
+        stop_w = max(1e-6, stop_loss - entry)
+        tp_rr = entry - stop_w * 2.0
+        tp_wall = recent_low20 + 0.10 * atr if recent_low20 < entry else tp_rr
+        take_profit = tp_rr if _calc_rr("SHORT", entry, tp_wall, stop_loss) < 1.2 else max(tp_rr, tp_wall)
+
+    rr = _calc_rr(side, entry, take_profit, stop_loss)
+
+    notes = []
+    if compressed:
+        notes.append("ATR圧縮（浅いSLが成立しやすい局面）")
+    else:
+        notes.append("ATR圧縮ではない（浅いSLは刈られやすい可能性）")
+    notes.append("構造（直近20日高安）を優先してSLを近づけたLIMIT案")
+
+    return {
+        "decision": "TRADE",
+        "side": side,
+        "entry": float(entry),
+        "take_profit": float(take_profit),
+        "stop_loss": float(stop_loss),
+        "horizon": "WEEK",
+        "confidence": 0.55,
+        "why": "固定1枚の現実に合わせ、押し目/戻りでSL幅を縮めるLIMIT案。",
+        "notes": notes,
+        "order_bundle": "IFD_OCO",
+        "entry_type": "LIMIT",
+        "entry_price_kind_jp": "指値",
+        "bundle_hint_jp": "SBI: 指値(IFD-OCO)で放置（TP/SL同時）",
+        "_rr": float(rr),
+        "_candidate_kind": "PULLBACK_LIMIT",
+    }
+
+def _derive_hybrid_confirm_market_candidate(pair_label: str, base_side: str, ctx: dict, df_src: pd.DataFrame):
+    """
+    Hybrid案：ブレイク確認後に成行（ツールは“条件”として提示）
+    """
+    try:
+        price = float(ctx.get("price", 0.0) or 0.0)
+        atr = float(ctx.get("atr", 0.0) or 0.0)
+        atr_avg60 = float(ctx.get("atr_avg60", atr) or atr)
+    except Exception:
+        return None
+    if price <= 0 or atr <= 0:
+        return None
+
+    side = "SHORT" if str(base_side).upper() == "SHORT" else "LONG"
+    try:
+        recent_high20 = float(df_src["High"].tail(20).max())
+        recent_low20 = float(df_src["Low"].tail(20).min())
+    except Exception:
+        recent_high20 = price
+        recent_low20 = price
+
+    # 構造SL（少し広めだが、STOPよりは近くなることが多い）
+    if side == "LONG":
+        entry = price
+        stop_loss = min(recent_low20, price - 0.90 * atr) - 0.05 * atr
+        stop_w = max(1e-6, entry - stop_loss)
+        take_profit = entry + stop_w * 2.0
+    else:
+        entry = price
+        stop_loss = max(recent_high20, price + 0.90 * atr) + 0.05 * atr
+        stop_w = max(1e-6, stop_loss - entry)
+        take_profit = entry - stop_w * 2.0
+
+    rr = _calc_rr(side, entry, take_profit, stop_loss)
+    compressed = (atr_avg60 > 0 and atr <= atr_avg60 * 0.95)
+    notes = [
+        "ブレイク確認（終値/足確定）後に成行で建てる“条件付き”案（固定1枚の代替）",
+        "未約定リスク0を活かす（条件未達なら見送り）",
+    ]
+    if compressed:
+        notes.append("ATR圧縮")
+    return {
+        "decision": "TRADE",
+        "side": side,
+        "entry": float(entry),
+        "take_profit": float(take_profit),
+        "stop_loss": float(stop_loss),
+        "horizon": "WEEK",
+        "confidence": 0.50,
+        "why": "固定1枚でブレイクの勢い確認後に入るHybrid（条件付き成行）案。",
+        "notes": notes,
+        "order_bundle": "IFD_OCO",
+        "entry_type": "MARKET",
+        "entry_price_kind_jp": "成行",
+        "bundle_hint_jp": "SBI: 条件成立後に成行→IFD-OCO（手動実行）",
+        "_rr": float(rr),
+        "_candidate_kind": "HYBRID_CONFIRM_MARKET",
+    }
+
+def _decorate_time_rules(candidate: dict):
+    """時間ルール（未約定キャンセル/建値化/時間損切）をnotesに追記（目安）。"""
+    try:
+        now = datetime.now(TOKYO)
+    except Exception:
+        now = datetime.now()
+    wed = _next_weekday_jst(now, 2)  # Wed
+    fri = _next_weekday_jst(now, 4)  # Fri
+    if not isinstance(candidate, dict):
+        return candidate
+    notes = list(candidate.get("notes") or [])
+    notes.append(f"未約定なら {wed.strftime('%Y-%m-%d')}（水）23:59 でキャンセル目安")
+    notes.append("＋1R到達でSLを建値へ（事故回避）")
+    notes.append(f"{fri.strftime('%Y-%m-%d')}（金）まで進まないなら時間損切り検討")
+    candidate["notes"] = notes
+    return candidate
+
+def _evaluate_and_pick_candidates(
+    pair_label: str,
+    candidates: list,
+    capital_jpy: float,
+    risk_percent_target: float,
+    max_risk_percent_cap: float,
+    fixed_1lot_mode: bool,
+    usd_jpy: float,
+    remaining_margin_jpy: float,
+    weekly_dd_cap_percent: float,
+    active_positions: list,
+    max_positions_per_currency: int,
+    leverage: int = 25,
+):
+    evaluated = []
+    for c in (candidates or []):
+        if not isinstance(c, dict) or c.get("decision") != "TRADE":
+            continue
+        side = c.get("side", "LONG")
+        e = float(c.get("entry") or 0.0)
+        sl = float(c.get("stop_loss") or 0.0)
+        tp = float(c.get("take_profit") or 0.0)
+        if e <= 0 or sl <= 0 or tp <= 0:
+            c["_eval"] = {"ok": False, "reason": "missing_price"}
+            evaluated.append(c)
+            continue
+
+        rr = _calc_rr(side, e, tp, sl)
+        sel = _select_lots_with_fixed_mode(
+            pair_label=pair_label,
+            entry=e,
+            stop_loss=sl,
+            capital_jpy=capital_jpy,
+            risk_percent_target=risk_percent_target,
+            max_risk_percent_cap=max_risk_percent_cap,
+            fixed_1lot_mode=fixed_1lot_mode,
+            usd_jpy=usd_jpy,
+            remaining_margin_jpy=remaining_margin_jpy,
+            leverage=leverage,
+        )
+
+        ok = True
+        reasons = []
+
+        if sel.get("blocked"):
+            ok = False
+            reasons.append(sel.get("blocked_reason") or "blocked")
+
+        if rr < 1.2:
+            ok = False
+            reasons.append("rr_too_low")
+
+        # 週DDキャップ
+        if ok and not logic.can_open_under_weekly_cap(active_positions, float(sel.get("risk_actual_pct", 0.0)), float(weekly_dd_cap_percent)):
+            ok = False
+            reasons.append("weekly_dd_cap")
+
+        # 通貨集中
+        if ok and logic.violates_currency_concentration(pair_label, active_positions, int(max_positions_per_currency)):
+            ok = False
+            reasons.append("currency_concentration")
+
+        c["_rr"] = float(rr)
+        c["_eval"] = {
+            "ok": bool(ok),
+            "reasons": reasons,
+            **sel,
+        }
+        evaluated.append(c)
+
+    # pick
+    valid = [c for c in evaluated if isinstance(c, dict) and c.get("_eval", {}).get("ok")]
+    if valid:
+        # リスク最小を優先（同率ならRR大）
+        valid.sort(key=lambda x: (x["_eval"].get("risk_actual_pct", 999.0), -float(x.get("_rr", 0.0))))
+        return valid[0], evaluated
+    # none valid: return lowest risk as reference
+    if evaluated:
+        evaluated.sort(key=lambda x: (x.get("_eval", {}).get("risk_1lot_pct", 999.0), -float(x.get("_rr", 0.0))))
+        return None, evaluated
+    return None, evaluated
+
 
 total_risk_pct, ccy_counts = _portfolio_summary(st.session_state.portfolio_positions)
 remain_risk_pct = float(weekly_dd_cap_percent) - float(total_risk_pct)
@@ -754,10 +1148,26 @@ with st.sidebar.expander("➕ ポジションを追加", expanded=False):
     add_tp = st.number_input("利確（TP）※任意", value=0.0, format="%.6f")
     add_horizon = st.selectbox("想定期間", ["WEEK（1週間）", "MONTH（1か月）"], index=0)
     if st.button("追加する", key="btn_add_position_manual"):
+        # ✅ 手動入力でも risk% は必ず再計算（入力値は参考扱い）
+        rp_auto = float(add_risk)
+        try:
+            if float(add_entry) > 0 and float(add_sl) > 0 and float(add_lots) > 0 and float(capital) > 0:
+                try:
+                    usd_jpy_now = float(current_rate)
+                except Exception:
+                    usd_jpy_now = float(st.session_state.get('usd_jpy_current', 0.0) or 0.0)
+                q = _infer_quote_ccy_from_label(add_pair)
+                conv = _jpy_conversion_factor_from_quote(q, usd_jpy_now)
+                loss_per_lot = abs(float(add_entry) - float(add_sl)) * 10000.0 * float(conv)
+                max_loss = loss_per_lot * float(add_lots)
+                rp_auto = float(max_loss) / float(capital) * 100.0
+        except Exception:
+            pass
+
         st.session_state.portfolio_positions.append({
             "pair": add_pair,
             "direction": "LONG" if "LONG" in add_dir else "SHORT",
-            "risk_percent": float(add_risk),
+            "risk_percent": float(rp_auto),
             "lots": float(add_lots),
             "entry_price": float(add_entry),
             "stop_loss": float(add_sl) if add_sl else 0.0,
@@ -806,10 +1216,28 @@ with st.sidebar.expander("📋 一覧（編集/削除）", expanded=False):
                         except Exception:
                             return float(default)
 
+                    rp_auto = _to_float(r.get("risk_percent", 0.0), 0.0)
+                    try:
+                        ep = _to_float(r.get("entry_price", 0.0), 0.0)
+                        slp = _to_float(r.get("stop_loss", 0.0), 0.0)
+                        lotsv = _to_float(r.get("lots", 0.0), 0.0)
+                        if ep > 0 and slp > 0 and lotsv > 0 and float(capital) > 0:
+                            try:
+                                usd_jpy_now = float(current_rate)
+                            except Exception:
+                                usd_jpy_now = float(st.session_state.get('usd_jpy_current', 0.0) or 0.0)
+                            q = _infer_quote_ccy_from_label(pair)
+                            conv = _jpy_conversion_factor_from_quote(q, usd_jpy_now)
+                            loss_per_lot = abs(ep - slp) * 10000.0 * float(conv)
+                            max_loss = loss_per_lot * lotsv
+                            rp_auto = float(max_loss) / float(capital) * 100.0
+                    except Exception:
+                        pass
+
                     recs.append({
                         "pair": pair,
                         "direction": direction,
-                        "risk_percent": _to_float(r.get("risk_percent", 0.0), 0.0),
+                        "risk_percent": float(rp_auto),
                         "lots": _to_float(r.get("lots", 0.0), 0.0),
                         "entry_price": _to_float(r.get("entry_price", 0.0), 0.0),
                         "stop_loss": _to_float(r.get("stop_loss", 0.0), 0.0),
@@ -886,6 +1314,7 @@ if df is None or df.empty:
 
 # 最新レートが取得できない場合のバックアップ
 current_rate = q_price if q_price else df["Close"].iloc[-1]
+st.session_state['usd_jpy_current'] = float(current_rate)
 
 # 軸同期のためにインデックスを正規化
 df.index = pd.to_datetime(df.index)
@@ -1277,7 +1706,57 @@ with tab2:
                     ctx["last_report"] = st.session_state.last_ai_report
                     ctx["panel_short"] = diag['short']['status'] if diag else "不明"
                     ctx["panel_mid"] = diag['mid']['status'] if diag else "不明"
-                    st.session_state.last_strategy = logic.get_ai_order_strategy(api_key, ctx, generation_policy=gen_policy)
+                    base_strategy = logic.get_ai_order_strategy(api_key, ctx, generation_policy=gen_policy)
+                    chosen = base_strategy
+                    try:
+                        if prefer_pullback_limit and isinstance(base_strategy, dict) and base_strategy.get('decision') == 'TRADE':
+                            side = base_strategy.get('side', 'LONG')
+                            cands = []
+                            c_limit = _derive_pullback_limit_candidate('USD/JPY (ドル円)', side, ctx, df)
+                            if c_limit:
+                                cands.append(c_limit)
+                            c_stop = dict(base_strategy)
+                            c_stop['_candidate_kind'] = c_stop.get('_candidate_kind') or 'BREAKOUT_STOP'
+                            c_stop = _decorate_time_rules(c_stop)
+                            cands.append(c_stop)
+                            c_hybrid = _derive_hybrid_confirm_market_candidate('USD/JPY (ドル円)', side, ctx, df)
+                            if c_hybrid:
+                                cands.append(c_hybrid)
+                            usd_jpy_now = float(current_rate)
+                            used_m = _portfolio_margin_used_jpy(st.session_state.portfolio_positions, usd_jpy_now, leverage=leverage)
+                            remain_m = float(capital) - float(used_m)
+                            if remain_m < 0:
+                                remain_m = 0.0
+                            picked, evaluated = _evaluate_and_pick_candidates(
+                                pair_label='USD/JPY (ドル円)',
+                                candidates=cands,
+                                capital_jpy=float(capital),
+                                risk_percent_target=float(risk_percent),
+                                max_risk_percent_cap=float(max_risk_percent_cap),
+                                fixed_1lot_mode=bool(fixed_1lot_mode),
+                                usd_jpy=usd_jpy_now,
+                                remaining_margin_jpy=float(remain_m),
+                                weekly_dd_cap_percent=float(weekly_dd_cap_percent),
+                                active_positions=st.session_state.portfolio_positions,
+                                max_positions_per_currency=int(max_positions_per_currency),
+                                leverage=leverage,
+                            )
+                            if picked:
+                                chosen = picked
+                            else:
+                                chosen = {
+                                    'decision': 'NO_TRADE',
+                                    'side': 'NONE',
+                                    'why': '固定1枚前提で、許容最大リスク%（上限）/週DDキャップ/証拠金の制約を満たす案がありません。',
+                                    'notes': [f'上限リスク%={float(max_risk_percent_cap):.1f}', f'週DDキャップ={float(weekly_dd_cap_percent):.1f}'],
+                                }
+                            chosen['candidates'] = evaluated
+                    except Exception as _e:
+                        chosen = base_strategy
+                        if isinstance(chosen, dict):
+                            chosen.setdefault('notes', [])
+                            chosen['notes'].append(f'3案生成評価で例外: {_e}')
+                    st.session_state.last_strategy = chosen
                     # ✅ USD/JPY注文のEntry/TP/SLをチャートに重ね表示
                     _ov = _strategy_to_overlay("USD/JPY (ドル円)", st.session_state.last_strategy)
                     if _ov:
@@ -1310,6 +1789,66 @@ with tab2:
             else:
                 st.markdown(strategy)
 
+
+        # ✅ 実損失ベース（固定1枚前提）の見える化
+        if isinstance(strategy, dict) and strategy.get("decision") == "TRADE":
+            try:
+                usd_jpy_now = float(current_rate)
+            except Exception:
+                usd_jpy_now = 0.0
+            used_m = _portfolio_margin_used_jpy(st.session_state.portfolio_positions, usd_jpy_now, leverage=leverage)
+            remain_m = float(capital) - float(used_m)
+            if remain_m < 0:
+                remain_m = 0.0
+
+            e = float(strategy.get("entry") or ctx.get("price", 0.0) or 0.0)
+            sl = float(strategy.get("stop_loss") or 0.0)
+            side = str(strategy.get("side") or "LONG")
+            sel = strategy.get("_eval") if isinstance(strategy.get("_eval"), dict) else _select_lots_with_fixed_mode(
+                pair_label="USD/JPY (ドル円)",
+                entry=e,
+                stop_loss=sl,
+                capital_jpy=float(capital),
+                risk_percent_target=float(risk_percent),
+                max_risk_percent_cap=float(max_risk_percent_cap),
+                fixed_1lot_mode=bool(fixed_1lot_mode),
+                usd_jpy=usd_jpy_now,
+                remaining_margin_jpy=float(remain_m),
+                leverage=leverage,
+            )
+            lots_sel = int(sel.get("lots", 0))
+            st.caption(
+                f"SL幅={sel.get('stop_w',0):.6f}（{sel.get('sl_pips',0):.0f}pips） / "
+                f"1枚最大損失=¥{sel.get('loss_per_lot_jpy',0):,.0f} / "
+                f"実質リスク(1枚)={sel.get('risk_1lot_pct',0):.2f}% / "
+                f"推奨枚数={lots_sel}枚 / 実質リスク={sel.get('risk_actual_pct',0):.2f}% / "
+                f"目標{float(risk_percent):.1f}%で1枚を収める必要資金=¥{sel.get('required_capital_for_target_1lot',0):,.0f}"
+            )
+            if lots_sel < 1:
+                st.error("❌ この案は『固定1枚＋上限リスク%/証拠金/週DDキャップ』の制約で実行不可です。")
+
+        if isinstance(strategy, dict) and strategy.get("candidates"):
+            with st.expander("🧩 3案比較（押し目LIMIT / ブレイクSTOP / Hybrid）", expanded=False):
+                rows = []
+                for c in (strategy.get("candidates") or []):
+                    if not isinstance(c, dict):
+                        continue
+                    ev = c.get("_eval") if isinstance(c.get("_eval"), dict) else {}
+                    rows.append({
+                        "案": c.get("_candidate_kind",""),
+                        "entry_type": c.get("entry_type",""),
+                        "entry": c.get("entry",0),
+                        "SL": c.get("stop_loss",0),
+                        "TP": c.get("take_profit",0),
+                        "RR": round(float(c.get("_rr", 0.0) or 0.0), 2),
+                        "lots": ev.get("lots", 0),
+                        "実質リスク%": round(float(ev.get("risk_actual_pct", 0.0) or 0.0), 2),
+                        "1枚リスク%": round(float(ev.get("risk_1lot_pct", 0.0) or 0.0), 2),
+                        "OK": bool(ev.get("ok")),
+                        "NG理由": ",".join(ev.get("reasons") or []) if isinstance(ev.get("reasons"), list) else "",
+                    })
+                if rows:
+                    st.dataframe(pd.DataFrame(rows), use_container_width=True)
         decision = ""
         try:
             decision = strategy.get("decision") if isinstance(strategy, dict) else ""
@@ -1330,9 +1869,24 @@ with tab2:
                 sl = float(strategy.get("stop_loss") or 0.0)
                 tp = float(strategy.get("take_profit") or 0.0)
 
-                lots_int, risk_actual_pct, req_margin_per_lot, loss_per_lot_jpy, stop_w, quote_ccy = _recommend_lots_int_and_risk(
-                    "USD/JPY (ドル円)", e, sl, float(capital), float(risk_percent), usd_jpy_now, remain_m, leverage=leverage
+                sel = _select_lots_with_fixed_mode(
+                    pair_label="USD/JPY (ドル円)",
+                    entry=e,
+                    stop_loss=sl,
+                    capital_jpy=float(capital),
+                    risk_percent_target=float(risk_percent),
+                    max_risk_percent_cap=float(max_risk_percent_cap),
+                    fixed_1lot_mode=bool(fixed_1lot_mode),
+                    usd_jpy=usd_jpy_now,
+                    remaining_margin_jpy=float(remain_m),
+                    leverage=leverage,
                 )
+                lots_int = int(sel.get("lots", 0))
+                risk_actual_pct = float(sel.get("risk_actual_pct", 0.0))
+                req_margin_per_lot = float(sel.get("req_margin_per_lot", 0.0))
+                loss_per_lot_jpy = float(sel.get("loss_per_lot_jpy", 0.0))
+                stop_w = float(sel.get("stop_w", 0.0))
+                quote_ccy = str(sel.get("quote_ccy", "JPY"))
 
                 if lots_int < 1:
                     st.error(
@@ -1399,7 +1953,59 @@ with tab2:
                     alt_ctx = _build_ctx_for_pair(best_pair, ctx, us10y_raw)
                     if not alt_ctx.get("_pair_ctx_ok"):
                         st.warning("⚠️ 代替ペアの最新テクニカル（RSI/ATR等）が取得できませんでした。精度が落ちるため、原則ノートレ推奨です。")
-                    st.session_state.last_alt_strategy = logic.get_ai_order_strategy(api_key, alt_ctx, generation_policy='AUTO_HIERARCHY')
+                    df_alt = _get_df_for_pair(best_pair, us10y_raw)
+                    base_strategy = logic.get_ai_order_strategy(api_key, alt_ctx, generation_policy='AUTO_HIERARCHY')
+                    chosen = base_strategy
+                    try:
+                        if prefer_pullback_limit and isinstance(base_strategy, dict) and base_strategy.get('decision') == 'TRADE' and df_alt is not None:
+                            side = base_strategy.get('side', 'LONG')
+                            cands = []
+                            c_limit = _derive_pullback_limit_candidate(best_pair, side, alt_ctx, df_alt)
+                            if c_limit:
+                                cands.append(c_limit)
+                            c_stop = dict(base_strategy)
+                            c_stop['_candidate_kind'] = c_stop.get('_candidate_kind') or 'BREAKOUT_STOP'
+                            c_stop = _decorate_time_rules(c_stop)
+                            cands.append(c_stop)
+                            c_hybrid = _derive_hybrid_confirm_market_candidate(best_pair, side, alt_ctx, df_alt)
+                            if c_hybrid:
+                                cands.append(c_hybrid)
+                            usd_jpy_now = float(current_rate)
+                            used_m = _portfolio_margin_used_jpy(st.session_state.portfolio_positions, usd_jpy_now, leverage=leverage)
+                            remain_m = float(capital) - float(used_m)
+                            if remain_m < 0:
+                                remain_m = 0.0
+                            picked, evaluated = _evaluate_and_pick_candidates(
+                                pair_label=best_pair,
+                                candidates=cands,
+                                capital_jpy=float(capital),
+                                risk_percent_target=float(risk_percent),
+                                max_risk_percent_cap=float(max_risk_percent_cap),
+                                fixed_1lot_mode=bool(fixed_1lot_mode),
+                                usd_jpy=usd_jpy_now,
+                                remaining_margin_jpy=float(remain_m),
+                                weekly_dd_cap_percent=float(weekly_dd_cap_percent),
+                                active_positions=st.session_state.portfolio_positions,
+                                max_positions_per_currency=int(max_positions_per_currency),
+                                leverage=leverage,
+                            )
+                            if picked:
+                                chosen = picked
+                            else:
+                                chosen = {
+                                    'decision': 'NO_TRADE',
+                                    'side': 'NONE',
+                                    'why': '固定1枚前提で、許容最大リスク%（上限）/週DDキャップ/証拠金の制約を満たす案がありません。',
+                                    'notes': [f'上限リスク%={float(max_risk_percent_cap):.1f}', f'週DDキャップ={float(weekly_dd_cap_percent):.1f}'],
+                                }
+                            chosen['candidates'] = evaluated
+                    except Exception as _e:
+                        chosen = base_strategy
+                        if isinstance(chosen, dict):
+                            chosen.setdefault('notes', [])
+                            chosen['notes'].append(f'3案生成評価で例外: {_e}')
+                    st.session_state.last_alt_strategy = chosen
+
                     # ✅ 代替ペア注文のEntry/TP/SLをチャートに重ね表示（自動で代替チャートへ切替）
                     _ov2 = _strategy_to_overlay(best_pair, st.session_state.last_alt_strategy)
                     st.session_state.chart_pair_label = best_pair
@@ -1443,9 +2049,24 @@ with tab2:
                             sl = float((alt_strategy.get("stop_loss") if isinstance(alt_strategy, dict) else 0.0) or 0.0)
                             tp = float((alt_strategy.get("take_profit") if isinstance(alt_strategy, dict) else 0.0) or 0.0)
 
-                            lots_int, risk_actual_pct, req_margin_per_lot, loss_per_lot_jpy, stop_w, quote_ccy = _recommend_lots_int_and_risk(
-                                best_pair, e, sl, float(capital), float(risk_percent), usd_jpy_now, remain_m, leverage=leverage
+                            sel = _select_lots_with_fixed_mode(
+                                pair_label=best_pair,
+                                entry=e,
+                                stop_loss=sl,
+                                capital_jpy=float(capital),
+                                risk_percent_target=float(risk_percent),
+                                max_risk_percent_cap=float(max_risk_percent_cap),
+                                fixed_1lot_mode=bool(fixed_1lot_mode),
+                                usd_jpy=usd_jpy_now,
+                                remaining_margin_jpy=float(remain_m),
+                                leverage=leverage,
                             )
+                            lots_int = int(sel.get("lots", 0))
+                            risk_actual_pct = float(sel.get("risk_actual_pct", 0.0))
+                            req_margin_per_lot = float(sel.get("req_margin_per_lot", 0.0))
+                            loss_per_lot_jpy = float(sel.get("loss_per_lot_jpy", 0.0))
+                            stop_w = float(sel.get("stop_w", 0.0))
+                            quote_ccy = str(sel.get("quote_ccy", "JPY"))
 
                             if lots_int < 1:
                                 st.error(
