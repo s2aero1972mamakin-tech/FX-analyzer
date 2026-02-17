@@ -704,7 +704,7 @@ if st.sidebar.button("📊 一括集計を実行", use_container_width=True):
         "risk_percent_target": float(risk_percent),
         "fixed_1lot_mode": bool(fixed_1lot_mode),
         "max_positions_per_currency": int(max_positions_per_currency),
-        "leverage": int(leverage),
+        "leverage": 25,  # fixed (avoid NameError before leverage is defined)
         "api_key": str(api_key or ""),
     }
 
