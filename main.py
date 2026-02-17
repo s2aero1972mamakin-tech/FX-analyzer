@@ -30,6 +30,28 @@ st.title("🤖 AI連携型 USD/JPY 戦略分析ツール (SBI仕様)")
 
 TOKYO = pytz.timezone("Asia/Tokyo")
 
+def _parse_bool(v, default: bool = False) -> bool:
+    """Parse booleans from Streamlit secrets/UI which may deliver strings like 'false'."""
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return default
+    if isinstance(v, (int, float)):
+        return bool(v)
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("1", "true", "yes", "y", "on"):
+            return True
+        if s in ("0", "false", "no", "n", "off", ""):
+            return False
+    return default
+
+try:
+    DEV_MODE = _parse_bool(st.secrets.get("DEV_MODE", False), False)
+except Exception:
+    DEV_MODE = False
+
+
 # --- SBI必要証拠金（1万通貨あたり / JPY） ---
 # ユーザー提示の固定値を優先して「最大発注可能数（枚）」を計算します。
 # ※SBI側の改定があり得るので、数値は必要に応じて更新してください。
@@ -514,9 +536,16 @@ prefer_pullback_limit = st.sidebar.checkbox(
     help="AI案が遠い/損切幅が広い場合に、押し目LIMIT/確認後成行の代替案を自動生成して採用します。"
 )
 
-# ✅【追加】デバッグ（テスト用）
-st.sidebar.subheader("🧪 デバッグ")
-force_no_trade_debug = st.sidebar.checkbox("NO_TRADE分岐を強制表示（テスト用）", value=False, help="代替ペアの動線テスト用。実運用ではOFF。")
+# ✅【追加】デバッグ（テスト用）: Secretsの DEV_MODE=true のときだけ表示
+if DEV_MODE:
+    st.sidebar.subheader("🧪 デバッグ")
+    force_no_trade_debug = st.sidebar.checkbox(
+        "NO_TRADE分岐を強制表示（テスト用）",
+        value=False,
+        help="代替ペアの動線テスト用。実運用ではOFF。",
+    )
+else:
+    force_no_trade_debug = False
 
 
 leverage = 25  # 固定
@@ -1091,7 +1120,7 @@ with st.sidebar.expander("💾 状態保存 / 復元（ポートフォリオ）"
 
     # Safari 対策（Secretsの FORCE_SAFARI_DOWNLOAD=true でリンク方式に切替）
     try:
-        _force_safari = bool(st.secrets.get("FORCE_SAFARI_DOWNLOAD", False))
+        _force_safari = _parse_bool(st.secrets.get("FORCE_SAFARI_DOWNLOAD", False), False)
     except Exception:
         _force_safari = False
 
