@@ -13,6 +13,152 @@ import json  # ✅ JSON固定出力のため
 TOKYO = pytz.timezone("Asia/Tokyo")
 
 # =============================
+# OpenAI (Responses API) helper
+# =============================
+OPENAI_API_URL = "https://api.openai.com/v1/responses"
+
+def _openai_responses_json_schema(api_key: str, model: str, user_prompt: str, schema: dict, system_prompt: str = "", timeout: int = 40):
+    """Call OpenAI Responses API with JSON schema. Returns (obj, err_msg)."""
+    try:
+        if not api_key:
+            return None, "openai_api_key_missing"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": model,
+            "input": [
+                {"role": "system", "content": system_prompt or "You are a careful trading assistant. Output only valid JSON."},
+                {"role": "user", "content": user_prompt},
+            ],
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "fx_order_decision",
+                    "schema": schema,
+                    "strict": True,
+                }
+            },
+        }
+        r = requests.post(OPENAI_API_URL, headers=headers, json=payload, timeout=timeout)
+        if r.status_code != 200:
+            return None, f"openai_http_{r.status_code}:{(r.text or '')[:200]}"
+        data = r.json()
+        # Responses API: output_text contains the text output (should be JSON string)
+        out_text = data.get("output_text", "") or ""
+        if not out_text:
+            # fallback: sometimes the JSON is in output[0].content[0].text
+            try:
+                out = data.get("output", [])
+                if out and isinstance(out, list):
+                    c = out[0].get("content", [])
+                    if c and isinstance(c, list):
+                        out_text = c[0].get("text", "") or ""
+            except Exception:
+                out_text = ""
+        if not out_text:
+            return None, "openai_empty_output"
+        # out_text should be JSON
+        obj = json.loads(out_text)
+        return obj, ""
+    except Exception as e:
+        return None, f"openai_exception:{type(e).__name__}:{str(e)[:180]}"
+
+# Order JSON schema (shared)
+_ORDER_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "decision": {"type": "string", "enum": ["TRADE", "NO_TRADE"]},
+        "side": {"type": "string", "enum": ["LONG", "SHORT", "NONE"]},
+        "entry": {"type": "number"},
+        "take_profit": {"type": "number"},
+        "stop_loss": {"type": "number"},
+        "horizon": {"type": "string", "enum": ["WEEK", "MONTH"]},
+        "confidence": {"type": "number"},
+        "p_win": {"type": "number"},
+        "expected_R": {"type": "number"},
+        "order_bundle": {"type": "string"},
+        "entry_type": {"type": "string"},
+        "entry_price_kind_jp": {"type": "string"},
+        "bundle_hint_jp": {"type": "string"},
+        "why": {"type": "string"},
+        "notes": {"type": "array", "items": {"type": "string"}},
+        "invalidation_conditions": {"type": "array", "items": {"type": "string"}},
+        "invalidation_codes": {"type": "array", "items": {"type": "string"}},
+        "veto_reason_codes": {"type": "array", "items": {"type": "string"}},
+        "veto_confidence": {"type": "number"},
+    },
+    "required": ["decision", "side", "entry", "take_profit", "stop_loss", "horizon", "confidence", "p_win", "expected_R",
+                 "order_bundle", "entry_type", "entry_price_kind_jp", "bundle_hint_jp", "why", "notes",
+                 "invalidation_conditions", "invalidation_codes", "veto_reason_codes", "veto_confidence"],
+    "additionalProperties": False,
+}
+
+def _ensure_order_meta_fields(obj: dict, ctx: dict):
+    """Fill/clamp meta fields for comparison/logging."""
+    if not isinstance(obj, dict):
+        return obj
+    # Defaults
+    if "notes" not in obj or not isinstance(obj.get("notes"), list):
+        obj["notes"] = []
+    if "why" not in obj:
+        obj["why"] = ""
+    # confidence
+    try:
+        obj["confidence"] = _clamp(float(obj.get("confidence", 0.0)), 0.0, 1.0)
+    except Exception:
+        obj["confidence"] = 0.0
+    # p_win
+    p = obj.get("p_win", None)
+    try:
+        p = float(p)
+        p = _clamp(p, 0.0, 1.0)
+    except Exception:
+        # fallback: use confidence as proxy
+        p = obj.get("confidence", 0.0)
+        obj.setdefault("notes", []).append("p_win_fallback=confidence")
+    obj["p_win"] = p
+    # rr
+    try:
+        entry = float(obj.get("entry", 0.0))
+        sl = float(obj.get("stop_loss", 0.0))
+        tp = float(obj.get("take_profit", 0.0))
+        risk = abs(entry - sl)
+        reward = abs(tp - entry)
+        rr = reward / risk if risk > 0 else 0.0
+    except Exception:
+        rr = 0.0
+    # expected_R
+    er = obj.get("expected_R", None)
+    try:
+        er = float(er)
+    except Exception:
+        # simplified EV in R units: win->+rr, lose->-1
+        er = p * rr - (1.0 - p) * 1.0
+        obj.setdefault("notes", []).append("expected_R_autocalc")
+    obj["expected_R"] = er
+    # invalidation
+    if "invalidation_conditions" not in obj or not isinstance(obj.get("invalidation_conditions"), list):
+        obj["invalidation_conditions"] = [
+            "日足で直近スイング高安を明確に割ったら撤退/見送り",
+            "週初方向(trend_side_hint)と逆行が強まり、日足終値ベースで反転が確認されたら撤退",
+            "想定ボラ(ATR)から大きく逸脱する急変動が出たら一旦撤退（イベント週扱い）",
+        ]
+        obj.setdefault("notes", []).append("invalidation_default")
+    if "invalidation_codes" not in obj or not isinstance(obj.get("invalidation_codes"), list):
+        obj["invalidation_codes"] = ["break_structure", "week_trend_reversal", "atr_spike_hard"]
+    # veto fields for trade: keep empty arrays
+    if "veto_reason_codes" not in obj or not isinstance(obj.get("veto_reason_codes"), list):
+        obj["veto_reason_codes"] = []
+    try:
+        obj["veto_confidence"] = _clamp(float(obj.get("veto_confidence", 0.0)), 0.0, 1.0)
+    except Exception:
+        obj["veto_confidence"] = 0.0
+    return obj
+
+
+# =============================
 # Tunables (運用ルール)
 # =============================
 # entry_too_far ルール
@@ -740,7 +886,10 @@ def get_ai_market_regime(api_key, context_data):
     ※推測でニュースを作らず、数値中心で判断する。
     """
     try:
-        model = genai.GenerativeModel(get_active_model(api_key))
+        _prov = str(_provider or "gemini").lower().strip()
+        if _prov != "openai":
+            model = genai.GenerativeModel(get_active_model(api_key))
+        model_name_used = str(_openai_model or "gpt-4o-mini")
         pair_label = str(context_data.get("pair_label", "USD/JPY"))
         p = context_data.get("price", 0.0)
         rsi = context_data.get("rsi", 0.0)
@@ -768,9 +917,14 @@ panel_mid={pm}
 
 【出力ルール】
 - 出力はJSONオブジェクトのみ（前後に文章を付けない）
+- decision="NO_TRADE" の場合も、必須キーは省略しない（数値は0、配列は[]で埋める）
 - 次のキーを必ず含める：
   market_regime: "DEFENSIVE" または "OPPORTUNITY"
   confidence: 0.0〜1.0
+  p_win: 0.0〜1.0（TPがSLより先に到達する確率の推定。主観でよいが誇張しない）
+  expected_R: number（期待値。R換算で、+なら期待優位。簡易計算でOK）
+  invalidation_conditions: 0〜6個の配列（日本語。成立しなくなった/撤退すべき条件）
+  invalidation_codes: 文字列配列（英語コード。例: ["break_structure","daily_close_below_sma25"]）
   why: 1〜3文の理由（日本語）
   notes: 箇条書き配列（0〜6個）
 
@@ -970,7 +1124,7 @@ def get_ai_portfolio(api_key, context_data):
         return "ポートフォリオ分析に失敗しました。"
 
 
-def get_ai_order_strategy(api_key, context_data, override_mode="AUTO", override_reason=""):
+def get_ai_order_strategy(api_key, context_data, override_mode="AUTO", override_reason="", *, _provider="gemini", _openai_api_key="", _openai_model="gpt-4o-mini", _openai_timeout=40):
     """
     注文命令書をJSON固定で返す（命令 + why/notes解説）。
     さらに market_regime をAIが判定し、守り/攻めのNO_TRADEゲートを自動切替する。
@@ -1148,10 +1302,43 @@ last_report_summary={report[:1200]}
   逆行が強い場合は decision="NO_TRADE" とし、veto_reason_codes に "week_trend_reversal" を含める。
 - あいまい表現で行動を濁さない。TRADE/NO_TRADEどちらかに決める。
 """
-        resp = model.generate_content(prompt)
-        raw = getattr(resp, "text", "") or ""
-        j = _extract_json_block(raw)
-        obj = json.loads(j) if j else {"decision":"NO_TRADE","side":"NONE","why":"JSON抽出失敗","notes":["json_extract_failed"]}
+        if _prov == "openai":
+            obj, err = _openai_responses_json_schema(
+                api_key=_openai_api_key,
+                model=model_name_used,
+                user_prompt=prompt,
+                schema=_ORDER_JSON_SCHEMA,
+                system_prompt="",
+                timeout=int(_openai_timeout),
+            )
+            if err or not isinstance(obj, dict):
+                obj = {
+                    "decision": "NO_TRADE",
+                    "side": "NONE",
+                    "entry": 0,
+                    "take_profit": 0,
+                    "stop_loss": 0,
+                    "horizon": "WEEK",
+                    "confidence": 0.0,
+                    "p_win": 0.0,
+                    "expected_R": -1.0,
+                    "order_bundle": "NONE",
+                    "entry_type": "NONE",
+                    "entry_price_kind_jp": "なし",
+                    "bundle_hint_jp": "",
+                    "why": "OpenAI出力失敗",
+                    "notes": [err or "openai_failed"],
+                    "invalidation_conditions": [],
+                    "invalidation_codes": [],
+                    "veto_reason_codes": ["openai_failed"],
+                    "veto_confidence": 1.0,
+                }
+        else:
+            resp = model.generate_content(prompt)
+            raw = getattr(resp, "text", "") or ""
+            j = _extract_json_block(raw)
+            obj = json.loads(j) if j else {"decision":"NO_TRADE","side":"NONE","why":"JSON抽出失敗","notes":["json_extract_failed"]}
+        obj = _ensure_order_meta_fields(obj, context_data)
         ok, reasons = _validate_order_json(obj, context_data)
 
         # バリデーションNG → 強制NO_TRADE
@@ -1164,6 +1351,12 @@ last_report_summary={report[:1200]}
                 "stop_loss": 0,
                 "horizon": "WEEK",
                 "confidence": 0.0,
+                "p_win": 0.0,
+                "expected_R": -1.0,
+                "invalidation_conditions": [],
+                "invalidation_codes": [],
+                "veto_reason_codes": ["parse_or_validation_failed"],
+                "veto_confidence": 1.0,
                 "why": "注文JSONの検証に失敗したため取引停止。",
                 "notes": ["parse_or_validation_failed", *reasons][:12],
                 "market_regime": market_regime,
@@ -3173,3 +3366,71 @@ def suggest_alternative_pair_if_usdjpy_stay(
         "source": "numeric_scan_no_tradeable",
         "candidates": cand_out,
     }
+
+
+# =============================
+# Shadow compare helper (OpenAI)
+# =============================
+def get_ai_order_strategy_shadow_openai(
+    openai_api_key: str,
+    context_data: dict,
+    openai_model: str = "gpt-4o-mini",
+    override_mode: str = "AUTO",
+    override_reason: str = "",
+):
+    """OpenAI版のAI_STRICT注文生成（比較用）。ポジション作成や発注はしない。"""
+    base = globals().get("_old_get_ai_order_strategy", None)
+    if base is None:
+        return {
+            "decision": "NO_TRADE",
+            "side": "NONE",
+            "entry": 0,
+            "take_profit": 0,
+            "stop_loss": 0,
+            "horizon": "WEEK",
+            "confidence": 0.0,
+            "p_win": 0.0,
+            "expected_R": -1.0,
+            "order_bundle": "NONE",
+            "entry_type": "NONE",
+            "entry_price_kind_jp": "なし",
+            "bundle_hint_jp": "",
+            "why": "内部エラー: _old_get_ai_order_strategyが見つかりません",
+            "notes": ["shadow_helper_missing_old"],
+            "invalidation_conditions": [],
+            "invalidation_codes": [],
+            "veto_reason_codes": ["shadow_helper_missing_old"],
+            "veto_confidence": 1.0,
+        }
+    try:
+        return base(
+            api_key="",
+            context_data=context_data or {},
+            override_mode=override_mode,
+            override_reason=override_reason,
+            _provider="openai",
+            _openai_api_key=openai_api_key,
+            _openai_model=openai_model,
+        )
+    except Exception as e:
+        return {
+            "decision": "NO_TRADE",
+            "side": "NONE",
+            "entry": 0,
+            "take_profit": 0,
+            "stop_loss": 0,
+            "horizon": "WEEK",
+            "confidence": 0.0,
+            "p_win": 0.0,
+            "expected_R": -1.0,
+            "order_bundle": "NONE",
+            "entry_type": "NONE",
+            "entry_price_kind_jp": "なし",
+            "bundle_hint_jp": "",
+            "why": f"shadow_openai_exception: {type(e).__name__}",
+            "notes": [str(e)[:160]],
+            "invalidation_conditions": [],
+            "invalidation_codes": [],
+            "veto_reason_codes": ["shadow_openai_exception"],
+            "veto_confidence": 1.0,
+        }
