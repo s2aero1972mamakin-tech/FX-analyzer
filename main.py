@@ -7,7 +7,7 @@ import json
 import base64
 import math
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import pytz
 import logic  # ← logic.pyが必要
 
