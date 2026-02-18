@@ -701,7 +701,7 @@ _batch_max_hold_weeks = st.sidebar.number_input(
 )
 _batch_max_entry_wait_weeks = st.sidebar.number_input(
     "約定猶予週数（LIMIT/STOPの待ち）",
-    min_value=1, max_value=8, value=2, step=1,
+    min_value=1, max_value=8, value=4, step=1,
     help="指値/逆指値が何週以内に約定しなければ無効（NO_FILL）として扱うか。"
 )
 if st.sidebar.button("📊 一括集計を実行", use_container_width=True):
@@ -1053,22 +1053,22 @@ def _derive_pullback_limit_candidate(pair_label: str, base_side: str, ctx: dict,
     compressed = (atr_avg60 > 0 and atr <= atr_avg60 * 0.95)
 
     if side == "LONG":
-        entry = sma25 + 0.10 * atr if sma25 < price else price - 0.25 * atr
+        entry = sma25 + 0.05 * atr if sma25 < price else price - 0.15 * atr
         entry = min(entry, price)  # 上から指すのはNG
         sl_struct = min(recent_low20, entry - 0.80 * atr)
         stop_loss = sl_struct - 0.05 * atr
         stop_w = max(1e-6, entry - stop_loss)
-        tp_rr = entry + stop_w * 2.0
+        tp_rr = entry + stop_w * 1.6
         # 壁（直近高値）の少し手前を優先（RRが崩れる場合はRR優先）
         tp_wall = recent_high20 - 0.10 * atr if recent_high20 > entry else tp_rr
         take_profit = tp_rr if _calc_rr("LONG", entry, tp_wall, stop_loss) < 1.2 else min(tp_rr, tp_wall)
     else:
-        entry = sma25 - 0.10 * atr if sma25 > price else price + 0.25 * atr
+        entry = sma25 - 0.05 * atr if sma25 > price else price + 0.15 * atr
         entry = max(entry, price)
         sl_struct = max(recent_high20, entry + 0.80 * atr)
         stop_loss = sl_struct + 0.05 * atr
         stop_w = max(1e-6, stop_loss - entry)
-        tp_rr = entry - stop_w * 2.0
+        tp_rr = entry - stop_w * 1.6
         tp_wall = recent_low20 + 0.10 * atr if recent_low20 < entry else tp_rr
         take_profit = tp_rr if _calc_rr("SHORT", entry, tp_wall, stop_loss) < 1.2 else max(tp_rr, tp_wall)
 
@@ -1125,12 +1125,12 @@ def _derive_hybrid_confirm_market_candidate(pair_label: str, base_side: str, ctx
         entry = price
         stop_loss = min(recent_low20, price - 0.90 * atr) - 0.05 * atr
         stop_w = max(1e-6, entry - stop_loss)
-        take_profit = entry + stop_w * 2.0
+        take_profit = entry + stop_w * 1.6
     else:
         entry = price
         stop_loss = max(recent_high20, price + 0.90 * atr) + 0.05 * atr
         stop_w = max(1e-6, stop_loss - entry)
-        take_profit = entry - stop_w * 2.0
+        take_profit = entry - stop_w * 1.6
 
     rr = _calc_rr(side, entry, take_profit, stop_loss)
     compressed = (atr_avg60 > 0 and atr <= atr_avg60 * 0.95)
@@ -1223,7 +1223,7 @@ def _evaluate_and_pick_candidates(
             ok = False
             reasons.append(sel.get("blocked_reason") or "blocked")
 
-        if rr < 1.2:
+        if rr < 1.1:
             ok = False
             reasons.append("rr_too_low")
 
