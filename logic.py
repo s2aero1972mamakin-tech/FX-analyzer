@@ -1,11 +1,9 @@
-# logic.py
+# logic.py (v4 integrated, backward-compatible with v3 UI)
 from __future__ import annotations
 
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, List
 import math
-
 import pandas as pd
-
 
 PAIR_MAP = {
     "USD/JPY": "JPY=X",
@@ -17,10 +15,19 @@ PAIR_MAP = {
     "AUD/JPY": "AUDJPY=X",
 }
 
-
+# -------------------------
+# Small utils
+# -------------------------
 def _clamp(x: float, lo: float, hi: float) -> float:
     return lo if x < lo else hi if x > hi else x
 
+def _safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        if x is None:
+            return default
+        return float(x)
+    except Exception:
+        return default
 
 def _softmax(logits: Dict[str, float]) -> Dict[str, float]:
     m = max(logits.values())
@@ -28,7 +35,9 @@ def _softmax(logits: Dict[str, float]) -> Dict[str, float]:
     s = sum(exps.values()) or 1.0
     return {k: exps[k] / s for k in exps}
 
-
+# -------------------------
+# Indicators (same as v3)
+# -------------------------
 def compute_indicators(df: pd.DataFrame) -> Dict[str, float]:
     if df is None or df.empty:
         return {
@@ -100,19 +109,21 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, float]:
         "trend_strength": float(trend_strength),
     }
 
+# -------------------------
+# State probs + overlays
+# -------------------------
+def _state_probs_base(ctx: Dict[str, Any]) -> Dict[str, float]:
+    price = _safe_float(ctx.get("price"), 0.0)
+    sma25 = _safe_float(ctx.get("sma25"), price)
+    sma75 = _safe_float(ctx.get("sma75"), price)
+    rsi = _safe_float(ctx.get("rsi"), 50.0)
+    atr_ratio = _safe_float(ctx.get("atr_ratio"), 0.0)
+    trend_strength = _safe_float(ctx.get("trend_strength"), 0.0)
 
-def _state_probs(ctx: Dict[str, Any]) -> Dict[str, float]:
-    price = float(ctx.get("price") or 0.0)
-    sma25 = float(ctx.get("sma25") or price)
-    sma75 = float(ctx.get("sma75") or price)
-    rsi = float(ctx.get("rsi") or 50.0)
-    atr_ratio = float(ctx.get("atr_ratio") or 0.0)
-    trend_strength = float(ctx.get("trend_strength") or 0.0)
-
-    news = float(ctx.get("news_sentiment") or 0.0)
-    cpi = float(ctx.get("cpi_surprise") or 0.0)
-    nfp = float(ctx.get("nfp_surprise") or 0.0)
-    rate = float(ctx.get("rate_diff_change") or 0.0)
+    news = _safe_float(ctx.get("news_sentiment"), 0.0)
+    cpi = _safe_float(ctx.get("cpi_surprise"), 0.0)
+    nfp = _safe_float(ctx.get("nfp_surprise"), 0.0)
+    rate = _safe_float(ctx.get("rate_diff_change"), 0.0)
 
     up = 0.0
     down = 0.0
@@ -125,25 +136,63 @@ def _state_probs(ctx: Dict[str, Any]) -> Dict[str, float]:
 
     rng += -1.2 * trend_strength + 0.02 * (1.0 - abs(rsi - 50.0) / 50.0)
 
+    # baseline risk_off: volatility + macro shocks
     risk += 80.0 * atr_ratio + 0.8 * abs(rate) - 0.3 * news
     risk += 0.02 * (abs(cpi) + abs(nfp))
 
     return _softmax({"trend_up": up, "trend_down": down, "range": rng, "risk_off": risk})
 
+def _apply_overlays(state_probs: Dict[str, float], ctx: Dict[str, Any]) -> Tuple[Dict[str, float], Dict[str, Any]]:
+    """
+    Applies macro/geo stress overlays to state probabilities.
+    Returns (new_probs, overlay_meta)
+    """
+    p = dict(state_probs)
+    macro = _clamp(_safe_float(ctx.get("macro_risk_score"), 0.0), 0.0, 1.0)
+    global_risk = _clamp(_safe_float(ctx.get("global_risk_index"), 0.0), 0.0, 1.0)
+    war_prob = _clamp(_safe_float(ctx.get("war_probability"), 0.0), 0.0, 1.0)
+    fin_stress = _clamp(_safe_float(ctx.get("financial_stress"), 0.0), 0.0, 1.0)
 
-def _state_stats_ev_stub() -> Dict[str, Dict[str, float]]:
+    # Overlay strength: conservative. push more weight into risk_off when risk rises.
+    bump = 0.35 * global_risk + 0.20 * macro + 0.20 * war_prob + 0.15 * fin_stress
+    bump = _clamp(bump, 0.0, 0.65)
+
+    # Take from non-risk states proportionally
+    non = max(1e-9, p["trend_up"] + p["trend_down"] + p["range"])
+    take = bump
+    p["risk_off"] = _clamp(p["risk_off"] + bump, 0.0, 1.0)
+    p["trend_up"] = _clamp(p["trend_up"] * (1.0 - take), 0.0, 1.0)
+    p["trend_down"] = _clamp(p["trend_down"] * (1.0 - take), 0.0, 1.0)
+    p["range"] = _clamp(p["range"] * (1.0 - take), 0.0, 1.0)
+
+    # Normalize
+    s = sum(p.values()) or 1.0
+    p = {k: v / s for k, v in p.items()}
+
+    meta = {
+        "macro_risk_score": macro,
+        "global_risk_index": global_risk,
+        "war_probability": war_prob,
+        "financial_stress": fin_stress,
+        "risk_off_bump": bump,
+    }
+    return p, meta
+
+# -------------------------
+# EV model (still stub, but now modulated)
+# -------------------------
+def _state_stats_ev_base() -> Dict[str, Dict[str, float]]:
+    # These are priors; you can later replace with empirical from backtests.
     return {
         "trend_up": {"mean_R": 0.08, "n": 120},
         "trend_down": {"mean_R": 0.08, "n": 120},
         "range": {"mean_R": 0.01, "n": 120},
-        "risk_off": {"mean_R": -0.10, "n": 60},
+        "risk_off": {"mean_R": -0.12, "n": 60},
     }
-
 
 def _shrink_mean_R(mean_R: float, n: float, n_ref: float = 30.0) -> float:
     w = _clamp(float(n) / float(n_ref), 0.0, 1.0)
     return float(mean_R) * w
-
 
 def _ev_from_probs(state_probs: Dict[str, float], state_stats: Dict[str, Dict[str, float]]) -> Tuple[float, Dict[str, float]]:
     contribs: Dict[str, float] = {}
@@ -158,7 +207,6 @@ def _ev_from_probs(state_probs: Dict[str, float], state_stats: Dict[str, Dict[st
         ev += c
     return float(ev), contribs
 
-
 def _pwin_from_probs(state_probs: Dict[str, float], state_stats: Dict[str, Dict[str, float]]) -> float:
     pwin = 0.5
     for st, p in state_probs.items():
@@ -166,12 +214,101 @@ def _pwin_from_probs(state_probs: Dict[str, float], state_stats: Dict[str, Dict[
         pwin += float(p) * _clamp(mean_R, -0.2, 0.2) / 2.0
     return float(_clamp(pwin, 0.05, 0.95))
 
+# -------------------------
+# Black Swan Guard + Capital Governor
+# -------------------------
+def evaluate_black_swan(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Returns dict: {flag: bool, level: 'green/yellow/red', reasons: [...], metrics: {...}}
+    Uses:
+      - atr_ratio
+      - vix
+      - global_risk_index / war_probability / financial_stress
+      - gdelt counts
+    """
+    atr_ratio = _safe_float(ctx.get("atr_ratio"), 0.0)
+    vix = _safe_float(ctx.get("vix"), float("nan"))
+    global_risk = _clamp(_safe_float(ctx.get("global_risk_index"), 0.0), 0.0, 1.0)
+    war = _clamp(_safe_float(ctx.get("war_probability"), 0.0), 0.0, 1.0)
+    fin = _clamp(_safe_float(ctx.get("financial_stress"), 0.0), 0.0, 1.0)
+    war_cnt = _safe_float(ctx.get("gdelt_war_count_1d"), 0.0)
+    fin_cnt = _safe_float(ctx.get("gdelt_finance_count_1d"), 0.0)
 
+    reasons: List[str] = []
+    level = "green"
+
+    # thresholds are conservative; adjust later
+    if atr_ratio > 0.02:  # daily ATR >2% of price (FX daily is often <1%)
+        reasons.append(f"ATR比が高い(atr_ratio={atr_ratio:.3f})")
+        level = "yellow"
+    if not math.isnan(vix) and vix >= 35:
+        reasons.append(f"VIX高水準(vix={vix:.1f})")
+        level = "yellow"
+    if global_risk >= 0.70:
+        reasons.append(f"GlobalRisk高(global_risk={global_risk:.2f})")
+        level = "red"
+    if war >= 0.75:
+        reasons.append(f"War確率高(war_prob={war:.2f})")
+        level = "red"
+    if fin >= 0.75:
+        reasons.append(f"FinancialStress高(fin_stress={fin:.2f})")
+        level = "red"
+    if war_cnt >= 200:
+        reasons.append(f"戦争関連ニュース急増(count={int(war_cnt)})")
+        level = "red"
+    if fin_cnt >= 250:
+        reasons.append(f"金融危機関連ニュース急増(count={int(fin_cnt)})")
+        level = "red"
+
+    flag = level == "red"
+    return {
+        "flag": flag,
+        "level": level,
+        "reasons": reasons,
+        "metrics": {
+            "atr_ratio": atr_ratio,
+            "vix": vix,
+            "global_risk_index": global_risk,
+            "war_probability": war,
+            "financial_stress": fin,
+            "gdelt_war_count_1d": war_cnt,
+            "gdelt_finance_count_1d": fin_cnt,
+        }
+    }
+
+def capital_governor(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Purely local risk governor using user-provided limits in ctx.
+    This does NOT look at broker positions; it gates new trades.
+    """
+    max_dd = _safe_float(ctx.get("max_drawdown_limit"), 0.15)
+    daily_stop = _safe_float(ctx.get("daily_loss_limit"), 0.03)
+    cur_dd = _safe_float(ctx.get("equity_drawdown"), 0.0)
+    cur_daily = _safe_float(ctx.get("daily_loss"), 0.0)
+    losing_streak = int(_safe_float(ctx.get("losing_streak"), 0))
+    max_streak = int(_safe_float(ctx.get("max_losing_streak"), 5))
+
+    enabled = True
+    reasons: List[str] = []
+    if cur_dd >= max_dd:
+        enabled = False
+        reasons.append(f"DD制限超過({cur_dd:.2%} >= {max_dd:.0%})")
+    if cur_daily >= daily_stop:
+        enabled = False
+        reasons.append(f"日次損失制限超過({cur_daily:.2%} >= {daily_stop:.0%})")
+    if losing_streak >= max_streak:
+        enabled = False
+        reasons.append(f"連敗停止({losing_streak} >= {max_streak})")
+    return {"enabled": enabled, "reasons": reasons, "limits": {"max_dd": max_dd, "daily_stop": daily_stop, "max_streak": max_streak}}
+
+# -------------------------
+# Order builder (same as v3, but uses dom state)
+# -------------------------
 def _build_order(ctx: Dict[str, Any], state_probs: Dict[str, float], expected_R_ev: float) -> Dict[str, Any]:
-    price = float(ctx.get("price") or 0.0)
-    atr = float(ctx.get("atr") or 0.0)
-    rh = float(ctx.get("recent_high20") or price)
-    rl = float(ctx.get("recent_low20") or price)
+    price = _safe_float(ctx.get("price"), 0.0)
+    atr = _safe_float(ctx.get("atr"), 0.0)
+    rh = _safe_float(ctx.get("recent_high20"), price)
+    rl = _safe_float(ctx.get("recent_low20"), price)
 
     dom = max(state_probs.items(), key=lambda kv: kv[1])[0]
 
@@ -183,14 +320,13 @@ def _build_order(ctx: Dict[str, Any], state_probs: Dict[str, float], expected_R_
         "entry": None,
         "stop_loss": None,
         "take_profit": None,
+        "dominant_state": dom,
     }
 
     if dom == "risk_off":
         return order
-
     if expected_R_ev <= 0:
         return order
-
     if atr <= 0:
         atr = max(price * 0.005, 0.0001)
 
@@ -237,49 +373,92 @@ def _build_order(ctx: Dict[str, Any], state_probs: Dict[str, float], expected_R_
     })
     return order
 
-
+# -------------------------
+# Public API: get_ai_order_strategy
+# -------------------------
 def get_ai_order_strategy(api_key: str, context_data: Dict[str, Any], **kwargs) -> Dict[str, Any]:
+    """
+    Backward-compatible output + new fields:
+      - overlay_meta
+      - dynamic_threshold
+      - black_swan
+      - governor
+      - veto_reasons
+    """
     ctx = dict(context_data or {})
-    min_expected_R = float(ctx.get("min_expected_R") or 0.07)
+    base_threshold = _safe_float(ctx.get("min_expected_R"), 0.07)
 
-    state_probs = _state_probs(ctx)
-    state_stats = _state_stats_ev_stub()
+    # base probs, then overlays
+    probs0 = _state_probs_base(ctx)
+    probs, overlay_meta = _apply_overlays(probs0, ctx)
 
-    news = float(ctx.get("news_sentiment") or 0.0)
-    rate = float(ctx.get("rate_diff_change") or 0.0)
+    # state stats + small nudges
+    state_stats = _state_stats_ev_base()
+    news = _safe_float(ctx.get("news_sentiment"), 0.0)
+    rate = _safe_float(ctx.get("rate_diff_change"), 0.0)
     state_stats["trend_up"]["mean_R"] += 0.02 * news
     state_stats["trend_down"]["mean_R"] += 0.02 * (-news)
     state_stats["risk_off"]["mean_R"] += -0.02 * abs(rate)
 
-    expected_R_ev, ev_contribs = _ev_from_probs(state_probs, state_stats)
-    p_win_ev = _pwin_from_probs(state_probs, state_stats)
+    expected_R_ev, ev_contribs = _ev_from_probs(probs, state_stats)
+    p_win_ev = _pwin_from_probs(probs, state_stats)
 
-    why = f"EVゲート: expected_R_ev={expected_R_ev:+.3f} < min_expected_R={min_expected_R:.2f}"
-    confidence = float(_clamp(abs(expected_R_ev) / max(min_expected_R, 1e-9), 0.0, 1.0))
+    # Dynamic threshold: raise threshold in risky regimes
+    macro = _clamp(_safe_float(ctx.get("macro_risk_score"), 0.0), 0.0, 1.0)
+    global_risk = _clamp(_safe_float(ctx.get("global_risk_index"), 0.0), 0.0, 1.0)
+    war = _clamp(_safe_float(ctx.get("war_probability"), 0.0), 0.0, 1.0)
+    fin = _clamp(_safe_float(ctx.get("financial_stress"), 0.0), 0.0, 1.0)
 
-    order = _build_order(ctx, state_probs, expected_R_ev)
+    dynamic_threshold = base_threshold * (1.0 + 0.8*macro + 1.0*global_risk + 0.6*war + 0.6*fin)
+    dynamic_threshold = float(_clamp(dynamic_threshold, base_threshold, 0.35))
 
-    if expected_R_ev >= min_expected_R and order.get("decision") == "TRADE":
-        why = f"EVゲート通過: expected_R_ev={expected_R_ev:+.3f} ≥ min_expected_R={min_expected_R:.2f}"
-        confidence = float(_clamp(expected_R_ev / max(min_expected_R, 1e-9), 0.0, 1.0))
-        decision = "TRADE"
-    else:
+    veto_reasons: List[str] = []
+
+    # Governor & Black Swan guard
+    gov = capital_governor(ctx)
+    if not gov["enabled"]:
+        veto_reasons.extend(gov["reasons"])
+
+    bs = evaluate_black_swan(ctx)
+    if bs["flag"]:
+        veto_reasons.append("BlackSwanGuard: " + (" / ".join(bs["reasons"]) if bs["reasons"] else "red"))
+
+    # Build order candidate
+    order = _build_order(ctx, probs, expected_R_ev)
+
+    # EV gate
+    if expected_R_ev < dynamic_threshold:
+        veto_reasons.append(f"EV不足: {expected_R_ev:+.3f} < 動的閾値 {dynamic_threshold:.3f}")
+
+    # Final decision
+    decision = "TRADE"
+    if veto_reasons or order.get("decision") != "TRADE":
         decision = "NO_TRADE"
 
+    confidence = float(_clamp(abs(expected_R_ev) / max(dynamic_threshold, 1e-9), 0.0, 1.0))
+
+    why = " / ".join(veto_reasons) if veto_reasons else f"EV通過: {expected_R_ev:+.3f} ≥ {dynamic_threshold:.3f}"
+
     out: Dict[str, Any] = {
-        "decision": decision if decision == "NO_TRADE" else order.get("decision", "TRADE"),
+        "decision": decision,
         "side": order.get("side"),
         "order_type": order.get("order_type"),
         "entry_type": order.get("entry_type"),
         "entry": order.get("entry"),
         "stop_loss": order.get("stop_loss"),
         "take_profit": order.get("take_profit"),
+        "dominant_state": order.get("dominant_state"),
         "confidence": confidence,
         "why": why,
-        "state_probs": state_probs,
+        "state_probs": probs,
         "expected_R_ev": float(expected_R_ev),
         "p_win_ev": float(p_win_ev),
         "ev_contribs": ev_contribs,
         "state_stats_ev": state_stats,
+        "overlay_meta": overlay_meta,
+        "dynamic_threshold": float(dynamic_threshold),
+        "black_swan": bs,
+        "governor": gov,
+        "veto_reasons": veto_reasons,
     }
     return out
