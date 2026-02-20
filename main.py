@@ -2,19 +2,28 @@
 from __future__ import annotations
 
 import os
-from typing import Dict, Any, Tuple
+import time
+from typing import Dict, Any, Tuple, Optional
 
 import streamlit as st
 import pandas as pd
+
 import yfinance as yf
 
 import logic
 
-# data_layer is optional; the app will run without it (features become 0)
+# data_layer is optional; app will run without it (features become 0)
 try:
     import data_layer  # type: ignore
 except Exception:
     data_layer = None  # type: ignore
+
+# yfinance rate limit exception (version-dependent)
+try:
+    from yfinance.exceptions import YFRateLimitError  # type: ignore
+except Exception:
+    class YFRateLimitError(Exception):
+        pass
 
 
 # -------------------------
@@ -44,18 +53,127 @@ def _pair_label_to_symbol(pair_label: str) -> str:
     }
     return fallback.get(pl, "JPY=X")
 
-@st.cache_data(ttl=60 * 30)
-def _fetch_price_history(symbol: str, period: str, interval: str) -> pd.DataFrame:
-    df = yf.Ticker(symbol).history(period=period, interval=interval)
+def _pair_label_to_stooq_symbol(pair_label: str) -> Optional[str]:
+    """
+    Stooq symbols (common):
+      usdjpy, eurusd, gbpusd, audusd, eurjpy, gbpjpy, audjpy
+    Endpoint:
+      https://stooq.com/q/d/l/?s=usdjpy&i=d
+    """
+    pl = _normalize_pair_label(pair_label)
+    mapping = {
+        "USD/JPY": "usdjpy",
+        "EUR/USD": "eurusd",
+        "GBP/USD": "gbpusd",
+        "AUD/USD": "audusd",
+        "EUR/JPY": "eurjpy",
+        "GBP/JPY": "gbpjpy",
+        "AUD/JPY": "audjpy",
+    }
+    return mapping.get(pl)
+
+def _load_secret(name: str, default: str = "") -> str:
+    try:
+        return str(st.secrets.get(name, default) or default)
+    except Exception:
+        return os.getenv(name, default) or default
+
+
+# -------------------------
+# Price data fetch (robust)
+# -------------------------
+
+def _coerce_ohlc(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0] for c in df.columns]
-    return df
+    d = df.copy()
+    if isinstance(d.columns, pd.MultiIndex):
+        d.columns = [c[0] for c in d.columns]
+    # Ensure OHLC exists
+    needed = ["Open", "High", "Low", "Close"]
+    for c in needed:
+        if c not in d.columns:
+            return pd.DataFrame()
+    d = d[needed].dropna()
+    return d
 
+def _fetch_from_stooq(pair_label: str, interval: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    Stooq is mainly good for daily data. If interval != 1d, we still return daily to keep app alive.
+    """
+    meta = {"source": "stooq", "ok": False, "error": None, "interval_used": "1d"}
+    stq = _pair_label_to_stooq_symbol(pair_label)
+    if not stq:
+        meta["error"] = "unsupported_pair_for_stooq"
+        return pd.DataFrame(), meta
+
+    # Stooq daily CSV
+    url = f"https://stooq.com/q/d/l/?s={stq}&i=d"
+    try:
+        d = pd.read_csv(url)
+        # columns: Date, Open, High, Low, Close, Volume
+        if "Date" not in d.columns:
+            meta["error"] = "bad_csv"
+            return pd.DataFrame(), meta
+        d["Date"] = pd.to_datetime(d["Date"])
+        d = d.set_index("Date").sort_index()
+        d = _coerce_ohlc(d)
+        if d.empty:
+            meta["error"] = "empty_after_parse"
+            return pd.DataFrame(), meta
+        meta["ok"] = True
+        # interval downgrade notice (handled in UI)
+        if interval != "1d":
+            meta["interval_used"] = "1d"
+        return d, meta
+    except Exception as e:
+        meta["error"] = f"{type(e).__name__}:{e}"
+        return pd.DataFrame(), meta
+
+@st.cache_data(ttl=60 * 60)  # 1 hour cache to reduce rate limit
+def _fetch_price_history_robust(pair_label: str, symbol: str, period: str, interval: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    Tries yfinance first. If rate-limited or fails, falls back to Stooq (daily).
+    Returns (df, meta).
+    """
+    meta: Dict[str, Any] = {"source": "yfinance", "ok": False, "error": None, "fallback": None, "interval_used": interval}
+
+    # yfinance attempt with limited retries (don’t hammer)
+    last_err = None
+    for attempt in range(2):
+        try:
+            df = yf.Ticker(symbol).history(period=period, interval=interval)
+            df = _coerce_ohlc(df)
+            if df.empty:
+                last_err = "empty_df"
+                raise RuntimeError("empty_df")
+            meta["ok"] = True
+            return df, meta
+        except YFRateLimitError:
+            last_err = "YFRateLimitError"
+            break
+        except Exception as e:
+            last_err = f"{type(e).__name__}:{e}"
+            time.sleep(0.6 * (attempt + 1))
+
+    meta["error"] = last_err
+    # fallback to Stooq (daily)
+    df2, m2 = _fetch_from_stooq(pair_label, interval=interval)
+    meta["fallback"] = m2
+    if not df2.empty and m2.get("ok"):
+        meta["source"] = "stooq"
+        meta["ok"] = True
+        meta["interval_used"] = m2.get("interval_used", "1d")
+        return df2, meta
+
+    return pd.DataFrame(), meta
+
+
+# -------------------------
+# External features
+# -------------------------
 @st.cache_data(ttl=60 * 30)
 def _fetch_external(pair_label: str, keys: Dict[str, str]) -> Tuple[Dict[str, float], Dict[str, Any]]:
-    # Hard guard: never crash even if module is missing / wrong
     if data_layer is None:
         return {
             "news_sentiment": 0.0,
@@ -92,12 +210,6 @@ def _fetch_external(pair_label: str, keys: Dict[str, str]) -> Tuple[Dict[str, fl
             "data_layer_file": getattr(data_layer, "__file__", "unknown"),
         }
 
-def _load_secret(name: str, default: str = "") -> str:
-    try:
-        return str(st.secrets.get(name, default) or default)
-    except Exception:
-        return os.getenv(name, default) or default
-
 
 # -------------------------
 # UI
@@ -112,7 +224,7 @@ with st.sidebar:
     pair_label = _normalize_pair_label(pair_label)
     symbol = _pair_label_to_symbol(pair_label)
 
-    st.caption(f"yfinance symbol: `{symbol}`")
+    st.caption(f"primary source: yfinance `{symbol}` (fallback: stooq daily)")
 
     st.markdown("### 🔑 APIキー（任意：無くても落ちない）")
     gemini_key = st.text_input("GEMINI_API_KEY（HYBRID/LLM_ONLYで使用）", value=_load_secret("GEMINI_API_KEY", ""), type="password")
@@ -142,81 +254,96 @@ with st.sidebar:
     period = st.selectbox("期間", ["1y", "2y", "5y", "10y"], index=3)
     interval = st.selectbox("間隔", ["1d", "1h"], index=0)
 
+    # manual refresh (clears cache for price/external)
+    if st.button("🔄 データ再取得（キャッシュクリア）"):
+        st.cache_data.clear()
+        st.toast("キャッシュをクリアしました。再読み込みします。")
+        st.rerun()
+
 v1_keys = {"TRADING_ECONOMICS_KEY": (te_key or "").strip(), "FRED_API_KEY": (fred_key or "").strip()}
 
 tabs = st.tabs(["📌 注文戦略（Ver1）", "🧪 EVバックテスト（簡易WFA）", "ℹ️ 使い方・運用"])
 
 with tabs[0]:
-    df = _fetch_price_history(symbol, period=period, interval=interval)
+    df, price_meta = _fetch_price_history_robust(pair_label, symbol, period=period, interval=interval)
+
     if df.empty:
-        st.error("価格データが取得できませんでした（yfinance）")
-    else:
-        st.subheader(f"{pair_label} / {symbol}")
-        st.line_chart(df["Close"])
+        st.error("価格データが取得できませんでした（yfinanceが制限/失敗、stooqも失敗）")
+        st.json(price_meta)
+        st.stop()
 
-        ctx: Dict[str, Any] = {}
-        latest = df.dropna().iloc[-1]
-        ctx["pair_label"] = pair_label
-        ctx["pair_symbol"] = symbol
-        ctx["price"] = float(latest["Close"])
+    st.subheader(f"{pair_label} / {symbol}")
+    st.caption(f"Price source: {price_meta.get('source')} / interval_used: {price_meta.get('interval_used')}")
+    if price_meta.get("source") == "stooq" and interval != "1d":
+        st.warning("yfinanceが制限中のため、日足（stooq）に降格して表示しています。")
 
-        ind = logic.compute_indicators(df)
-        ctx.update(ind)
+    st.line_chart(df["Close"])
 
-        feats, meta = _fetch_external(pair_label, keys=v1_keys)
-        ctx.update(feats)
-        ctx["external_meta"] = meta
+    ctx: Dict[str, Any] = {}
+    latest = df.dropna().iloc[-1]
+    ctx["pair_label"] = pair_label
+    ctx["pair_symbol"] = symbol
+    ctx["price"] = float(latest["Close"])
 
-        ctx["decision_engine"] = decision_engine
-        ctx["min_expected_R"] = float(min_expected_R)
-        ctx["horizon_days"] = int(horizon_days)
-        ctx["keys"] = v1_keys
+    ind = logic.compute_indicators(df)
+    ctx.update(ind)
 
-        plan = logic.get_ai_order_strategy(
-            api_key=gemini_key,
-            context_data=ctx,
-            generation_policy="AUTO_HIERARCHY",
-            override_mode="AUTO",
-            override_reason="",
-        )
+    feats, meta = _fetch_external(pair_label, keys=v1_keys)
+    ctx.update(feats)
+    ctx["external_meta"] = meta
 
-        c1, c2 = st.columns([1, 1])
-        with c1:
-            st.markdown("### ✅ 出力（注文戦略）")
-            if isinstance(plan, dict):
-                st.json({
-                    "decision": plan.get("decision"),
-                    "side": plan.get("side"),
-                    "entry": plan.get("entry"),
-                    "take_profit": plan.get("take_profit"),
-                    "stop_loss": plan.get("stop_loss"),
-                    "confidence": plan.get("confidence"),
-                    "why": plan.get("why"),
-                })
-            else:
-                st.write(plan)
+    ctx["decision_engine"] = decision_engine
+    ctx["min_expected_R"] = float(min_expected_R)
+    ctx["horizon_days"] = int(horizon_days)
+    ctx["keys"] = v1_keys
 
-        with c2:
-            st.markdown("### 📊 状態確率 / EV")
-            if isinstance(plan, dict):
-                st.write("**state_probs**")
-                st.json(plan.get("state_probs", {}))
-                st.write("**EV**")
-                st.json({
-                    "expected_R_ev": plan.get("expected_R_ev"),
-                    "p_win_ev": plan.get("p_win_ev"),
-                })
+    plan = logic.get_ai_order_strategy(
+        api_key=gemini_key,
+        context_data=ctx,
+        generation_policy="AUTO_HIERARCHY",
+        override_mode="AUTO",
+        override_reason="",
+    )
 
-        st.markdown("### 🌐 外部特徴量（Ver1）")
-        st.json(feats)
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        st.markdown("### ✅ 出力（注文戦略）")
+        if isinstance(plan, dict):
+            st.json({
+                "decision": plan.get("decision"),
+                "side": plan.get("side"),
+                "entry": plan.get("entry"),
+                "take_profit": plan.get("take_profit"),
+                "stop_loss": plan.get("stop_loss"),
+                "confidence": plan.get("confidence"),
+                "why": plan.get("why"),
+            })
+        else:
+            st.write(plan)
 
-        if show_meta:
-            st.markdown("### 🧾 外部データ取得メタ")
-            st.json(meta)
+    with c2:
+        st.markdown("### 📊 状態確率 / EV")
+        if isinstance(plan, dict):
+            st.write("**state_probs**")
+            st.json(plan.get("state_probs", {}))
+            st.write("**EV**")
+            st.json({
+                "expected_R_ev": plan.get("expected_R_ev"),
+                "p_win_ev": plan.get("p_win_ev"),
+            })
 
-        if show_debug:
-            st.markdown("### 🛠️ ctx（内部）")
-            st.json({k: v for k, v in ctx.items() if k not in ("keys",)})
+    st.markdown("### 🌐 外部特徴量（Ver1）")
+    st.json(feats)
+
+    if show_meta:
+        st.markdown("### 🧾 外部データ取得メタ")
+        st.json(meta)
+        st.markdown("### 🧾 価格データ取得メタ")
+        st.json(price_meta)
+
+    if show_debug:
+        st.markdown("### 🛠️ ctx（内部）")
+        st.json({k: v for k, v in ctx.items() if k not in ("keys",)})
 
 with tabs[1]:
     st.subheader("簡易ウォークフォワード（EVゲート）")
@@ -256,50 +383,29 @@ with tabs[1]:
 
 with tabs[2]:
     st.markdown("""
-## 追加機能（Ver1で“全部入れ”した内容）
+## 追加機能（Ver1の“全部入り”）
 
-### 1) 外部データ取得層（0フォールバック＋キャッシュ）
-- **ニュース（GDELT）**：APIキー不要。直近数日分のトーン（tone）を -1〜+1 に正規化し `news_sentiment` として利用。
-- **経済指標（TradingEconomics）**：CPI/NFPの **Actual - Forecast** を「サプライズ指標」として `cpi_surprise / nfp_surprise` に格納。
-- **金利差（FRED）**：米10年(DGS10)と日本10年(IRLTLT01JPM156N)のスプレッド変化を `rate_diff_change` に格納。
-- **COT（CFTC）**：FinFutWk.txt からレバレッジ勢/アセット勢のネットポジションを `cot_*_net_pctoi` として格納（-1〜+1）。
+### A) 価格データ取得の堅牢化（今回の修正ポイント）
+- まず yfinance を試す
+- **RateLimit（YFRateLimitError）なら自動で Stooq（日足）にフォールバック**
+- どっちもダメなら、メタ情報（原因）を表示して停止
+- キャッシュTTLを長く（1時間）して、Streamlit Cloudでの連打を回避
+- 「データ再取得（キャッシュクリア）」ボタンで手動更新
 
-> キーが無い・APIが落ちる・制限に当たる → **0** が入るだけで、アプリは落ちません。  
-> 取得状況は「外部データ取得メタ表示」で確認できます。
+### B) 外部データ取得（ニュース/経済指標/金利差/COT）
+- data_layer.py が提供する features を ctx に合流
+- 失敗時は 0 フォールバック（落ちない）
+- 「外部データ取得メタ表示」で取得状況を確認
 
-### 2) 状態確率推定（Softmax）
-以下の4状態の確率を返します：
-- P(trend_up), P(trend_down), P(range), P(risk_off)
-
-価格指標（SMA/RSI/ATR）＋外部特徴量（ニュース/指標/金利差/COT）を使い、ロジット→Softmaxで確率化します。
-
-### 3) EV（期待値）ゲート
-- 状態別の期待R（mean_R）を過去データから推定し、
-- **EV = Σ(P(state) × mean_R(state))**
-- EVが `min_expected_R` 未満なら **NO_TRADE** で見送り（機会損失より“無駄撃ち抑制”を優先）
-
-### 4) 意思決定（STOP/LIMIT/MARKETの自動選択）
-支配的状態により発注方式を決めます（Ver1の簡易版）：
-- trend_up / trend_down → STOP（ブレイク想定）
-- range → LIMIT（端での逆張り想定）
-- risk_off → 原則 NO_TRADE（急変動回避）
-
-### 5) エンジン切替（運用モード）
-- **EV_V1**：数値のみ（再現性最優先）。まずここで“落ちない＆筋が通る”を確認。
-- **HYBRID**：EVゲートで「撃つ/撃たない」を決め、撃つ時だけ LLMに“説明文だけ”生成（注文値は数値ロジック優先）。
-- **LLM_ONLY**：従来型（おすすめしません：事故りやすい）。
+### C) EVゲート（期待値最大化の核）
+- 状態確率（4状態）→ 状態別期待R → EV を計算
+- EVが閾値未満なら NO_TRADE（無駄撃ちを抑制）
 
 ---
 
-## 運用手順（最短）
-1. **EV_V1** で起動 → 外部特徴量が 0 以外になるか確認（キー無しなら一部は0でOK）
-2. `min_expected_R` を 0.10〜0.20 から開始（無駄撃ち抑制）
-3. 「🧪 EVバックテスト」で **AvgR（平均R）/ MaxDD(R)** を確認し、閾値と horizon を調整
-4. HYBRIDに切替（必要なら）→ LLMは“説明”に限定して暴走を防ぐ
-
----
-
-## 重要な注意
-- このVer1は「期待値最大化」の土台です。**利益保証はできません**。
-- 実運用には Ver2 で、スプレッド/スリッページ/指値到達率/ロールなどの約定モデルが必須です。
+## 運用方法（Streamlit Cloudで安定させるコツ）
+1. **intervalは基本 1d**
+   - 1h は yfinance 依存が強いので RateLimitの時に落ちやすい。
+2. 「データ再取得」ボタンは多用しない（キャッシュが効かなくなる）
+3. どうしても1hが必要なら、Ver2で **TwelveData / AlphaVantage / Polygon** 等のAPIに切替（キー必須）
 """)
