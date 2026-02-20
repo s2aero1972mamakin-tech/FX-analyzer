@@ -27,6 +27,52 @@ LAST_FETCH_ERROR = ""
 
 
 # -----------------------------
+# 外部フィルタ（リスクオン/オフ）: VIX / DXY / US10Y をスナップショット取得
+# 失敗しても止めない（Noneで返す）
+# -----------------------------
+def _fetch_external_snapshot(period: str = "7d"):
+    snap = {"vix": None, "dxy": None, "us10y": None, "why": []}
+    try:
+        df = yf.Ticker("^VIX").history(period=period)
+        if df is not None and not df.empty:
+            snap["vix"] = float(df["Close"].iloc[-1])
+    except Exception as e:
+        snap["why"].append(f"vix_fail:{type(e).__name__}")
+    try:
+        df = yf.Ticker("DX-Y.NYB").history(period=period)
+        if df is not None and not df.empty:
+            snap["dxy"] = float(df["Close"].iloc[-1])
+    except Exception as e:
+        snap["why"].append(f"dxy_fail:{type(e).__name__}")
+    try:
+        df = yf.Ticker("^TNX").history(period=period)
+        if df is not None and not df.empty:
+            snap["us10y"] = float(df["Close"].iloc[-1])
+    except Exception as e:
+        snap["why"].append(f"us10y_fail:{type(e).__name__}")
+    return snap
+
+def _compute_risk_regime(ext: dict):
+    # very simple, deterministic regime label for filters
+    vix = ext.get("vix")
+    dxy = ext.get("dxy")
+    us10y = ext.get("us10y")
+    notes=[]
+    regime="NEUTRAL"
+    try:
+        if vix is not None and vix >= 20.0:
+            regime="RISK_OFF"
+            notes.append("vix>=20")
+        if us10y is not None and us10y >= 4.5:
+            notes.append("us10y_high")
+        if dxy is not None and dxy >= 105.0:
+            notes.append("dxy_strong")
+    except Exception:
+        pass
+    return regime, notes
+
+
+# -----------------------------
 # AI予想レンジ 自動取得キャッシュ（意思決定に必須で連携）
 # -----------------------------
 AI_RANGE_TTL_SEC = 60 * 60 * 72  # 72時間（週2回運用なら十分）
@@ -3284,8 +3330,63 @@ def get_daily_order_strategy(api_key: str, context_data: dict, max_risk_pct: flo
     }
 
     if state == "RANGE":
-        out["why"] = "日足の状態がTREND_UP/TREND_DOWN条件を満たさないため見送り（毎日監視・状態遷移ルール）。"
-        out["notes"] = why_state
+        # RANGEでも「取りに行く」: レンジ上限/下限の近さで逆張りLIMIT案を生成（構造SL）
+        ext = _fetch_external_snapshot()
+        regime, regime_notes = _compute_risk_regime(ext)
+        out["notes"] = (why_state or []) + [f"regime:{regime}"] + regime_notes
+
+        # 直近20本のレンジ
+        try:
+            rh = float(df["High"].tail(20).max())
+            rl = float(df["Low"].tail(20).min())
+        except Exception:
+            rh, rl = None, None
+
+        if rh is None or rl is None or rh <= rl:
+            out["why"] = "RANGE判定だがレンジ幅の算出に失敗したため見送り。"
+            return out
+
+        mid = (rh + rl) / 2.0
+        dist_to_high = abs(rh - price)
+        dist_to_low = abs(price - rl)
+
+        # レンジ逆張り：端に近い方を採用（近くなければブレイク待ちSTOP案）
+        edge_thresh = max(0.10, (rh - rl) * 0.25)  # 端から25%以内なら逆張り
+        if dist_to_low <= edge_thresh:
+            out["decision"] = "TRADE"
+            out["side"] = "BUY"
+            out["entry_type"] = "LIMIT"
+            out["order_bundle"] = "IFD_OCO"
+            out["entry"] = round(max(rl + 0.02, price - 0.05), 3)
+            out["stop_loss"] = round(min(rl - 0.08, (rl - (rh - rl) * 0.10)), 3)
+            # TPはミドル〜上限手前
+            out["take_profit"] = round(min(mid, rh - 0.10), 3)
+            out["confidence"] = 0.45 if regime != "RISK_OFF" else 0.35
+            out["why"] = "RANGE: 下限付近のため、レンジ逆張りBUY(LIMIT)を提示。"
+            return out
+
+        if dist_to_high <= edge_thresh:
+            out["decision"] = "TRADE"
+            out["side"] = "SELL"
+            out["entry_type"] = "LIMIT"
+            out["order_bundle"] = "IFD_OCO"
+            out["entry"] = round(min(rh - 0.02, price + 0.05), 3)
+            out["stop_loss"] = round(max(rh + 0.08, (rh + (rh - rl) * 0.10)), 3)
+            out["take_profit"] = round(max(mid, rl + 0.10), 3)
+            out["confidence"] = 0.45 if regime != "RISK_OFF" else 0.35
+            out["why"] = "RANGE: 上限付近のため、レンジ逆張りSELL(LIMIT)を提示。"
+            return out
+
+        # 端に近くない -> ブレイク待ち（未約定リスク0）
+        out["decision"] = "WATCH"
+        out["side"] = "BOTH"
+        out["entry_type"] = "STOP"
+        out["order_bundle"] = "OCO_PAIR"
+        out["entry"] = round(rh + 0.03, 3)
+        out["stop_loss"] = round(rl - 0.03, 3)
+        out["take_profit"] = 0
+        out["confidence"] = 0.30
+        out["why"] = "RANGE: 中央付近のため、レンジ抜け待ち（上抜け/下抜け）を推奨。"
         return out
 
     # determine structure levels
@@ -3387,3 +3488,456 @@ def get_daily_order_strategy(api_key: str, context_data: dict, max_risk_pct: flo
         pass
 
     return out
+
+
+
+# ============================================================
+# ✅ Ver1追加（全て追加機能）: 外部データ取得層 + 状態確率(Softmax) + EVゲート/EV専用プラン
+# - 既存機能は削除しない（後方互換）
+# - decision_engine in ctx: "HYBRID" / "EV_V1" / "LLM_ONLY"
+# - keys in ctx: {"TRADING_ECONOMICS_KEY": "...", "FRED_API_KEY": "..."}
+# ============================================================
+
+# 外部データ層（無くても落ちない）
+try:
+    import data_layer  # type: ignore
+except Exception:
+    data_layer = None
+
+import os as _os
+import time as _time
+import math as _math
+import json as _json
+
+def ensure_external_features(ctx: dict):
+    """ctxに外部特徴量を注入。キー無しでも落とさない（0フォールバック）。"""
+    if not isinstance(ctx, dict):
+        return {}, {"ok": False, "error": "ctx_not_dict"}
+
+    if ctx.get("external_features") is not None and ctx.get("external_meta") is not None:
+        return ctx.get("external_features") or {}, ctx.get("external_meta") or {}
+
+    pair_label = ctx.get("pair_label") or ctx.get("pair") or "USD/JPY (ドル円)"
+    keys = ctx.get("keys") or {}
+    if not isinstance(keys, dict):
+        keys = {}
+
+    # env fallback
+    for k in ("TRADING_ECONOMICS_KEY", "FRED_API_KEY"):
+        if not keys.get(k) and _os.getenv(k):
+            keys[k] = _os.getenv(k)
+
+    if data_layer is None:
+        feats = {
+            "news_sentiment": 0.0,
+            "cpi_surprise": 0.0,
+            "nfp_surprise": 0.0,
+            "rate_diff_change": 0.0,
+            "cot_leveraged_net_pctoi": 0.0,
+            "cot_asset_net_pctoi": 0.0,
+        }
+        meta = {"ok": False, "error": "data_layer_import_failed"}
+        ctx["external_features"] = feats
+        ctx["external_meta"] = meta
+        for k, v in feats.items():
+            ctx.setdefault(k, v)
+        return feats, meta
+
+    feats, meta = data_layer.fetch_external_features(str(pair_label), keys=keys)
+    ctx["external_features"] = feats
+    ctx["external_meta"] = meta
+    for k, v in (feats or {}).items():
+        ctx.setdefault(k, v)
+    return feats, meta
+
+
+def _ev1_softmax(logits: dict) -> dict:
+    mx = max(logits.values())
+    exps = {k: _math.exp(v - mx) for k, v in logits.items()}
+    s = sum(exps.values()) or 1.0
+    return {k: exps[k] / s for k in exps}
+
+_EV1_STATES = ("trend_up", "trend_down", "range", "risk_off")
+
+def ev1_state_probs(ctx: dict) -> dict:
+    """Ver1: 状態確率 P(trend_up/down/range/risk_off) を返す（Softmax）。"""
+    price = _safe_float(ctx.get("price"), default=0.0) or 0.0
+    atr = _safe_float(ctx.get("atr"), default=0.0) or 0.0
+    atr = max(atr, 1e-9)
+    rsi = _safe_float(ctx.get("rsi"), default=50.0) or 50.0
+
+    sma25 = _safe_float(ctx.get("sma25") or ctx.get("SMA_25"), default=price) or price
+    sma75 = _safe_float(ctx.get("sma75") or ctx.get("SMA_75"), default=price) or price
+
+    # 外部特徴量（無くても0）
+    news = _safe_float(ctx.get("news_sentiment"), default=0.0) or 0.0      # [-1,1]
+    cpi = _safe_float(ctx.get("cpi_surprise"), default=0.0) or 0.0         # [-10,10]
+    nfp = _safe_float(ctx.get("nfp_surprise"), default=0.0) or 0.0         # [-10,10]
+    spread = _safe_float(ctx.get("rate_diff_change"), default=0.0) or 0.0  # [-2,2]
+    cot_lev = _safe_float(ctx.get("cot_leveraged_net_pctoi"), default=0.0) or 0.0
+    cot_ast = _safe_float(ctx.get("cot_asset_net_pctoi"), default=0.0) or 0.0
+
+    eps = 1e-9
+    slope = (sma25 - sma75) / max(price, eps)
+    trend_strength = abs(sma25 - sma75) / max(atr, eps)
+    atr_ratio = atr / max(price, eps)
+
+    macro = _clamp((cpi + nfp) / 10.0, -2.0, 2.0) + _clamp(spread, -2.0, 2.0)
+
+    risk_off = 0.0
+    risk_off += 0.40 * _clamp((atr_ratio - 0.010) * 80.0, -2.0, 2.0)
+    risk_off += 0.35 * _clamp((-news) * 2.0, -2.0, 2.0)
+    risk_off += 0.15 * _clamp((-cot_lev) * 2.0, -2.0, 2.0)
+    risk_off += 0.10 * _clamp((-cot_ast) * 2.0, -2.0, 2.0)
+
+    range_bias = _clamp((1.3 - trend_strength), -2.0, 2.0) + _clamp((0.010 - atr_ratio) * 50.0, -2.0, 2.0)
+
+    logits = {
+        "trend_up":   1.70 * slope + 0.22 * ((rsi - 50.0) / 10.0) + 0.18 * trend_strength + 0.18 * macro + 0.15 * news - 0.55 * risk_off,
+        "trend_down": -1.70 * slope + 0.22 * ((50.0 - rsi) / 10.0) + 0.18 * trend_strength - 0.18 * macro - 0.15 * news + 0.55 * risk_off,
+        "range":      0.85 * range_bias - 0.40 * trend_strength - 0.15 * abs(macro),
+        "risk_off":   0.95 * risk_off + 0.10 * abs(macro),
+    }
+    p = _ev1_softmax(logits)
+    # 数値安定
+    for k in _EV1_STATES:
+        p.setdefault(k, 0.0)
+    s = sum(p.values()) or 1.0
+    p = {k: float(p[k] / s) for k in p}
+    return p
+
+
+# ---- state stats cache (expected_R per state) ----
+_EV1_STATS_MEM = {}  # key -> (expire_ts, stats)
+
+def _ev1_stats_key(pair_symbol: str, horizon_days: int) -> str:
+    return f"{pair_symbol}::h{int(horizon_days)}"
+
+def _ev1_load_stats(pair_symbol: str, horizon_days: int):
+    try:
+        _os.makedirs("cache", exist_ok=True)
+        p = _os.path.join("cache", f"ev1_state_stats_{pair_symbol.replace('=','_').replace('^','_')}_h{int(horizon_days)}.json")
+        if not _os.path.exists(p):
+            return None
+        with open(p, "r", encoding="utf-8") as f:
+            return _json.load(f)
+    except Exception:
+        return None
+
+def _ev1_save_stats(pair_symbol: str, horizon_days: int, stats: dict):
+    try:
+        _os.makedirs("cache", exist_ok=True)
+        p = _os.path.join("cache", f"ev1_state_stats_{pair_symbol.replace('=','_').replace('^','_')}_h{int(horizon_days)}.json")
+        with open(p, "w", encoding="utf-8") as f:
+            _json.dump(stats, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def _ev1_compute_stats(pair_symbol: str, horizon_days: int, period: str = "10y") -> dict:
+    """状態別 mean_R / p_win を過去データから推定（簡易）。"""
+    try:
+        df = yf.Ticker(pair_symbol).history(period=period, interval="1d")
+        if df is None or df.empty:
+            return {st: {"mean_R": 0.0, "p_win": 0.0, "n": 0} for st in _EV1_STATES}
+        d = df.copy()
+        d = d[["Open", "High", "Low", "Close"]].dropna()
+        d["SMA_25"] = d["Close"].rolling(25).mean()
+        d["SMA_75"] = d["Close"].rolling(75).mean()
+        delta = d["Close"].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+        d["RSI"] = 100 - (100 / (1 + (gain / loss)))
+        hl = d["High"] - d["Low"]
+        hc = (d["High"] - d["Close"].shift()).abs()
+        lc = (d["Low"] - d["Close"].shift()).abs()
+        d["ATR"] = pd.concat([hl, hc, lc], axis=1).max(axis=1).rolling(14).mean()
+        d = d.dropna()
+
+        d["fwd_ret"] = d["Close"].shift(-horizon_days) / d["Close"] - 1.0
+        d["R"] = d["fwd_ret"] / (d["ATR"] / d["Close"]).replace(0, float("nan"))
+        d = d.dropna(subset=["R"])
+
+        states = []
+        for _, row in d.iterrows():
+            ctx = {
+                "price": float(row["Close"]),
+                "atr": float(row["ATR"]),
+                "rsi": float(row["RSI"]),
+                "sma25": float(row["SMA_25"]),
+                "sma75": float(row["SMA_75"]),
+                # 外部は入れない（過去外部データ取得は重いのでVer1では省略）
+            }
+            pr = ev1_state_probs(ctx)
+            states.append(max(pr, key=pr.get))
+        d["state"] = states
+
+        out = {}
+        for st in _EV1_STATES:
+            sub = d[d["state"] == st]
+            if sub.empty:
+                out[st] = {"mean_R": 0.0, "p_win": 0.0, "n": 0}
+            else:
+                out[st] = {
+                    "mean_R": float(sub["R"].mean()),
+                    "p_win": float((sub["R"] > 0).mean()),
+                    "n": int(len(sub)),
+                }
+        return out
+    except Exception:
+        return {st: {"mean_R": 0.0, "p_win": 0.0, "n": 0} for st in _EV1_STATES}
+
+def ev1_ensure_state_stats(pair_symbol: str, horizon_days: int, ttl_sec: int = 72 * 3600) -> dict:
+    pair_symbol = str(pair_symbol or "JPY=X")
+    horizon_days = int(horizon_days or 5)
+    key = _ev1_stats_key(pair_symbol, horizon_days)
+    now = _time.time()
+
+    if key in _EV1_STATS_MEM:
+        exp, stats = _EV1_STATS_MEM[key]
+        if now <= exp:
+            return stats
+
+    stats = _ev1_load_stats(pair_symbol, horizon_days)
+    if isinstance(stats, dict) and stats:
+        _EV1_STATS_MEM[key] = (now + ttl_sec, stats)
+        return stats
+
+    stats = _ev1_compute_stats(pair_symbol, horizon_days, period="10y")
+    _EV1_STATS_MEM[key] = (now + ttl_sec, stats)
+    _ev1_save_stats(pair_symbol, horizon_days, stats)
+    return stats
+
+def ev1_compute_ev(probs: dict, stats: dict):
+    ev = 0.0
+    pwin = 0.0
+    for st, pr in (probs or {}).items():
+        s = stats.get(st, {}) if isinstance(stats, dict) else {}
+        ev += float(pr) * float(s.get("mean_R", 0.0))
+        pwin += float(pr) * float(s.get("p_win", 0.0))
+    return float(ev), float(pwin)
+
+def ev1_numeric_plan(ctx: dict, probs: dict, stats: dict, horizon: str = "WEEK") -> dict:
+    """EV_V1専用（AI無し）: 優勢状態に応じた数値プランを生成。"""
+    price = _safe_float(ctx.get("price"), default=0.0) or 0.0
+    atr = _safe_float(ctx.get("atr"), default=0.0) or 0.0
+    atr = max(atr, 1e-9)
+    dom = max(probs, key=probs.get) if probs else "range"
+    ev, pwin = ev1_compute_ev(probs, stats)
+
+    min_ev = _safe_float(ctx.get("min_expected_R"), default=0.10) or 0.10
+    if ev < min_ev:
+        return {
+            "decision": "NO_TRADE",
+            "side": "NONE",
+            "entry": 0,
+            "take_profit": 0,
+            "stop_loss": 0,
+            "horizon": horizon,
+            "confidence": float(max(probs.values()) if probs else 0.0),
+            "why": f"EV<{min_ev:.2f} のため見送り（expected_R={ev:.3f}）",
+            "notes": [f"dominant_state={dom}", f"expected_R_ev={ev:.3f}", f"p_win_ev={pwin:.3f}", "engine=EV_V1"],
+            "state_probs": probs,
+            "expected_R_ev": ev,
+            "p_win_ev": pwin,
+            "state_stats_ev": stats,
+            "external_meta": ctx.get("external_meta", {}),
+        }
+
+    # 簡易: ATRベース
+    side = "NONE"
+    entry = price
+    tp = price
+    sl = price
+    order_type = "MARKET"
+
+    if dom == "trend_up":
+        side = "LONG"; order_type = "STOP"
+        entry = price + 0.20 * atr
+        sl = entry - 1.20 * atr
+        tp = entry + 2.00 * atr
+    elif dom == "trend_down":
+        side = "SHORT"; order_type = "STOP"
+        entry = price - 0.20 * atr
+        sl = entry + 1.20 * atr
+        tp = entry - 2.00 * atr
+    elif dom == "range":
+        side = "LONG" if (_safe_float(ctx.get("rsi"), default=50.0) or 50.0) < 50.0 else "SHORT"
+        order_type = "LIMIT"
+        if side == "LONG":
+            entry = price - 0.15 * atr
+            sl = entry - 0.90 * atr
+            tp = entry + 1.20 * atr
+        else:
+            entry = price + 0.15 * atr
+            sl = entry + 0.90 * atr
+            tp = entry - 1.20 * atr
+    else:  # risk_off
+        return {
+            "decision": "NO_TRADE",
+            "side": "NONE",
+            "entry": 0, "take_profit": 0, "stop_loss": 0,
+            "horizon": horizon,
+            "confidence": float(max(probs.values()) if probs else 0.0),
+            "why": "risk_off優勢のため見送り（急変動局面を回避）",
+            "notes": [f"dominant_state={dom}", f"expected_R_ev={ev:.3f}", f"p_win_ev={pwin:.3f}", "engine=EV_V1"],
+            "state_probs": probs,
+            "expected_R_ev": ev,
+            "p_win_ev": pwin,
+            "state_stats_ev": stats,
+            "external_meta": ctx.get("external_meta", {}),
+        }
+
+    conf = float(max(probs.values()) if probs else 0.0)
+    conf = float(_clamp(conf * (1.0 + _clamp(ev, -1.0, 1.0) * 0.25), 0.0, 0.99))
+
+    return {
+        "decision": "TRADE",
+        "side": side,
+        "entry": float(entry),
+        "take_profit": float(tp),
+        "stop_loss": float(sl),
+        "horizon": horizon,
+        "confidence": conf,
+        "why": f"EV_V1 数値プラン: dominant={dom} / expected_R={ev:.3f} / p_win={pwin:.3f}",
+        "notes": [f"order_type={order_type}", f"dominant_state={dom}", "engine=EV_V1"],
+        "state_probs": probs,
+        "expected_R_ev": ev,
+        "p_win_ev": pwin,
+        "state_stats_ev": stats,
+        "external_meta": ctx.get("external_meta", {}),
+    }
+
+
+# ---- wrap existing order strategy (do not delete original) ----
+_EV1_BASE_GET_AI_ORDER_STRATEGY = get_ai_order_strategy
+
+def get_ai_order_strategy(
+    api_key: str,
+    context_data: dict,
+    override_mode: str = "AUTO",
+    override_reason: str = "",
+    pair_name: str = None,
+    portfolio_positions: list = None,
+    weekly_dd_cap_percent: float = 2.0,
+    risk_percent_per_trade: float = 2.0,
+    max_positions_per_currency: int = 1,
+    generation_policy: str = "AUTO_HIERARCHY",
+):
+    """
+    Ver1統合:
+      - HYBRID: EVゲートがNO_TRADEなら即見送り。EVが良ければ従来AIへ（結果にEV情報を付与）。
+      - EV_V1: AIを使わず数値プランを返す。
+      - LLM_ONLY: 従来通り。
+    """
+    ctx = context_data if isinstance(context_data, dict) else {}
+    ensure_external_features(ctx)
+
+    engine = str(ctx.get("decision_engine") or "HYBRID").upper()
+    horizon_days = int(ctx.get("horizon_days") or 5)
+    pair_symbol = str(ctx.get("pair_symbol") or ctx.get("ticker") or "JPY=X")
+
+    probs = ev1_state_probs(ctx)
+    stats = ev1_ensure_state_stats(pair_symbol, horizon_days)
+    ev, pwin = ev1_compute_ev(probs, stats)
+
+    # ctxへ情報を追記（既存UI/ログ用）
+    ctx["state_probs"] = probs
+    ctx["expected_R_ev"] = ev
+    ctx["p_win_ev"] = pwin
+    ctx["state_stats_ev"] = stats
+
+    if engine == "EV_V1":
+        return ev1_numeric_plan(ctx, probs, stats, horizon="WEEK")
+
+    # HYBRID: EVゲート
+    if engine == "HYBRID":
+        min_ev = _safe_float(ctx.get("min_expected_R"), default=0.10) or 0.10
+        if ev < min_ev:
+            return {
+                "decision": "NO_TRADE",
+                "side": "NONE",
+                "entry": 0, "take_profit": 0, "stop_loss": 0,
+                "horizon": "WEEK",
+                "confidence": float(max(probs.values()) if probs else 0.0),
+                "why": f"EVゲートにより見送り（expected_R_ev={ev:.3f} < {min_ev:.2f}）",
+                "notes": ["ev_gate_no_trade", f"expected_R_ev={ev:.3f}", f"p_win_ev={pwin:.3f}"],
+                "state_probs": probs,
+                "expected_R_ev": ev,
+                "p_win_ev": pwin,
+                "state_stats_ev": stats,
+                "external_meta": ctx.get("external_meta", {}),
+                "generator_path": "ev_gate",
+            }
+
+    # LLM_ONLY or HYBRID-pass: 既存AIへ
+    res = _EV1_BASE_GET_AI_ORDER_STRATEGY(
+        api_key=api_key,
+        context_data=ctx,
+        override_mode=override_mode,
+        override_reason=override_reason,
+        pair_name=pair_name,
+        portfolio_positions=portfolio_positions,
+        weekly_dd_cap_percent=weekly_dd_cap_percent,
+        risk_percent_per_trade=risk_percent_per_trade,
+        max_positions_per_currency=max_positions_per_currency,
+        generation_policy=generation_policy,
+    )
+    if isinstance(res, dict):
+        res.setdefault("state_probs", probs)
+        res.setdefault("expected_R_ev", ev)
+        res.setdefault("p_win_ev", pwin)
+        res.setdefault("state_stats_ev", stats)
+        res.setdefault("external_meta", ctx.get("external_meta", {}))
+    return res
+
+
+# ---- wrap daily strategy ----
+_EV1_BASE_GET_DAILY_ORDER_STRATEGY = get_daily_order_strategy
+
+def get_daily_order_strategy(api_key: str, context_data: dict, max_risk_pct: float = 8.0):
+    ctx = context_data if isinstance(context_data, dict) else {}
+    ensure_external_features(ctx)
+
+    engine = str(ctx.get("decision_engine") or "HYBRID").upper()
+    horizon_days = int(ctx.get("horizon_days") or 3)
+    pair_symbol = str(ctx.get("pair_symbol") or ctx.get("ticker") or "JPY=X")
+
+    probs = ev1_state_probs(ctx)
+    stats = ev1_ensure_state_stats(pair_symbol, horizon_days)
+    ev, pwin = ev1_compute_ev(probs, stats)
+
+    ctx["state_probs"] = probs
+    ctx["expected_R_ev"] = ev
+    ctx["p_win_ev"] = pwin
+    ctx["state_stats_ev"] = stats
+
+    if engine == "EV_V1":
+        return ev1_numeric_plan(ctx, probs, stats, horizon="DAY")
+
+    if engine == "HYBRID":
+        min_ev = _safe_float(ctx.get("min_expected_R"), default=0.10) or 0.10
+        if ev < min_ev:
+            return {
+                "decision": "NO_TRADE",
+                "side": "NONE",
+                "entry": 0, "take_profit": 0, "stop_loss": 0,
+                "horizon": "DAY",
+                "confidence": float(max(probs.values()) if probs else 0.0),
+                "why": f"EVゲートにより見送り（expected_R_ev={ev:.3f} < {min_ev:.2f}）",
+                "notes": ["ev_gate_no_trade", f"expected_R_ev={ev:.3f}", f"p_win_ev={pwin:.3f}"],
+                "state_probs": probs,
+                "expected_R_ev": ev,
+                "p_win_ev": pwin,
+                "state_stats_ev": stats,
+                "external_meta": ctx.get("external_meta", {}),
+                "generator_path": "ev_gate",
+            }
+
+    res = _EV1_BASE_GET_DAILY_ORDER_STRATEGY(api_key=api_key, context_data=ctx, max_risk_pct=max_risk_pct)
+    if isinstance(res, dict):
+        res.setdefault("state_probs", probs)
+        res.setdefault("expected_R_ev", ev)
+        res.setdefault("p_win_ev", pwin)
+        res.setdefault("state_stats_ev", stats)
+        res.setdefault("external_meta", ctx.get("external_meta", {}))
+    return res
