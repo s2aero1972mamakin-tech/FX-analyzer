@@ -579,30 +579,12 @@ except Exception:
     default_key = ""
 api_key = st.sidebar.text_input("Gemini API Key", value=default_key, type="password")
 
+
 # --- シャドー比較（Gemini vs GPT） ---
-try:
-    _default_openai_key = st.secrets.get("OPENAI_API_KEY", "")
-except Exception:
-    _default_openai_key = ""
-st.sidebar.markdown("---")
-st.sidebar.subheader("🧪 シャドー比較（Gemini vs GPT）")
-shadow_enabled = st.sidebar.checkbox(
-    "シャドー比較を有効化（ログ保存）",
-    value=False,
-    help="Geminiの実運用判断はそのまま。OpenAIを追加で呼んで比較し、ログ（logs/shadow_compare_YYYYMMDD.jsonl）へ保存します。"
-)
-openai_api_key_shadow = st.sidebar.text_input(
-    "OpenAI API Key (shadow)",
-    value=_default_openai_key,
-    type="password",
-    help="未入力ならシャドー比較は実行されません。"
-)
-openai_model_shadow = st.sidebar.selectbox(
-    "シャドーGPTモデル",
-    options=["gpt-5-mini", "gpt-4o-mini", "gpt-5", "gpt-4o", "gpt-4.1"],
-    index=0,
-    help="まずは gpt-5-mini 推奨（コスパ良）。"
-)
+# 現運用では比較・検証UIを外し、通常運用を軽量化（ユーザー指示）。
+shadow_enabled = False
+openai_api_key_shadow = ""
+openai_model_shadow = "gpt-5-mini"
 
 
 # --- サイドバー設定 (資金管理機能追加) ---
@@ -613,11 +595,11 @@ st.sidebar.subheader("💰 SBI FX 資金管理")
 capital = st.sidebar.number_input("軍資金 (JPY)", value=300000, step=10000)
 risk_percent = st.sidebar.slider(
     "1トレード許容損失 (%)", 1.0, 10.0, 2.0,
-    help="負けた時に資金の何%を失う覚悟があるか。プロは2%推奨。"
+    help="1回の想定最大損失%（表示基準）。固定1枚では守れないことがあるので、実質リスク%も併記します。"
 )
 # ✅ ここはあなたの新機能で参照しているので、UI側でも定義しておく（削除ではなく追加）
 weekly_dd_cap_percent = st.sidebar.slider(
-    "週単位DDキャップ (%)", 0.5, 5.0, 2.0, 0.1,
+    "週単位DDキャップ (%)", 0.5, 12.0, 8.0, 0.1,
     help="週単位で許容する損失上限（全ポジ合計リスク%）。"
 )
 max_positions_per_currency = st.sidebar.number_input(
@@ -633,7 +615,7 @@ fixed_1lot_mode = st.sidebar.checkbox(
 )
 max_risk_percent_cap = st.sidebar.slider(
     "許容最大リスク%（上限）",
-    2.0, 12.0, 6.0, 0.5,
+    2.0, 20.0, 8.0, 0.5,
     help="2%は目標。固定1枚で2%を超える局面は上限以内なら取引可、上限超はNO_TRADE。"
 )
 prefer_pullback_limit = st.sidebar.checkbox(
@@ -644,93 +626,12 @@ prefer_pullback_limit = st.sidebar.checkbox(
 
 # ✅【追加】過去検証（紙トレ/回数見積もり）
 st.sidebar.markdown("---")
-st.sidebar.subheader("🕰 過去検証（紙トレ/回数見積もり）")
-backtest_enabled = st.sidebar.checkbox(
-    "過去日付で評価（データをその日までに固定）",
-    value=False,
-    help="実ポジを取らずに『その日時点でツールがどう判断したか』を再現します。クオート更新は無効になります。"
-)
-_default_asof = (datetime.now(TOKYO) - timedelta(days=7)).date()
-as_of_date = st.sidebar.date_input(
-    "評価日（JST）",
-    value=_default_asof,
-    disabled=not backtest_enabled,
-    help="この日付までのデータで固定して、同じボタン（詳細レポート/注文命令書）を実行できます。"
-)
-# グローバルへ反映（関数群が参照）
-if backtest_enabled:
-    BACKTEST_AS_OF_DATE = as_of_date
-    BACKTEST_AS_OF_TS = pd.Timestamp(as_of_date) + pd.Timedelta(hours=23, minutes=59, seconds=59)
-    BACKTEST_FETCH_PERIOD = _choose_period_for_asof(as_of_date)
-else:
-    BACKTEST_AS_OF_DATE = None
-    BACKTEST_AS_OF_TS = None
-    BACKTEST_FETCH_PERIOD = None
 
-
-# ✅【追加】過去N週一括：TRADE回数見積もり（2/4/6%）
-st.sidebar.markdown("")
-st.sidebar.markdown("**📊 過去N週を一括で回して『TRADE回数』を集計（2%/4%/6%/8%）**")
-_batch_weekday_label = st.sidebar.selectbox(
-    "集計の基準曜日（JST）",
-    options=["水曜（週中判断）", "月曜（週初判断）"],
-    index=0,
-    help="その曜日の終値までのデータで『その時点の判断』を再現します。"
-)
-_batch_weekday = 2 if _batch_weekday_label.startswith("水曜") else 0  # Mon=0, Wed=2
-_batch_n_weeks = st.sidebar.number_input(
-    "過去N週",
-    min_value=1, max_value=600, value=12, step=1,
-    help="例：12なら直近12回（週ごと）を集計します。"
-)
-_batch_scan_pairs = st.sidebar.checkbox(
-    "USD/JPYがNO_TRADEでも代替ペアをスキャン（FAST・AIなし）",
-    value=True,
-    help="PAIR_MAP（7通貨ペア）を数値ゲートでスキャンし、最も強いペアで判定します（AIは呼びません）。"
-)
-_batch_use_ai = st.sidebar.checkbox(
-    "AIも呼んで厳密に再現（高コスト/遅い）",
-    value=False,
-    help="各週ごとにAI呼び出しが発生します。まずはOFF推奨（数値フォールバックで十分に回数傾向を見れます）。"
-)
-
-_batch_max_hold_weeks = st.sidebar.number_input(
-    "最大保有週数（結果ログ用）",
-    min_value=1, max_value=12, value=4, step=1,
-    help="約定後、最大何週まで保有した想定で結果（final_r / MFE / MAE / SL/TP到達）を計算するか。4=約1ヶ月。"
-)
-_batch_max_entry_wait_weeks = st.sidebar.number_input(
-    "約定猶予週数（LIMIT/STOPの待ち）",
-    min_value=1, max_value=8, value=4, step=1,
-    help="指値/逆指値が何週以内に約定しなければ無効（NO_FILL）として扱うか。"
-)
-if st.sidebar.button("📊 一括集計を実行", use_container_width=True):
-    st.session_state["_batch_run_flag"] = True
-    st.session_state["_batch_params"] = {
-        "n_weeks": int(_batch_n_weeks),
-        "weekday": int(_batch_weekday),
-        "scan_pairs": bool(_batch_scan_pairs),
-        "use_ai": bool(_batch_use_ai),
-        "capital_jpy": float(capital),
-        "risk_percent_target": float(risk_percent),
-        "fixed_1lot_mode": bool(fixed_1lot_mode),
-        "max_positions_per_currency": int(max_positions_per_currency),
-        "leverage": 25,  # fixed (avoid NameError before leverage is defined)
-        "api_key": str(api_key or ""),
-        "max_hold_weeks": int(_batch_max_hold_weeks),
-        "max_entry_wait_weeks": int(_batch_max_entry_wait_weeks),
-    }
-
-# ✅【追加】デバッグ（テスト用）: Secretsの DEV_MODE=true のときだけ表示
-if DEV_MODE:
-    st.sidebar.subheader("🧪 デバッグ")
-    force_no_trade_debug = st.sidebar.checkbox(
-        "NO_TRADE分岐を強制表示（テスト用）",
-        value=False,
-        help="代替ペアの動線テスト用。実運用ではOFF。",
-    )
-else:
-    force_no_trade_debug = False
+# --- 検証/デバッグUI（削除） ---
+# ユーザー指示により、サイドバーの検証（過去日付・一括集計）/デバッグ機能を削除し、通常運用を軽量化。
+backtest_enabled = False
+as_of_date = None
+force_no_trade_debug = False
 
 
 leverage = 25  # 固定
@@ -1516,489 +1417,8 @@ def _batch_prev_weekday(from_date, weekday: int):
     return d
 
 
-def _batch_estimate_trade_frequency(
-    n_weeks: int,
-    weekday: int,
-    scan_pairs: bool,
-    use_ai: bool,
-    capital_jpy: float,
-    risk_percent_target: float,
-    fixed_1lot_mode: bool,
-    max_positions_per_currency: int,
-    leverage: int,
-    api_key: str,
-    max_hold_weeks: int,
-    max_entry_wait_weeks: int,
-):
-    # 日付リスト（指定曜日の“その日終値まで”で判定）
-    today = datetime.now(TOKYO).date()
-    anchor = _batch_prev_weekday(today, int(weekday))
-    dates = [anchor - timedelta(days=7 * i) for i in range(int(n_weeks))]
-    earliest = dates[-1] if dates else anchor
-    period = _choose_period_for_asof(earliest)
 
-    # 対象ペア（FASTスキャン or USDJPY固定）
-    try:
-        all_pairs = list(getattr(logic, "PAIR_MAP", {}).keys())
-    except Exception:
-        all_pairs = ["USD/JPY (ドル円)"]
-    if not all_pairs:
-        all_pairs = ["USD/JPY (ドル円)"]
-    pair_list = all_pairs if bool(scan_pairs) else ["USD/JPY (ドル円)"]
-
-    # 指標DFを先読みキャッシュ
-    df_map = {pl: _batch_cached_indicator_df(pl, period) for pl in set(pair_list + ["USD/JPY (ドル円)"])}
-
-    rows = []
-    counts = {2: 0, 4: 0, 6: 0, 8: 0}
-
-    for d in dates:
-        # USDJPY換算
-        usd_jpy_rate = 150.0
-        try:
-            _usd_df = _batch_slice_asof(df_map.get("USD/JPY (ドル円)"), d)
-            if _usd_df is not None and len(_usd_df) > 0:
-                usd_jpy_rate = float(_usd_df.iloc[-1].get("Close", 150.0) or 150.0)
-        except Exception:
-            usd_jpy_rate = 150.0
-
-        best_pair = None
-        best_score = -1e18
-        best_meta = {}
-
-        # ペア選択（NO_TRADEで弾かれたら次へ）
-        for pl in pair_list:
-            df_full = df_map.get(pl)
-            df_asof = _batch_slice_asof(df_full, d)
-            if df_asof is None or len(df_asof) < 90:
-                continue
-
-            ctx = _batch_ctx_from_df(df_asof)
-
-            # ゲート（代替ペアの“TRADE-able” と同じ考え方：trend_only + no_trade）
-            try:
-                nt, regime, nt_reasons = logic.no_trade_gate(ctx, "DEFENSIVE", force_defensive=True)
-            except Exception:
-                nt, regime, nt_reasons = True, "DEFENSIVE", ["no_trade_gate_error"]
-
-            try:
-                ok_trend, side_hint, trend_score, trend_reasons = logic.trend_only_gate(ctx)
-            except Exception:
-                ok_trend, side_hint, trend_score, trend_reasons = False, "NONE", None, ["trend_only_gate_error"]
-
-            if (not ok_trend) or bool(nt) or (trend_score is None):
-                continue
-
-            score = float(trend_score)
-            if score > best_score:
-                best_score = score
-                best_pair = pl
-                best_meta = {
-                    "date": d,
-                    "pair": pl,
-                    "side_hint": side_hint,
-                    "trend_score": score,
-                    "regime": regime,
-                    "trend_reasons": trend_reasons,
-                    "nt_reasons": nt_reasons,
-                    "df_asof": df_asof,
-                    "ctx": ctx,
-                }
-
-        if not best_pair:
-            rows.append({
-                "date": str(d),
-                "pair": "",
-                "side": "NONE",
-                "trend_score": 0.0,
-                "atr_ratio": 0.0,
-                "base_source": "",
-                "cap2_trade": False,
-                "cap2_kind": "",
-                "cap2_entry": 0.0,
-                "cap2_stop_loss": 0.0,
-                "cap2_take_profit": 0.0,
-                "cap2_rr": 0.0,
-                "cap2_lots": 0,
-                "cap2_risk_actual_pct": 0.0,
-                "cap2_entry": 0.0,
-                "cap2_stop_loss": 0.0,
-                "cap2_take_profit": 0.0,
-                "cap2_rr": 0.0,
-                "cap2_lots": 0,
-                "cap2_risk_actual_pct": 0.0,
-                "cap2_risk_1lot_pct": 0.0,
-                "cap2_sl_width_yen": 0.0,
-                "cap2_reject_reason": "all_pairs_gate",
-                "cap4_trade": False,
-                "cap4_kind": "",
-                "cap4_entry": 0.0,
-                "cap4_stop_loss": 0.0,
-                "cap4_take_profit": 0.0,
-                "cap4_rr": 0.0,
-                "cap4_lots": 0,
-                "cap4_risk_actual_pct": 0.0,
-                "cap4_entry": 0.0,
-                "cap4_stop_loss": 0.0,
-                "cap4_take_profit": 0.0,
-                "cap4_rr": 0.0,
-                "cap4_lots": 0,
-                "cap4_risk_actual_pct": 0.0,
-                "cap4_risk_1lot_pct": 0.0,
-                "cap4_sl_width_yen": 0.0,
-                "cap4_reject_reason": "all_pairs_gate",
-                "cap6_trade": False,
-                "cap6_kind": "",
-                "cap6_entry": 0.0,
-                "cap6_stop_loss": 0.0,
-                "cap6_take_profit": 0.0,
-                "cap6_rr": 0.0,
-                "cap6_lots": 0,
-                "cap6_risk_actual_pct": 0.0,
-                "cap6_entry": 0.0,
-                "cap6_stop_loss": 0.0,
-                "cap6_take_profit": 0.0,
-                "cap6_rr": 0.0,
-                "cap6_lots": 0,
-                "cap6_risk_actual_pct": 0.0,
-                "cap6_risk_1lot_pct": 0.0,
-                "cap6_sl_width_yen": 0.0,
-                "cap6_reject_reason": "all_pairs_gate",
-                "cap8_trade": False,
-                "cap8_kind": "",
-                "cap8_risk_1lot_pct": 0.0,
-                "cap8_sl_width_yen": 0.0,
-                "cap8_reject_reason": "all_pairs_gate",
-                "note": "trend_only_gate / no_trade_gate で全ペア見送り",
-            })
-            continue
-
-        # ベース注文（AI or 数値フォールバック）
-        ctx0 = dict(best_meta.get("ctx") or {})
-        ctx0["trend_side_hint"] = best_meta.get("side_hint", "NONE")
-        ctx0["trend_score"] = float(best_meta.get("trend_score", 0.0) or 0.0)
-
-        market_regime = str(best_meta.get("regime") or "DEFENSIVE")
-        regime_why = "batch_estimate"
-
-        base_source = ""
-
-        base = None
-        if bool(use_ai) and (api_key or ""):
-            try:
-                # 最低限のctxで呼ぶ（失敗時は数値フォールバックへ）
-                _ctx_ai = dict(ctx0)
-                _ctx_ai["asof_date_jst"] = str(d)
-                base = logic.get_ai_order_strategy(api_key, _ctx_ai, pair_name=best_pair, generation_policy="AUTO_HIERARCHY")
-                if isinstance(base, dict) and base.get("decision") == "TRADE":
-                    base_source = "AI"
-            except Exception:
-                base = None
-
-        if not isinstance(base, dict) or base.get("decision") != "TRADE":
-            try:
-                if hasattr(logic, "_build_numeric_fallback_order"):
-                    base = logic._build_numeric_fallback_order(ctx0, market_regime, regime_why, pair_name=best_pair)
-                    if isinstance(base, dict) and base.get("decision") == "TRADE":
-                        base_source = base_source or "NUMERIC"
-                else:
-                    base = None
-            except Exception:
-                base = None
-
-        if not isinstance(base, dict) or base.get("decision") != "TRADE":
-            rows.append({
-                "date": str(d),
-                "pair": best_pair,
-                "side": "NONE",
-                "trend_score": float(best_meta.get("trend_score", 0.0) or 0.0),
-                "atr_ratio": 0.0,
-                "base_source": "",
-                "cap2_trade": False,
-                "cap2_kind": "",
-                "cap2_risk_1lot_pct": 0.0,
-                "cap2_sl_width_yen": 0.0,
-                "cap2_reject_reason": "base_order_failed",
-                "cap4_trade": False,
-                "cap4_kind": "",
-                "cap4_risk_1lot_pct": 0.0,
-                "cap4_sl_width_yen": 0.0,
-                "cap4_reject_reason": "base_order_failed",
-                "cap6_trade": False,
-                "cap6_kind": "",
-                "cap6_risk_1lot_pct": 0.0,
-                "cap6_sl_width_yen": 0.0,
-                "cap6_reject_reason": "base_order_failed",
-                "cap8_trade": False,
-                "cap8_kind": "",
-                "cap8_risk_1lot_pct": 0.0,
-                "cap8_sl_width_yen": 0.0,
-                "cap8_reject_reason": "base_order_failed",
-                "note": "ベース注文が作れず（AI/数値とも不成立）",
-            })
-            continue
-
-        # 3案生成（pullback LIMIT / breakout STOP / hybrid）
-        df_asof = best_meta.get("df_asof")
-        base_side = str(base.get("side") or best_meta.get("side_hint") or "LONG").upper()
-        ctx_for_cands = dict(ctx0)
-
-        cands = []
-        try:
-            c_break = dict(base)
-            c_break["_candidate_kind"] = "BREAKOUT_STOP"
-            cands.append(_decorate_time_rules(c_break))
-        except Exception:
-            pass
-        try:
-            c_pull = _derive_pullback_limit_candidate(best_pair, base_side, ctx_for_cands, df_asof)
-            if isinstance(c_pull, dict):
-                c_pull["_candidate_kind"] = "PULLBACK_LIMIT"
-                cands.append(_decorate_time_rules(c_pull))
-        except Exception:
-            pass
-        try:
-            c_hyb = _derive_hybrid_confirm_market_candidate(best_pair, base_side, ctx_for_cands, df_asof)
-            if isinstance(c_hyb, dict):
-                c_hyb["_candidate_kind"] = "HYBRID_CONFIRM"
-                cands.append(_decorate_time_rules(c_hyb))
-        except Exception:
-            pass
-
-        def _cap_result(capv: float):
-            picked, evaluated = _evaluate_and_pick_candidates(
-                pair_label=best_pair,
-                candidates=cands,
-                capital_jpy=float(capital_jpy),
-                risk_percent_target=float(risk_percent_target),
-                max_risk_percent_cap=float(capv),
-                fixed_1lot_mode=bool(fixed_1lot_mode),
-                usd_jpy=float(usd_jpy_rate),
-                remaining_margin_jpy=float(capital_jpy),  # ノーポジ前提（余力=資金）
-                weekly_dd_cap_percent=float(capv),        # 週DDキャップも同値で揃える
-                active_positions=[],
-                max_positions_per_currency=int(max_positions_per_currency),
-                leverage=int(leverage),
-            )
-
-            # 参照（最小リスクの案）: pickできなくても「なぜダメか」を出すため
-            ref = None
-            if isinstance(picked, dict):
-                ref = picked
-            elif evaluated:
-                # evaluated は _evaluate_and_pick_candidates 内で risk_1lot_pct 昇順に整列済み
-                ref = evaluated[0]
-
-            def _pack(cand: dict, ok_trade: bool):
-                ev = (cand or {}).get("_eval", {}) if isinstance(cand, dict) else {}
-                reasons = ev.get("reasons") or []
-                return {
-                    "trade": bool(ok_trade),
-                    "kind": str((cand or {}).get("_candidate_kind") or ""),
-                    "order_raw": {
-                        "side": str((cand or {}).get("side") or base_side),
-                        "kind": str((cand or {}).get("_candidate_kind") or ""),
-                        "entry": float((cand or {}).get("entry") or 0.0) if isinstance(cand, dict) else 0.0,
-                        "stop_loss": float((cand or {}).get("stop_loss") or 0.0) if isinstance(cand, dict) else 0.0,
-                        "take_profit": float((cand or {}).get("take_profit") or 0.0) if isinstance(cand, dict) else 0.0,
-                    },
-                    "entry": float((cand or {}).get("entry") or 0.0) if isinstance(cand, dict) else 0.0,
-                    "stop_loss": float((cand or {}).get("stop_loss") or 0.0) if isinstance(cand, dict) else 0.0,
-                    "take_profit": float((cand or {}).get("take_profit") or 0.0) if isinstance(cand, dict) else 0.0,
-                    "rr": float((cand or {}).get("_rr") or 0.0) if isinstance(cand, dict) else 0.0,
-                    "lots": int(ev.get("lots", 0) or 0),
-                    "risk_1lot_pct": float(ev.get("risk_1lot_pct", 0.0) or 0.0),
-                    "risk_actual_pct": float(ev.get("risk_actual_pct", 0.0) or 0.0),
-                    "sl_width_yen": float(ev.get("stop_w", 0.0) or 0.0),
-                    "sl_pips": float(ev.get("sl_pips", 0.0) or 0.0),
-                    "loss_1lot_jpy": float(ev.get("loss_per_lot_jpy", 0.0) or 0.0),
-                    "blocked_reason": str(ev.get("blocked_reason") or ""),
-                    "reject_reasons": ";".join([str(x) for x in reasons]) if reasons else "",
-                }
-
-            if isinstance(picked, dict):
-                return _pack(picked, True)
-            if isinstance(ref, dict):
-                return _pack(ref, False)
-            return _pack({}, False)
-
-        r2 = _cap_result(2.0)
-        r4 = _cap_result(4.0)
-        r6 = _cap_result(6.0)
-        r8 = _cap_result(8.0)
-
-
-        
-        # 結果ログ（紙トレ）: 週足OHLCで簡易シミュレーション（最大保有=max_hold_weeks）
-        try:
-            _df_full_for_sim = df_map.get(best_pair)
-        except Exception:
-            _df_full_for_sim = None
-
-        s2 = _batch_simulate_order_weekly(_df_full_for_sim, d, r2.get('order_raw') or {}, max_hold_weeks=max_hold_weeks, max_entry_wait_weeks=max_entry_wait_weeks) if bool(r2.get('trade')) else {"filled": False, "fill_date": "", "exit_type": "NO_TRADE", "exit_date": "", "final_r": 0.0, "mfe_r": 0.0, "mae_r": 0.0, "hold_weeks": 0}
-        s4 = _batch_simulate_order_weekly(_df_full_for_sim, d, r4.get('order_raw') or {}, max_hold_weeks=max_hold_weeks, max_entry_wait_weeks=max_entry_wait_weeks) if bool(r4.get('trade')) else {"filled": False, "fill_date": "", "exit_type": "NO_TRADE", "exit_date": "", "final_r": 0.0, "mfe_r": 0.0, "mae_r": 0.0, "hold_weeks": 0}
-        s6 = _batch_simulate_order_weekly(_df_full_for_sim, d, r6.get('order_raw') or {}, max_hold_weeks=max_hold_weeks, max_entry_wait_weeks=max_entry_wait_weeks) if bool(r6.get('trade')) else {"filled": False, "fill_date": "", "exit_type": "NO_TRADE", "exit_date": "", "final_r": 0.0, "mfe_r": 0.0, "mae_r": 0.0, "hold_weeks": 0}
-        s8 = _batch_simulate_order_weekly(_df_full_for_sim, d, r8.get('order_raw') or {}, max_hold_weeks=max_hold_weeks, max_entry_wait_weeks=max_entry_wait_weeks) if bool(r8.get('trade')) else {"filled": False, "fill_date": "", "exit_type": "NO_TRADE", "exit_date": "", "final_r": 0.0, "mfe_r": 0.0, "mae_r": 0.0, "hold_weeks": 0}
-
-# 追加の診断指標（増えない理由の確定用）
-        try:
-            _atr = float(ctx0.get('atr', 0.0) or 0.0)
-        except Exception:
-            _atr = 0.0
-        try:
-            _atr_avg60 = float(ctx0.get('atr_avg60', _atr) or _atr)
-        except Exception:
-            _atr_avg60 = _atr
-        _atr_ratio = (_atr / _atr_avg60) if (_atr_avg60 and _atr_avg60 > 0) else 0.0
-
-        if r2.get('trade'): counts[2] += 1
-        if r4.get('trade'): counts[4] += 1
-        if r6.get('trade'): counts[6] += 1
-        if r8.get('trade'): counts[8] += 1
-
-        rows.append({
-            'date': str(d),
-            'pair': best_pair,
-            'side': base_side,
-            'trend_score': float(best_meta.get('trend_score', 0.0) or 0.0),
-            'atr_ratio': float(_atr_ratio),
-            'base_source': str(base_source or ''),
-            'cap2_trade': bool(r2.get('trade')),
-            'cap2_kind': str(r2.get('kind') or ''),
-            'cap2_entry': float(r2.get('entry', 0.0) or 0.0),
-            'cap2_stop_loss': float(r2.get('stop_loss', 0.0) or 0.0),
-            'cap2_take_profit': float(r2.get('take_profit', 0.0) or 0.0),
-            'cap2_rr': float(r2.get('rr', 0.0) or 0.0),
-            'cap2_lots': int(r2.get('lots', 0) or 0),
-            'cap2_risk_actual_pct': float(r2.get('risk_actual_pct', 0.0) or 0.0),
-            'cap2_risk_1lot_pct': float(r2.get('risk_1lot_pct', 0.0) or 0.0),
-            'cap2_sl_width_yen': float(r2.get('sl_width_yen', 0.0) or 0.0),
-            'cap2_reject_reason': str(r2.get('reject_reasons') or r2.get('blocked_reason') or ''),
-            'cap2_filled': bool(s2.get('filled')),
-            'cap2_fill_date': str(s2.get('fill_date') or ''),
-            'cap2_exit_type': str(s2.get('exit_type') or ''),
-            'cap2_exit_date': str(s2.get('exit_date') or ''),
-            'cap2_final_r': float(s2.get('final_r', 0.0) or 0.0),
-            'cap2_mfe_r': float(s2.get('mfe_r', 0.0) or 0.0),
-            'cap2_mae_r': float(s2.get('mae_r', 0.0) or 0.0),
-            'cap2_hold_weeks': int(s2.get('hold_weeks', 0) or 0),
-
-            'cap4_trade': bool(r4.get('trade')),
-            'cap4_kind': str(r4.get('kind') or ''),
-            'cap4_entry': float(r4.get('entry', 0.0) or 0.0),
-            'cap4_stop_loss': float(r4.get('stop_loss', 0.0) or 0.0),
-            'cap4_take_profit': float(r4.get('take_profit', 0.0) or 0.0),
-            'cap4_rr': float(r4.get('rr', 0.0) or 0.0),
-            'cap4_lots': int(r4.get('lots', 0) or 0),
-            'cap4_risk_actual_pct': float(r4.get('risk_actual_pct', 0.0) or 0.0),
-            'cap4_risk_1lot_pct': float(r4.get('risk_1lot_pct', 0.0) or 0.0),
-            'cap4_sl_width_yen': float(r4.get('sl_width_yen', 0.0) or 0.0),
-            'cap4_reject_reason': str(r4.get('reject_reasons') or r4.get('blocked_reason') or ''),
-            'cap4_filled': bool(s4.get('filled')),
-            'cap4_fill_date': str(s4.get('fill_date') or ''),
-            'cap4_exit_type': str(s4.get('exit_type') or ''),
-            'cap4_exit_date': str(s4.get('exit_date') or ''),
-            'cap4_final_r': float(s4.get('final_r', 0.0) or 0.0),
-            'cap4_mfe_r': float(s4.get('mfe_r', 0.0) or 0.0),
-            'cap4_mae_r': float(s4.get('mae_r', 0.0) or 0.0),
-            'cap4_hold_weeks': int(s4.get('hold_weeks', 0) or 0),
-
-            'cap6_trade': bool(r6.get('trade')),
-            'cap6_kind': str(r6.get('kind') or ''),
-            'cap6_entry': float(r6.get('entry', 0.0) or 0.0),
-            'cap6_stop_loss': float(r6.get('stop_loss', 0.0) or 0.0),
-            'cap6_take_profit': float(r6.get('take_profit', 0.0) or 0.0),
-            'cap6_rr': float(r6.get('rr', 0.0) or 0.0),
-            'cap6_lots': int(r6.get('lots', 0) or 0),
-            'cap6_risk_actual_pct': float(r6.get('risk_actual_pct', 0.0) or 0.0),
-            'cap6_risk_1lot_pct': float(r6.get('risk_1lot_pct', 0.0) or 0.0),
-            'cap6_sl_width_yen': float(r6.get('sl_width_yen', 0.0) or 0.0),
-            'cap6_reject_reason': str(r6.get('reject_reasons') or r6.get('blocked_reason') or ''),
-            'cap6_filled': bool(s6.get('filled')),
-            'cap6_fill_date': str(s6.get('fill_date') or ''),
-            'cap6_exit_type': str(s6.get('exit_type') or ''),
-            'cap6_exit_date': str(s6.get('exit_date') or ''),
-            'cap6_final_r': float(s6.get('final_r', 0.0) or 0.0),
-            'cap6_mfe_r': float(s6.get('mfe_r', 0.0) or 0.0),
-            'cap6_mae_r': float(s6.get('mae_r', 0.0) or 0.0),
-            'cap6_hold_weeks': int(s6.get('hold_weeks', 0) or 0),
-
-            'cap8_trade': bool(r8.get('trade')),
-            'cap8_kind': str(r8.get('kind') or ''),
-            'cap8_entry': float(r8.get('entry', 0.0) or 0.0),
-            'cap8_stop_loss': float(r8.get('stop_loss', 0.0) or 0.0),
-            'cap8_take_profit': float(r8.get('take_profit', 0.0) or 0.0),
-            'cap8_rr': float(r8.get('rr', 0.0) or 0.0),
-            'cap8_lots': int(r8.get('lots', 0) or 0),
-            'cap8_risk_actual_pct': float(r8.get('risk_actual_pct', 0.0) or 0.0),
-            'cap8_risk_1lot_pct': float(r8.get('risk_1lot_pct', 0.0) or 0.0),
-            'cap8_sl_width_yen': float(r8.get('sl_width_yen', 0.0) or 0.0),
-            'cap8_reject_reason': str(r8.get('reject_reasons') or r8.get('blocked_reason') or ''),
-            'cap8_filled': bool(s8.get('filled')),
-            'cap8_fill_date': str(s8.get('fill_date') or ''),
-            'cap8_exit_type': str(s8.get('exit_type') or ''),
-            'cap8_exit_date': str(s8.get('exit_date') or ''),
-            'cap8_final_r': float(s8.get('final_r', 0.0) or 0.0),
-            'cap8_mfe_r': float(s8.get('mfe_r', 0.0) or 0.0),
-            'cap8_mae_r': float(s8.get('mae_r', 0.0) or 0.0),
-            'cap8_hold_weeks': int(s8.get('hold_weeks', 0) or 0),
-
-
-            'note': '',
-        })
-
-    df_out = pd.DataFrame(rows)
-    summary = {
-        "n_weeks": int(n_weeks),
-        "weekday": int(weekday),
-        "anchor": str(anchor),
-        "period": str(period),
-        "counts": counts,
-        "use_ai": bool(use_ai),
-        "scan_pairs": bool(scan_pairs),
-    }
-    return df_out, summary
-
-
-# 実行トリガ（サイドバーのボタンでフラグが立つ）
-if st.session_state.get("_batch_run_flag"):
-    _p = st.session_state.get("_batch_params") or {}
-    try:
-        with st.spinner("過去N週を一括集計中…（数値ゲート＋3案生成）"):
-            _df_b, _sum_b = _batch_estimate_trade_frequency(**_p)
-        st.session_state["batch_freq_df"] = _df_b
-        st.session_state["batch_freq_summary"] = _sum_b
-        st.sidebar.success("✅ 一括集計が完了しました（下に結果が出ます）")
-    except Exception as e:
-        st.session_state["batch_freq_df"] = None
-        st.session_state["batch_freq_summary"] = None
-        st.sidebar.error(f"❌ 一括集計でエラー: {type(e).__name__}: {e}")
-    finally:
-        st.session_state["_batch_run_flag"] = False
-
-
-# 結果表示
-if st.session_state.get("batch_freq_df") is not None:
-    _sum = st.session_state.get("batch_freq_summary") or {}
-    _cnt = (_sum.get("counts") or {})
-    with st.expander("📊 回数見積もり結果（過去N週 / 2%・4%・6%）", expanded=True):
-        st.markdown(
-            f"**対象:** 過去{_sum.get('n_weeks','?')}週 / 基準曜日={('水曜' if int(_sum.get('weekday',2))==2 else '月曜')}（anchor={_sum.get('anchor','')}）  \n"
-            f"**集計（TRADEになった週数）:** 2%={_cnt.get(2,0)} / 4%={_cnt.get(4,0)} / 6%={_cnt.get(6,0)} / 8%={_cnt.get(8,0)}  \n"
-            f"（取得period={_sum.get('period','')}）"
-        )
-        st.dataframe(st.session_state.get("batch_freq_df"), use_container_width=True)
-        try:
-            _df_export = st.session_state.get("batch_freq_df")
-            _csv = _df_export.to_csv(index=False)
-            _bytes = _csv.encode("utf-8-sig")
-            _ts = datetime.now(TOKYO).strftime("%Y-%m-%dT%H-%M")
-            _suffix = "_export_ai" if bool(_sum.get("use_ai")) else "_export"
-            st.download_button("📥 CSVエクスポート", data=_bytes, file_name=f"{_ts}{_suffix}.csv", mime="text/csv", use_container_width=True)
-        except Exception:
-            pass
-
-        st.caption("※ FASTスキャンはAIを呼ばず、trend_only_gate + no_trade_gate + 数値フォールバックで『TRADE可能か』の傾向を素早く見積もります。")
+# （削除）過去N週一括集計（検証用）機能はユーザー指示により削除しました。
 
 total_risk_pct, ccy_counts = _portfolio_summary(st.session_state.portfolio_positions)
 remain_risk_pct = float(weekly_dd_cap_percent) - float(total_risk_pct)
@@ -2417,6 +1837,42 @@ fig_main.add_trace(go.Scatter(x=df_chart.index, y=df_chart["SMA_5"], name="5日�
 fig_main.add_trace(go.Scatter(x=df_chart.index, y=df_chart["SMA_25"], name="25日線", line=dict(color="orange", width=2)), row=1, col=1)
 fig_main.add_trace(go.Scatter(x=df_chart.index, y=df_chart["SMA_75"], name="75日線", line=dict(color="gray", width=1, dash="dot")), row=1, col=1)
 
+
+# --- ★ AIトレンド判定ライン（直近1週間日足の“終値ブレイク”目安） ---
+# 直近N本（デフォ5本=約1週間）の日足高値/安値を基準に、
+# 「終値で上抜け/下抜けしたらTREND」として視覚化します。
+def _compute_trend_triggers(_df: pd.DataFrame, lookback:int=5):
+    try:
+        if _df is None or len(_df) < 3:
+            return None, None
+        lb = max(2, min(lookback, len(_df)-1))
+        ref = _df.iloc[-(lb+1):-1]  # exclude last bar (today / latest)
+        up = float(ref["High"].max())
+        dn = float(ref["Low"].min())
+        return up, dn
+    except Exception:
+        return None, None
+
+trend_up, trend_dn = _compute_trend_triggers(df_chart, lookback=5)
+if trend_up is not None and trend_dn is not None:
+    view_x = [chart_start_view, chart_last_date]
+    fig_main.add_trace(
+        go.Scatter(
+            x=view_x, y=[trend_up, trend_up],
+            name=f"TREND↑終値>{trend_up:.3f}",
+            line=dict(color="#1f77b4", width=2, dash="dot")
+        ),
+        row=1, col=1
+    )
+    fig_main.add_trace(
+        go.Scatter(
+            x=view_x, y=[trend_dn, trend_dn],
+            name=f"TREND↓終値<{trend_dn:.3f}",
+            line=dict(color="#9467bd", width=2, dash="dot")
+        ),
+        row=1, col=1
+    )
+
 # ★ AI予想ライン表示機能 (赤・緑点線)
 if (chart_pair_label == "USD/JPY (ドル円)") and st.session_state.ai_range:
     high_val, low_val = st.session_state.ai_range
@@ -2472,6 +1928,19 @@ fig_main.update_xaxes(range=[chart_start_view, chart_last_date], matches='x', ro
 fig_main.update_yaxes(range=[y_min_view_chart * 0.998, y_max_view_chart * 1.002], autorange=False, row=1, col=1)
 fig_main.update_layout(height=650, template="plotly_dark", xaxis_rangeslider_visible=False, showlegend=True, margin=dict(r=10, l=10))
 st.plotly_chart(fig_main, use_container_width=True)
+
+# ✅ このチャート上の点線が「AIがトレンド確定と判定する終値ライン」です（目安）。
+#   - TREND↑終値>ライン：直近5本（約1週間）の日足高値を終値で上抜け
+#   - TREND↓終値<ライン：直近5本（約1週間）の日足安値を終値で下抜け
+try:
+    if trend_up is not None and trend_dn is not None:
+        st.markdown(
+            f"**トレンド確定ライン（終値ベース/直近5本）**  \n"
+            f"- 上昇トレンド確定：**終値が {trend_up:.3f} を上抜け**  \n"
+            f"- 下落トレンド確定：**終値が {trend_dn:.3f} を下抜け**"
+        )
+except Exception:
+    pass
 
 # --- 4. RSI & SBI仕様ロット計算機 ---
 st.subheader("🛠️ SBI FX ロット計算機 (1万通貨単位)")
@@ -2674,6 +2143,59 @@ with tab2:
             help="AIの出力が不正/失敗した場合は『見送り』で止めます（安全最優先）。"
         )
 
+
+
+    # =========================
+    # 📅 毎日監視: デイリー判断（状態遷移）
+    # =========================
+    btn_daily = st.button(
+        "📅 今日の市場判断（デイリー）",
+        key="btn_daily_plan",
+        help="週縛りを外し、日足の状態遷移(TREND/RANGE)で今日の注文案を作成します。価格は数値ロジック、AIはveto/説明のみ。"
+    )
+    if btn_daily:
+        try:
+            ctx_daily = dict(ctx)
+            # df_daily がローカルにある場合は載せる
+            if "df_daily" in locals():
+                ctx_daily["df_daily"] = df_daily
+            # デフォ: 上限8%（機会損失を減らす）
+            max_risk = float(st.session_state.get("max_risk_pct", 8.0) or 8.0)
+            if hasattr(logic, "get_daily_order_strategy"):
+                plan = logic.get_daily_order_strategy(api_key, ctx_daily, max_risk_pct=max_risk)
+            else:
+                plan = logic.get_ai_order_strategy(api_key, ctx_daily)
+            st.session_state["last_daily_plan"] = plan
+            st.success("✅ デイリー判断を作成しました")
+        except Exception as e:
+            st.error(f"デイリー判断で例外: {e}")
+
+    plan = st.session_state.get("last_daily_plan")
+    if isinstance(plan, dict):
+        st.markdown("### 📅 デイリー判断（結果）")
+        st.json(plan)
+        # JSON保存/ダウンロード
+        try:
+            rec = {
+                "ts": datetime.now(TOKYO).isoformat(),
+                "kind": "DAILY_PLAN",
+                "pair": ctx.get("pair",""),
+                "plan": plan,
+            }
+            _write_jsonl(os.path.join("logs", f"ai_daily_plan_{_today_tokyo_str()}.jsonl"), rec)
+        except Exception:
+            pass
+
+        try:
+            js = json.dumps(plan, ensure_ascii=False, indent=2)
+            b64 = base64.b64encode(js.encode("utf-8")).decode("ascii")
+            st.markdown(
+                f'<a download="daily_plan_{_today_tokyo_str()}.json" href="data:application/json;base64,{b64}">⬇️ デイリー判断JSONをダウンロード</a>',
+                unsafe_allow_html=True
+            )
+        except Exception:
+            pass
+
     if btn_make_auto or btn_make_strict:
         gen_policy = "AUTO_HIERARCHY" if btn_make_auto else "AI_STRICT"
         if api_key:
@@ -2758,11 +2280,42 @@ with tab2:
                             if picked:
                                 chosen = picked
                             else:
+                                # 詳細理由: 最もリスクが小さい候補でも制約を満たせない理由を明示
+                                _best = None
+                                try:
+                                    if evaluated:
+                                        _best = sorted(
+                                            evaluated,
+                                            key=lambda _x: (
+                                                float((_x.get("_eval", {}) or {}).get("risk_1lot_pct", 999.0) or 999.0),
+                                                -float(_x.get("_rr", 0.0) or 0.0),
+                                            ),
+                                        )[0]
+                                except Exception:
+                                    _best = None
+
+                                _notes = [f'上限リスク%={float(max_risk_percent_cap):.1f}', f'週DDキャップ={float(weekly_dd_cap_percent):.1f}']
+                                _why = '固定1枚前提で、許容最大リスク%（上限）/週DDキャップ/証拠金の制約を満たす案がありません。'
+                                if isinstance(_best, dict):
+                                    _ev = _best.get("_eval", {}) or {}
+                                    _reasons = _ev.get("reasons") or []
+                                    _r1 = float(_ev.get("risk_1lot_pct", 0.0) or 0.0)
+                                    _loss = float(_ev.get("loss_per_lot_jpy", 0.0) or 0.0)
+                                    _stopw = float(_ev.get("stop_w", 0.0) or 0.0)
+                                    _why = (
+                                        f"見送り: 最低リスク案（{_best.get('_candidate_kind','?')}）でも "
+                                        f"実質リスク{_r1:.2f}%（1枚損失{_loss:.0f}円 / SL幅{_stopw:.3f}円）が "
+                                        f"上限/週DD/他制約により不可。"
+                                    )
+                                    if _reasons:
+                                        _notes.append("不許可理由=" + ",".join([str(x) for x in _reasons]))
+                                    _notes.append(f"実質リスク%={_r1:.2f}（<=上限{float(max_risk_percent_cap):.1f} / <=週DD{float(weekly_dd_cap_percent):.1f} が条件）")
+
                                 chosen = {
                                     'decision': 'NO_TRADE',
                                     'side': 'NONE',
-                                    'why': '固定1枚前提で、許容最大リスク%（上限）/週DDキャップ/証拠金の制約を満たす案がありません。',
-                                    'notes': [f'上限リスク%={float(max_risk_percent_cap):.1f}', f'週DDキャップ={float(weekly_dd_cap_percent):.1f}'],
+                                    'why': _why,
+                                    'notes': _notes,
                                 }
                             chosen['candidates'] = evaluated
                     except Exception as _e:
@@ -2803,26 +2356,32 @@ with tab2:
             else:
                 st.markdown(strategy)
 
-        # --- 🧪 シャドー比較表示（直近の実行結果） ---
-        if shadow_enabled:
-            with st.expander("🧪 シャドー比較（Gemini vs GPT）", expanded=False):
-                if not openai_api_key_shadow:
-                    st.caption("OpenAI API Key (shadow) が未入力のため、比較はスキップされました。")
-                elif not hasattr(logic, "get_ai_order_strategy_shadow_openai"):
-                    st.warning("logic.py に get_ai_order_strategy_shadow_openai がありません。logic_shadow_compare.py を logic.py に差し替えてください。")
-                else:
-                    g = st.session_state.get("last_shadow_base") or {}
-                    o = st.session_state.get("last_shadow_openai") or {}
-                    d = st.session_state.get("last_shadow_diff") or {}
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        st.markdown("**Gemini（実運用）**")
-                        st.json(jpize_json(g))
-                    with c2:
-                        st.markdown(f"**GPT（シャドー: {openai_model_shadow}）**")
-                        st.json(jpize_json(o))
-                    st.markdown("**差分サマリー**")
-                    st.json(d)
+
+        # 📥 AI注文戦略（JSON）を保存/ダウンロード（削除しない・運用に必須）
+        if isinstance(strategy, dict):
+            try:
+                _payload = jpize_json(strategy)
+            except Exception:
+                _payload = strategy
+            try:
+                _bytes = json.dumps(_payload, ensure_ascii=False, indent=2).encode("utf-8")
+                _fname = f"ai_order_strategy_{_today_tokyo_str()}_{datetime.now(TOKYO).strftime('%H%M%S')}.json"
+                st.download_button("📥 AI注文戦略をダウンロード（JSON）", data=_bytes, file_name=_fname, mime="application/json", use_container_width=True)
+            except Exception:
+                pass
+            # サーバ側にもログ保存（JSONL）
+            try:
+                _write_jsonl(
+                    f"logs/ai_order_strategy_{_today_tokyo_str()}.jsonl",
+                    {
+                        "ts": datetime.now(TOKYO).isoformat(),
+                        "pair": "USD/JPY (ドル円)",
+                        "policy": str(st.session_state.get("last_strategy_policy") or ""),
+                        "strategy": _payload,
+                    },
+                )
+            except Exception:
+                pass
 
 
         # ✅ 実損失ベース（固定1枚前提）の見える化
@@ -3051,11 +2610,42 @@ with tab2:
                             if picked:
                                 chosen = picked
                             else:
+                                # 詳細理由: 最もリスクが小さい候補でも制約を満たせない理由を明示
+                                _best = None
+                                try:
+                                    if evaluated:
+                                        _best = sorted(
+                                            evaluated,
+                                            key=lambda _x: (
+                                                float((_x.get("_eval", {}) or {}).get("risk_1lot_pct", 999.0) or 999.0),
+                                                -float(_x.get("_rr", 0.0) or 0.0),
+                                            ),
+                                        )[0]
+                                except Exception:
+                                    _best = None
+
+                                _notes = [f'上限リスク%={float(max_risk_percent_cap):.1f}', f'週DDキャップ={float(weekly_dd_cap_percent):.1f}']
+                                _why = '固定1枚前提で、許容最大リスク%（上限）/週DDキャップ/証拠金の制約を満たす案がありません。'
+                                if isinstance(_best, dict):
+                                    _ev = _best.get("_eval", {}) or {}
+                                    _reasons = _ev.get("reasons") or []
+                                    _r1 = float(_ev.get("risk_1lot_pct", 0.0) or 0.0)
+                                    _loss = float(_ev.get("loss_per_lot_jpy", 0.0) or 0.0)
+                                    _stopw = float(_ev.get("stop_w", 0.0) or 0.0)
+                                    _why = (
+                                        f"見送り: 最低リスク案（{_best.get('_candidate_kind','?')}）でも "
+                                        f"実質リスク{_r1:.2f}%（1枚損失{_loss:.0f}円 / SL幅{_stopw:.3f}円）が "
+                                        f"上限/週DD/他制約により不可。"
+                                    )
+                                    if _reasons:
+                                        _notes.append("不許可理由=" + ",".join([str(x) for x in _reasons]))
+                                    _notes.append(f"実質リスク%={_r1:.2f}（<=上限{float(max_risk_percent_cap):.1f} / <=週DD{float(weekly_dd_cap_percent):.1f} が条件）")
+
                                 chosen = {
                                     'decision': 'NO_TRADE',
                                     'side': 'NONE',
-                                    'why': '固定1枚前提で、許容最大リスク%（上限）/週DDキャップ/証拠金の制約を満たす案がありません。',
-                                    'notes': [f'上限リスク%={float(max_risk_percent_cap):.1f}', f'週DDキャップ={float(weekly_dd_cap_percent):.1f}'],
+                                    'why': _why,
+                                    'notes': _notes,
                                 }
                             chosen['candidates'] = evaluated
                     except Exception as _e:
