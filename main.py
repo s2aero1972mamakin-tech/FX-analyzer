@@ -679,6 +679,41 @@ def _v1_inject_ctx(ctx: dict, pair_label: str = None) -> dict:
         except Exception:
             pass
     return ctx
+def _safe_v1_inject_ctx(ctx: dict, pair_label: str = None) -> dict:
+    """_v1_inject_ctx が無い/壊れていても絶対に落とさない保険。"""
+    try:
+        fn = globals().get("_v1_inject_ctx")
+        if callable(fn):
+            return fn(ctx, pair_label)
+    except Exception:
+        pass
+    # 最低限の注入（キー無しでも0フォールバックする設計）
+    if not isinstance(ctx, dict):
+        return ctx
+    try:
+        ctx["decision_engine"] = globals().get("V1_DECISION_ENGINE", "EV_V1")
+        ctx["min_expected_R"] = float(globals().get("V1_MIN_EXPECTED_R", 0.10))
+        ctx["horizon_days"] = int(globals().get("V1_HORIZON_DAYS", 5))
+        ctx["keys"] = globals().get("V1_KEYS", {})
+        pl = pair_label or ctx.get("pair_label") or ctx.get("pair") or ctx.get("ticker_label")
+        if pl:
+            try:
+                pl = _normalize_pair_label(pl)
+            except Exception:
+                pass
+            ctx["pair_label"] = pl
+            try:
+                sym = None
+                if hasattr(logic, "PAIR_MAP"):
+                    sym = logic.PAIR_MAP.get(pl)
+                if sym:
+                    ctx["pair_symbol"] = sym
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return ctx
+
 
 
 
@@ -2284,7 +2319,7 @@ with tab2:
             if hasattr(logic, "get_daily_order_strategy"):
                 plan = logic.get_daily_order_strategy(api_key, ctx_daily, max_risk_pct=max_risk)
             else:
-                _v1_inject_ctx(ctx_daily, best_pair)
+                _safe_v1_inject_ctx(ctx_daily, globals().get('best_pair'))
                 plan = logic.get_ai_order_strategy(api_key, ctx_daily)
             st.session_state["last_daily_plan"] = plan
             st.success("✅ デイリー判断を作成しました")
@@ -2327,7 +2362,7 @@ with tab2:
                     ctx["last_report"] = st.session_state.last_ai_report
                     ctx["panel_short"] = diag['short']['status'] if diag else "不明"
                     ctx["panel_mid"] = diag['mid']['status'] if diag else "不明"
-                    _v1_inject_ctx(ctx, best_pair)
+                    _safe_v1_inject_ctx(ctx, globals().get('best_pair'))
                     base_strategy = logic.get_ai_order_strategy(api_key, ctx, generation_policy=gen_policy)
                     # --- シャドー比較（Gemini vs GPT）: Gemini出力(base_strategy)とOpenAI出力を同条件で比較 ---
                     if shadow_enabled:
@@ -2670,7 +2705,7 @@ with tab2:
                     if not alt_ctx.get("_pair_ctx_ok"):
                         st.warning("⚠️ 代替ペアの最新テクニカル（RSI/ATR等）が取得できませんでした。精度が落ちるため、原則ノートレ推奨です。")
                     df_alt = _get_df_for_pair(best_pair, us10y_raw)
-                    _v1_inject_ctx(alt_ctx, alt_ctx.get('pair_label') or best_pair)
+                    _safe_v1_inject_ctx(alt_ctx, alt_ctx.get('pair_label') or globals().get('best_pair'))
                     base_strategy = logic.get_ai_order_strategy(api_key, alt_ctx, generation_policy='AUTO_HIERARCHY')
                     # --- シャドー比較（代替ペア） ---
                     if shadow_enabled and hasattr(logic, "get_ai_order_strategy_shadow_openai") and openai_api_key_shadow:
@@ -2982,32 +3017,113 @@ with tab5:
 
         run_bt = st.button("バックテスト実行（簡易WFA）", key="run_ev_backtest_v1")
         if run_bt:
-            # --- backtest_ev_v1 安全ガード（モジュール未導入/import失敗でも落とさない） ---
-            if backtest_ev_v1 is None or not hasattr(backtest_ev_v1, "run_backtest"):
-                st.error("❌ backtest_ev_v1.py が読み込めません。GitHubに backtest_ev_v1.py を追加（または差し替え）してください。")
-                st.info("👉 対処: 私が渡す backtest_ev_v1_fixed.py を backtest_ev_v1.py にリネームしてリポジトリ直下へ配置し、再デプロイしてください。")
-                st.stop()
-
-            try:
-                with st.spinner("価格取得 + WFA計算中..."):
-                    wf_df, summ = backtest_ev_v1.run_backtest(
-                        pair_symbol=bt_symbol,
-                        period=bt_period,
-                        horizon_days=int(bt_horizon_days),
-                        train_years=int(bt_train_years),
-                        test_months=int(bt_test_months),
-                        min_expected_R=float(bt_min_ev),
-                    )
-            except Exception as e:
-                st.error("❌ バックテスト実行中に失敗しました（クラッシュ回避）。")
-                st.exception(e)
-                st.stop()
+            with st.spinner("yfinance取得 + WFA計算中..."):
+                wf_df, summ = backtest_ev_v1.run_backtest(
+                    pair_symbol=bt_symbol,
+                    period=bt_period,
+                    horizon_days=int(bt_horizon_days),
+                    train_years=int(bt_train_years),
+                    test_months=int(bt_test_months),
+                    min_expected_R=float(bt_min_ev),
+                )
 
             st.markdown("### Summary")
             st.json(summ)
 
             st.markdown("### Walk-Forward details")
             st.dataframe(wf_df, use_container_width=True)
+
+            # --- ✅ 合否判定 + グラフ + 運用コメント（自動） ---
+            try:
+                d = wf_df.copy()
+                # 可能なら時系列として扱う
+                if "test_end" in d.columns:
+                    d["test_end_dt"] = pd.to_datetime(d["test_end"], errors="coerce")
+                    d = d.sort_values("test_end_dt")
+                total_trades = float(d["n_trades"].sum()) if "n_trades" in d.columns else 0.0
+                total_sumR = float(d["sum_R"].sum()) if "sum_R" in d.columns else 0.0
+                avgR_per_trade = (total_sumR / total_trades) if total_trades > 0 else 0.0
+                w_win = (float((d["win_rate"] * d["n_trades"]).sum()) / total_trades) if (total_trades > 0 and "win_rate" in d.columns and "n_trades" in d.columns) else 0.0
+                worst_dd = float(d["max_dd_R"].max()) if "max_dd_R" in d.columns and len(d) else 0.0
+
+                # 直近窓（最後の1〜2行）
+                last1 = d.iloc[-1] if len(d) else None
+                last2 = d.iloc[-2:] if len(d) >= 2 else d
+
+                last1_sum = float(last1["sum_R"]) if last1 is not None and "sum_R" in d.columns else 0.0
+                last1_trades = float(last1["n_trades"]) if last1 is not None and "n_trades" in d.columns else 0.0
+                last2_sum = float(last2["sum_R"].sum()) if "sum_R" in d.columns and len(last2) else 0.0
+                last1_dd = float(last1["max_dd_R"]) if last1 is not None and "max_dd_R" in d.columns else 0.0
+
+                # ---- 判定ルール（Ver1の現実的な安全策）
+                # STOP: 直近がマイナス / 直近2窓合計がマイナス / DDが大きい
+                status = "注意"
+                if total_trades < 30:
+                    status = "データ不足"
+                elif (last1_sum < 0) or (last2_sum < 0) or (worst_dd >= 30) or (last1_dd >= 30):
+                    status = "停止"
+                elif (worst_dd >= 20) or (last1_dd >= 20) or (avgR_per_trade <= 0):
+                    status = "注意"
+                else:
+                    status = "合格"
+
+                st.markdown("### ✅ 自動判定（この結果をどう使うか）")
+                m1, m2, m3, m4, m5 = st.columns(5)
+                m1.metric("総トレード数", f"{int(total_trades)}")
+                m2.metric("合計R", f"{total_sumR:.2f}R")
+                m3.metric("平均R/回", f"{avgR_per_trade:.3f}R")
+                m4.metric("勝率(加重)", f"{(w_win*100):.1f}%")
+                m5.metric("最大DD(R)", f"{worst_dd:.2f}R")
+
+                if status == "合格":
+                    st.success("判定：**合格**（Ver1として“方向性OK”。ただし実運用は必ずロット小＋停止ルール併用）")
+                elif status == "注意":
+                    st.warning("判定：**注意**（エッジが弱い/ドローダウン大。閾値や運用ルールの調整が必要）")
+                elif status == "停止":
+                    st.error("判定：**停止**（直近がマイナス or DD大。自動運用ONは危険。ゲート強化/停止ルール必須）")
+                else:
+                    st.info("判定：**データ不足**（トレード回数が少なく、統計的に判断できません）")
+
+                # ---- 運用コメント（自動）
+                comments = []
+                if last1_trades == 0:
+                    comments.append("直近窓でトレード0回：**min_expected_R（EV閾値）が高すぎ**か、状態推定が弱い可能性。→ 閾値を下げる/特徴量を追加。")
+                if last1_sum < 0:
+                    comments.append("直近窓がマイナス：**自動運用は停止推奨**。→ 停止ルール（直近窓マイナスなら停止）を必ず実装。")
+                if worst_dd >= 20:
+                    comments.append("最大DDが大きい：**ロット縮小** or **EV閾値引き上げ**で無駄撃ちを減らす。")
+                if (total_sumR > 0) and (last2_sum < 0):
+                    comments.append("長期ではプラスでも直近で崩れている：**レジーム変化**に弱い。→ risk_off/range判定の強化が次の優先。")
+                if avgR_per_trade <= 0 and total_trades > 50:
+                    comments.append("平均R/回が0以下：勝率ではなく**期待値が負**。→ EVゲートを強く（min_expected_R↑）/ エントリー条件を絞る。")
+                if not comments:
+                    comments.append("大きな危険シグナルは見えません（Ver1としては良好）。ただし約定コスト未反映のため、実運用は小ロット＋停止ルール併用。")
+
+                st.markdown("#### 🧭 運用コメント（自動）")
+                for c in comments:
+                    st.write("• " + c)
+
+                st.markdown("#### 📈 推移グラフ（窓ごとの成績）")
+                # plotly: sum_R と max_dd_R
+                try:
+                    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.12,
+                                        subplot_titles=("sum_R（各テスト窓の合計R）", "max_dd_R（各テスト窓の最大DD）"))
+                    x = d["test_end_dt"] if "test_end_dt" in d.columns else list(range(len(d)))
+                    if "sum_R" in d.columns:
+                        fig.add_trace(go.Scatter(x=x, y=d["sum_R"], mode="lines+markers", name="sum_R"), row=1, col=1)
+                    if "max_dd_R" in d.columns:
+                        fig.add_trace(go.Scatter(x=x, y=d["max_dd_R"], mode="lines+markers", name="max_dd_R"), row=2, col=1)
+                    fig.update_layout(height=520, margin=dict(l=20, r=20, t=60, b=20))
+                    st.plotly_chart(fig, use_container_width=True)
+                except Exception:
+                    pass
+
+                st.markdown("#### ✅ 実運用ルール（最低限）")
+                st.write("• 直近6か月（最後の1窓）がマイナスなら **自動停止**")
+                st.write("• max_dd_R が 20R を超えたら **ロット半分**、30R を超えたら **停止**")
+                st.write("• まずは EV_V1（数値のみ）で安定稼働 → その後 HYBRID（説明だけLLM）に移行")
+            except Exception as e:
+                st.warning(f"自動判定の生成で例外（表示のみ失敗）: {type(e).__name__}: {e}")
 
             try:
                 csv_bytes = wf_df.to_csv(index=False).encode("utf-8")
