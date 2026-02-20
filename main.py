@@ -2982,15 +2982,26 @@ with tab5:
 
         run_bt = st.button("バックテスト実行（簡易WFA）", key="run_ev_backtest_v1")
         if run_bt:
-            with st.spinner("yfinance取得 + WFA計算中..."):
-                wf_df, summ = backtest_ev_v1.run_backtest(
-                    pair_symbol=bt_symbol,
-                    period=bt_period,
-                    horizon_days=int(bt_horizon_days),
-                    train_years=int(bt_train_years),
-                    test_months=int(bt_test_months),
-                    min_expected_R=float(bt_min_ev),
-                )
+            # --- backtest_ev_v1 安全ガード（モジュール未導入/import失敗でも落とさない） ---
+            if backtest_ev_v1 is None or not hasattr(backtest_ev_v1, "run_backtest"):
+                st.error("❌ backtest_ev_v1.py が読み込めません。GitHubに backtest_ev_v1.py を追加（または差し替え）してください。")
+                st.info("👉 対処: 私が渡す backtest_ev_v1_fixed.py を backtest_ev_v1.py にリネームしてリポジトリ直下へ配置し、再デプロイしてください。")
+                st.stop()
+
+            try:
+                with st.spinner("価格取得 + WFA計算中..."):
+                    wf_df, summ = backtest_ev_v1.run_backtest(
+                        pair_symbol=bt_symbol,
+                        period=bt_period,
+                        horizon_days=int(bt_horizon_days),
+                        train_years=int(bt_train_years),
+                        test_months=int(bt_test_months),
+                        min_expected_R=float(bt_min_ev),
+                    )
+            except Exception as e:
+                st.error("❌ バックテスト実行中に失敗しました（クラッシュ回避）。")
+                st.exception(e)
+                st.stop()
 
             st.markdown("### Summary")
             st.json(summ)
