@@ -406,75 +406,116 @@ def _dget(d: dict, *keys, default=""):
     return default
 
 def render_order_summary(order: dict, pair_name: str = "", title: str = "📌 注文サマリー"):
-    """注文命令書(dict)を、エントリー判断に必要な項目だけに絞って表示する。"""
+    """注文命令書(dict)を、迷わないための『最上段AUTOパネル』＋必要最低限に絞って表示する。"""
     if not isinstance(order, dict):
-        st.markdown(order)
+        st.markdown(str(order))
         return
 
+    # ---- core fields (JP/EN keys both supported) ----
     decision = _dget(order, "判定", "decision", default="")
     side = _dget(order, "売買方向", "side", default="")
-    entry = _dget(order, "エントリー価格", "entry", default=0)
-    tp = _dget(order, "利確（TP）", "take_profit", "tp", default=0)
-    sl = _dget(order, "損切（SL）", "stop_loss", "sl", default=0)
-    horizon = _dget(order, "想定期間", "horizon", default="")
-    conf = _dget(order, "確信度", "confidence", default="")
-    method = _dget(order, "bundle_hint_jp", "order_bundle", "entry_price_kind_jp", default="")
-    rr = _dget(order, "rr_ratio", default="")
+    entry = _dget(order, "エントリー価格", "entry", default=0.0)
+    sl = _dget(order, "損切り価格", "stop_loss", default=0.0)
+    tp = _dget(order, "利確価格", "take_profit", default=0.0)
 
+    # order type / entry type
+    order_type = _dget(order, "注文種別", "decision", default="")  # STOP/LIMIT/MARKET/NO_TRADE
+    entry_type = _dget(order, "entry_type", "entry_type", default="")
+    if not entry_type:
+        # notes: ["entry_type=..."] 形式の互換
+        notes = order.get("notes") or []
+        if isinstance(notes, list):
+            for n in notes:
+                if isinstance(n, str) and n.startswith("entry_type="):
+                    entry_type = n.split("=", 1)[1].strip()
+                    break
 
-    gen = _dget(order, "生成経路", "generator_path", default="")
-
-
-    gen_map = {
-            "ai_strict": "AI(1回)",
-            "ai": "AI",
-            "ai_retry": "AI再生成",
-            "ai_retry_failed": "AI再生成(失敗)",
-            "numeric_fallback": "数値フォールバック",
-            "numeric_fallback_failed": "数値フォールバック(失敗)",
-            "numeric_fallback_blocked": "数値フォールバック(ブロック)",
-            "error": "エラー",
-    }
-    gen_disp = gen_map.get(str(gen), str(gen)) if gen else ""
-
+    ev = _dget(order, "expected_R_ev", "expected_R_ev", default=None)
+    pwin = _dget(order, "p_win_ev", "p_win_ev", default=None)
+    conf = _dget(order, "信頼度", "confidence", default=None)
     why = _dget(order, "理由", "why", default="")
-    regime = _dget(order, "相場モード", "market_regime", default="")
-    regime_why = _dget(order, "モード理由", "regime_why", default="")
 
-    head = f"{title}"
-    if pair_name:
-        head += f"（{pair_name}）"
-    st.subheader(head)
+    st.markdown(f"### {title}" + (f"（{pair_name}）" if pair_name else ""))
 
-    if str(decision) in ["取引", "TRADE"]:
-        st.success(f"✅ 判定: {decision} / 方向: {side} / 期間: {horizon} / 確信度: {conf}" + (f" / 生成: {gen_disp}" if gen_disp else ""))
-    else:
-        st.warning(f"⛔ 判定: {decision} / 方向: {side} / 期間: {horizon} / 確信度: {conf}" + (f" / 生成: {gen_disp}" if gen_disp else ""))
+    # ---- TOP AUTO PANEL ----
+    box = st.container()
+    with box:
+        c1, c2, c3, c4 = st.columns(4)
+        # 判定
+        with c1:
+            st.metric("判定", str(decision))
+        # EV
+        with c2:
+            if ev is None or ev == "":
+                st.metric("期待値EV(R)", "—")
+            else:
+                st.metric("期待値EV(R)", f"{float(ev):+.3f}")
+        # 勝率(参考)
+        with c3:
+            if pwin is None or pwin == "":
+                st.metric("勝率(参考)", "—")
+            else:
+                st.metric("勝率(参考)", f"{float(pwin)*100:.1f}%")
+        # 信頼度
+        with c4:
+            if conf is None or conf == "":
+                st.metric("信頼度", "—")
+            else:
+                st.metric("信頼度", f"{float(conf):.2f}")
 
-    try:
-        entry_f = float(entry)
-        tp_f = float(tp)
-        sl_f = float(sl)
-        rr_f = float(rr) if rr not in ("", None) else None
-        line = f"**エントリー**: {entry_f:.3f} / **利確TP**: {tp_f:.3f} / **損切SL**: {sl_f:.3f}  \\n**注文方式**: {method}"
-        if rr_f is not None:
-            line += f" / **RR**: {rr_f:.2f}"
-        st.markdown(line)
-    except Exception:
-        st.markdown(f"**エントリー**: {entry} / **TP**: {tp} / **SL**: {sl}  \\n**注文方式**: {method}")
+        if str(decision).upper() != "NO_TRADE":
+            # エントリー情報を最上段に明示
+            st.success("✅ エントリー候補（AUTO）")
+            cc1, cc2, cc3, cc4 = st.columns(4)
+            with cc1:
+                st.metric("売買", str(side))
+            with cc2:
+                st.metric("注文形式", str(order_type))
+            with cc3:
+                st.metric("エントリー種別", str(entry_type or "—"))
+            with cc4:
+                st.metric("エントリー価格", f"{float(entry):.3f}")
+            cc5, cc6 = st.columns(2)
+            with cc5:
+                st.metric("損切り(SL)", f"{float(sl):.3f}" if sl else "—")
+            with cc6:
+                st.metric("利確(TP)", f"{float(tp):.3f}" if tp else "—")
+        else:
+            st.warning("⛔ 見送り（NO_TRADE）")
+            if why:
+                st.write(f"**理由:** {why}")
 
-    if why:
-        w = str(why).strip()
-        if len(w) > 220:
-            w = w[:220] + " …"
-        st.caption(f"理由: {w}")
+        # ---- EV breakdown (contribs) ----
+        contribs = order.get("ev_contribs")
+        if isinstance(contribs, dict) and contribs:
+            try:
+                import plotly.graph_objects as go
+                states = list(contribs.keys())
+                vals = [float(contribs[s]) for s in states]
+                fig = go.Figure(data=[go.Bar(x=states, y=vals)])
+                fig.update_layout(
+                    title="EV内訳（P(state) × mean_R）: どの状態がEVを押し上げ/潰しているか",
+                    xaxis_title="state",
+                    yaxis_title="contribution (R)",
+                    height=280,
+                    margin=dict(l=20, r=20, t=40, b=20),
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            except Exception:
+                pass
 
-    if regime or regime_why:
-        with st.expander("相場モード（参考）"):
-            if regime:
-                st.write(f"相場モード: {regime}")
-            if regime_why:
-                st.write(regime_why)
+    # ---- existing compact summary (kept for backward compatibility) ----
+    if str(decision).upper() != "NO_TRADE":
+        st.markdown("#### 実行ポイント（要点）")
+        st.write(
+            f"- **売買**: {side} / **注文**: {order_type} / **種別**: {entry_type or '—'}
+"
+            f"- **Entry**: {float(entry):.3f} / **SL**: {float(sl):.3f} / **TP**: {float(tp):.3f}"
+        )
+
+    # show raw (optional)
+    with st.expander("詳細（JSON）"):
+        st.json(order)
 
 def render_alt_summary(alt: dict, title: str = "🔁 代替ペア提案サマリー"):
     if not isinstance(alt, dict):
