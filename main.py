@@ -10,6 +10,16 @@ import os
 from datetime import datetime, timedelta, date
 import pytz
 import logic  # ← logic.pyが必要
+# --- Ver1 追加モジュール（無くても落ちない） ---
+try:
+    import data_layer  # 外部データ取得層
+except Exception:
+    data_layer = None
+try:
+    import backtest_ev_v1  # EVバックテスト
+except Exception:
+    backtest_ev_v1 = None
+
 
 # --- 起動時セルフチェック（logic.pyの差し替えミスを即検知） ---
 _REQUIRED_LOGIC = [
@@ -579,6 +589,98 @@ except Exception:
     default_key = ""
 api_key = st.sidebar.text_input("Gemini API Key", value=default_key, type="password")
 
+# ============================================================
+# ✅ Ver1: 外部データ取得層 + EV意思決定エンジン設定（全部入り）
+# - 「必要なら」ではなく常時追加機能として実装
+# - キー未設定でも落ちない（該当特徴量は0フォールバック）
+# ============================================================
+st.sidebar.markdown("---")
+st.sidebar.subheader("🧠 Ver1: 統合AI状態確率×期待値(EV)")
+
+# Secretsからデフォルト読込
+def _secret_get(key: str, default: str = "") -> str:
+    try:
+        v = st.secrets.get(key, default)
+        return str(v) if v is not None else str(default)
+    except Exception:
+        return str(default)
+
+V1_TRADING_ECONOMICS_KEY = st.sidebar.text_input(
+    "TradingEconomics API Key（経済指標: CPI/NFP等）",
+    value=_secret_get("TRADING_ECONOMICS_KEY", ""),
+    type="password"
+)
+V1_FRED_API_KEY = st.sidebar.text_input(
+    "FRED API Key（金利差: 米10Y-日10Y）",
+    value=_secret_get("FRED_API_KEY", ""),
+    type="password"
+)
+
+V1_DECISION_ENGINE_UI = st.sidebar.selectbox(
+    "意思決定エンジン（Ver1）",
+    ["HYBRID（EVゲート＋従来AI）", "EV_V1（数値のみ・AI無し）", "LLM_ONLY（従来のみ）"],
+    index=0,
+    help="HYBRID推奨: EVが悪い時は取引停止。EVが良い時だけ従来AI案を採用/補強。"
+)
+V1_MIN_EXPECTED_R = st.sidebar.slider(
+    "EV閾値（min expected R）",
+    0.0, 1.0, 0.10, 0.01,
+    help="EV=Σ(P(state)×mean_R(state)) がこの値未満なら NO_TRADE。"
+)
+V1_HORIZON_DAYS = st.sidebar.number_input(
+    "EV horizon（日数）",
+    min_value=1, max_value=20, value=5, step=1,
+    help="状態別mean_R推定の将来リターン計測日数。"
+)
+V1_SHOW_EXTERNAL_META = st.sidebar.checkbox(
+    "外部データ取得メタを表示（デバッグ）",
+    value=False
+)
+
+if "HYBRID" in V1_DECISION_ENGINE_UI:
+    V1_DECISION_ENGINE = "HYBRID"
+elif "EV_V1" in V1_DECISION_ENGINE_UI:
+    V1_DECISION_ENGINE = "EV_V1"
+else:
+    V1_DECISION_ENGINE = "LLM_ONLY"
+
+V1_KEYS = {
+    "TRADING_ECONOMICS_KEY": (V1_TRADING_ECONOMICS_KEY or "").strip(),
+    "FRED_API_KEY": (V1_FRED_API_KEY or "").strip(),
+}
+st.session_state["v1_keys"] = V1_KEYS
+st.session_state["v1_decision_engine"] = V1_DECISION_ENGINE
+st.session_state["v1_min_expected_R"] = float(V1_MIN_EXPECTED_R)
+st.session_state["v1_horizon_days"] = int(V1_HORIZON_DAYS)
+st.session_state["v1_show_external_meta"] = bool(V1_SHOW_EXTERNAL_META)
+
+def _v1_inject_ctx(ctx: dict, pair_label: str = None) -> dict:
+    """既存ctxにVer1設定を注入（後方互換のため追加のみ）。"""
+    if not isinstance(ctx, dict):
+        return ctx
+    ctx["decision_engine"] = V1_DECISION_ENGINE
+    ctx["min_expected_R"] = float(V1_MIN_EXPECTED_R)
+    ctx["horizon_days"] = int(V1_HORIZON_DAYS)
+    ctx["keys"] = V1_KEYS
+    pl = pair_label or ctx.get("pair_label") or ctx.get("pair") or ctx.get("ticker_label")
+    if pl:
+        try:
+            pl = _normalize_pair_label(pl)
+        except Exception:
+            pass
+        ctx["pair_label"] = pl
+        # pair_symbol を付与（無くてもロジック側でフォールバック）
+        try:
+            sym = None
+            if hasattr(logic, "PAIR_MAP"):
+                sym = logic.PAIR_MAP.get(pl)
+            if sym:
+                ctx["pair_symbol"] = sym
+        except Exception:
+            pass
+    return ctx
+
+
 
 # --- シャドー比較（Gemini vs GPT） ---
 # 現運用では比較・検証UIを外し、通常運用を軽量化（ユーザー指示）。
@@ -594,7 +696,7 @@ st.sidebar.subheader("💰 SBI FX 資金管理")
 # 1. 資金管理入力
 capital = st.sidebar.number_input("軍資金 (JPY)", value=300000, step=10000)
 risk_percent = st.sidebar.slider(
-    "1トレード許容損失 (%)", 1.0, 10.0, 2.0,
+    "1トレード許容損失 (%)", 1.0, 10.0, 4.0,
     help="1回の想定最大損失%（表示基準）。固定1枚では守れないことがあるので、実質リスク%も併記します。"
 )
 # ✅ ここはあなたの新機能で参照しているので、UI側でも定義しておく（削除ではなく追加）
@@ -624,6 +726,17 @@ prefer_pullback_limit = st.sidebar.checkbox(
     help="AI案が遠い/損切幅が広い場合に、押し目LIMIT/確認後成行の代替案を自動生成して採用します。"
 )
 
+
+# =========================
+# 📅 毎日監視: デイリー判断（サイドバーから実行）
+# =========================
+st.sidebar.markdown("---")
+st.sidebar.subheader("📅 デイリー判断（毎日運用）")
+btn_daily_sidebar = st.sidebar.button(
+    "今日の市場判断（デイリー）",
+    key="btn_daily_plan_sidebar",
+    help="週縛りを外し、日足の状態遷移(TREND/RANGE)で今日の注文案を作成します。結果はメイン画面に表示＆JSON保存/ダウンロード可能。"
+)
 # ✅【追加】過去検証（紙トレ/回数見積もり）
 st.sidebar.markdown("---")
 
@@ -2114,7 +2227,7 @@ ctx = {
     "trade_type": trade_type
 }
 
-tab1, tab2, tab3 = st.tabs(["📊 詳細レポート", "📝 注文戦略(日/週)", "💰 長期/ポートフォリオ"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 詳細レポート", "📝 注文戦略(日/週)", "💰 長期/ポートフォリオ", "🌐 外部データ(Ver1)", "🧪 EVバックテスト(Ver1)"])
 
 with tab1:
     if st.button("✨ レポート生成 (五十日/選挙対応)"):
@@ -2153,17 +2266,25 @@ with tab2:
         key="btn_daily_plan",
         help="週縛りを外し、日足の状態遷移(TREND/RANGE)で今日の注文案を作成します。価格は数値ロジック、AIはveto/説明のみ。"
     )
-    if btn_daily:
+    if btn_daily or btn_daily_sidebar:
         try:
             ctx_daily = dict(ctx)
+            # デイリー用に必須パラメータを明示的に付与
+            ctx_daily["weekly_dd_cap_percent"] = float(weekly_dd_cap_percent)
+            ctx_daily["max_risk_percent_cap"] = float(max_risk_percent_cap)
+            ctx_daily["fixed_1lot_mode"] = bool(fixed_1lot_mode)
+            ctx_daily["prefer_pullback_limit"] = bool(prefer_pullback_limit)
+            ctx_daily["risk_percent_per_trade"] = float(risk_percent)
+            ctx_daily["capital_jpy"] = float(capital)
             # df_daily がローカルにある場合は載せる
             if "df_daily" in locals():
                 ctx_daily["df_daily"] = df_daily
             # デフォ: 上限8%（機会損失を減らす）
-            max_risk = float(st.session_state.get("max_risk_pct", 8.0) or 8.0)
+            max_risk = float(max_risk_percent_cap or 8.0)
             if hasattr(logic, "get_daily_order_strategy"):
                 plan = logic.get_daily_order_strategy(api_key, ctx_daily, max_risk_pct=max_risk)
             else:
+                _v1_inject_ctx(ctx_daily, best_pair)
                 plan = logic.get_ai_order_strategy(api_key, ctx_daily)
             st.session_state["last_daily_plan"] = plan
             st.success("✅ デイリー判断を作成しました")
@@ -2206,6 +2327,7 @@ with tab2:
                     ctx["last_report"] = st.session_state.last_ai_report
                     ctx["panel_short"] = diag['short']['status'] if diag else "不明"
                     ctx["panel_mid"] = diag['mid']['status'] if diag else "不明"
+                    _v1_inject_ctx(ctx, best_pair)
                     base_strategy = logic.get_ai_order_strategy(api_key, ctx, generation_policy=gen_policy)
                     # --- シャドー比較（Gemini vs GPT）: Gemini出力(base_strategy)とOpenAI出力を同条件で比較 ---
                     if shadow_enabled:
@@ -2548,6 +2670,7 @@ with tab2:
                     if not alt_ctx.get("_pair_ctx_ok"):
                         st.warning("⚠️ 代替ペアの最新テクニカル（RSI/ATR等）が取得できませんでした。精度が落ちるため、原則ノートレ推奨です。")
                     df_alt = _get_df_for_pair(best_pair, us10y_raw)
+                    _v1_inject_ctx(alt_ctx, alt_ctx.get('pair_label') or best_pair)
                     base_strategy = logic.get_ai_order_strategy(api_key, alt_ctx, generation_policy='AUTO_HIERARCHY')
                     # --- シャドー比較（代替ペア） ---
                     if shadow_enabled and hasattr(logic, "get_ai_order_strategy_shadow_openai") and openai_api_key_shadow:
@@ -2799,3 +2922,89 @@ with tab3:
                 }))
         except Exception:
             pass
+
+# ============================================================
+# ✅ Ver1 追加タブ: 外部データ可視化 / EVバックテスト
+# ============================================================
+with tab4:
+    st.subheader("🌐 外部データ（Ver1）")
+    st.caption("ニュース(GDELT) / 経済指標(TradingEconomics) / 金利差(FRED) / COT(CFTC) を取得してVer1へ直結します。キー未設定でも落ちません。")
+    pair_for_ext = st.session_state.get("chart_pair_label") or "USD/JPY (ドル円)"
+    try:
+        pair_for_ext = _normalize_pair_label(str(pair_for_ext))
+    except Exception:
+        pair_for_ext = "USD/JPY (ドル円)"
+    st.write("対象ペア:", pair_for_ext)
+
+    v1_keys = st.session_state.get("v1_keys", {}) if isinstance(st.session_state.get("v1_keys", {}), dict) else {}
+    if data_layer is None:
+        st.error("data_layer.py が読み込めません。リポジトリ直下に data_layer.py を追加してください。")
+    else:
+        with st.spinner("外部データ取得中..."):
+            feats, meta = data_layer.fetch_external_features(pair_for_ext, keys=v1_keys)
+
+        cols = st.columns(3)
+        cols[0].metric("news_sentiment", f"{feats.get('news_sentiment', 0.0):+.3f}")
+        cols[1].metric("rate_diff_change", f"{feats.get('rate_diff_change', 0.0):+.3f}")
+        cols[2].metric("COT leveraged net / OI", f"{feats.get('cot_leveraged_net_pctoi', 0.0):+.3f}")
+
+        cols2 = st.columns(3)
+        cols2[0].metric("cpi_surprise", f"{feats.get('cpi_surprise', 0.0):+.3f}")
+        cols2[1].metric("nfp_surprise", f"{feats.get('nfp_surprise', 0.0):+.3f}")
+        cols2[2].metric("COT asset net / OI", f"{feats.get('cot_asset_net_pctoi', 0.0):+.3f}")
+
+        st.markdown("#### 取得結果（raw）")
+        st.json(feats)
+
+        if st.session_state.get("v1_show_external_meta", False):
+            st.markdown("#### 取得メタ（デバッグ）")
+            st.json(meta)
+
+with tab5:
+    st.subheader("🧪 EVバックテスト（Ver1）")
+    st.caption("これは“簡易ウォークフォワード検証”です。スプレッド/スリップ/指値到達率などの厳密約定は未反映です（Ver2で強化）。")
+    if backtest_ev_v1 is None:
+        st.error("backtest_ev_v1.py が読み込めません。リポジトリ直下に backtest_ev_v1.py を追加してください。")
+    else:
+        # ペア選択
+        pair_labels = list(getattr(logic, "PAIR_MAP", {}).keys()) or ["USD/JPY (ドル円)"]
+        bt_pair_label = st.selectbox("バックテスト対象ペア", pair_labels, index=0)
+        bt_pair_label = _normalize_pair_label(bt_pair_label)
+        bt_symbol = getattr(logic, "PAIR_MAP", {}).get(bt_pair_label, "JPY=X")
+
+        c1, c2, c3, c4 = st.columns(4)
+        bt_period = c1.selectbox("期間", ["10y", "5y", "max"], index=0)
+        bt_horizon_days = c2.number_input("horizon_days", min_value=1, max_value=20, value=int(st.session_state.get("v1_horizon_days", 5)), step=1)
+        bt_train_years = c3.number_input("train_years", min_value=1, max_value=8, value=3, step=1)
+        bt_test_months = c4.number_input("test_months", min_value=1, max_value=12, value=6, step=1)
+
+        bt_min_ev = st.slider("min_expected_R (EV閾値)", 0.0, 1.0, float(st.session_state.get("v1_min_expected_R", 0.10)), 0.01)
+
+        run_bt = st.button("バックテスト実行（簡易WFA）", key="run_ev_backtest_v1")
+        if run_bt:
+            with st.spinner("yfinance取得 + WFA計算中..."):
+                wf_df, summ = backtest_ev_v1.run_backtest(
+                    pair_symbol=bt_symbol,
+                    period=bt_period,
+                    horizon_days=int(bt_horizon_days),
+                    train_years=int(bt_train_years),
+                    test_months=int(bt_test_months),
+                    min_expected_R=float(bt_min_ev),
+                )
+
+            st.markdown("### Summary")
+            st.json(summ)
+
+            st.markdown("### Walk-Forward details")
+            st.dataframe(wf_df, use_container_width=True)
+
+            try:
+                csv_bytes = wf_df.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "CSVダウンロード",
+                    data=csv_bytes,
+                    file_name=f"ev_wfa_{bt_pair_label.replace('/','_')}.csv",
+                    mime="text/csv"
+                )
+            except Exception:
+                pass
