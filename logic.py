@@ -1,18 +1,11 @@
 # logic.py
 from __future__ import annotations
 
-import os
+from typing import Dict, Any, Tuple
 import math
-import time
-import json
-from typing import Dict, Any, Tuple, Optional
 
 import pandas as pd
 
-try:
-    import data_layer  # type: ignore
-except Exception:
-    data_layer = None  # type: ignore
 
 PAIR_MAP = {
     "USD/JPY": "JPY=X",
@@ -24,408 +17,269 @@ PAIR_MAP = {
     "AUD/JPY": "AUDJPY=X",
 }
 
+
 def _clamp(x: float, lo: float, hi: float) -> float:
     return lo if x < lo else hi if x > hi else x
 
+
 def _softmax(logits: Dict[str, float]) -> Dict[str, float]:
-    mx = max(logits.values())
-    exps = {k: math.exp(v - mx) for k, v in logits.items()}
+    m = max(logits.values())
+    exps = {k: math.exp(v - m) for k, v in logits.items()}
     s = sum(exps.values()) or 1.0
     return {k: exps[k] / s for k in exps}
 
-def _safe_float(x: Any, default: float = 0.0) -> float:
-    try:
-        if x is None:
-            return default
-        return float(x)
-    except Exception:
-        return default
 
-def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
+def compute_indicators(df: pd.DataFrame) -> Dict[str, float]:
+    if df is None or df.empty:
+        return {
+            "sma25": 0.0, "sma75": 0.0, "rsi": 50.0, "atr": 0.0,
+            "recent_high20": 0.0, "recent_low20": 0.0,
+            "atr_ratio": 0.0, "trend_strength": 0.0,
+        }
+
     d = df.copy()
-    if d is None or d.empty:
-        return {"atr": 0.0, "rsi": 50.0, "sma25": 0.0, "sma75": 0.0, "recent_high20": 0.0, "recent_low20": 0.0}
-
     if isinstance(d.columns, pd.MultiIndex):
         d.columns = [c[0] for c in d.columns]
-
     for c in ["Open", "High", "Low", "Close"]:
         if c not in d.columns:
-            raise ValueError("price df missing columns")
+            return {
+                "sma25": 0.0, "sma75": 0.0, "rsi": 50.0, "atr": 0.0,
+                "recent_high20": 0.0, "recent_low20": 0.0,
+                "atr_ratio": 0.0, "trend_strength": 0.0,
+            }
 
     d = d[["Open", "High", "Low", "Close"]].dropna()
-    d["SMA_25"] = d["Close"].rolling(25).mean()
-    d["SMA_75"] = d["Close"].rolling(75).mean()
-
-    delta = d["Close"].diff()
-    gain = (delta.where(delta > 0, 0.0)).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0.0)).rolling(14).mean()
-    rs = gain / loss.replace(0, float("nan"))
-    d["RSI"] = 100 - (100 / (1 + rs))
-
-    hl = d["High"] - d["Low"]
-    hc = (d["High"] - d["Close"].shift()).abs()
-    lc = (d["Low"] - d["Close"].shift()).abs()
-    d["TR"] = pd.concat([hl, hc, lc], axis=1).max(axis=1)
-    d["ATR"] = d["TR"].rolling(14).mean()
-
-    d = d.dropna()
     if d.empty:
-        return {"atr": 0.0, "rsi": 50.0, "sma25": 0.0, "sma75": 0.0, "recent_high20": 0.0, "recent_low20": 0.0}
-
-    last = d.iloc[-1]
-    recent = d.iloc[-20:] if len(d) >= 20 else d
-    return {
-        "atr": float(last["ATR"]),
-        "rsi": float(last["RSI"]),
-        "sma25": float(last["SMA_25"]),
-        "sma75": float(last["SMA_75"]),
-        "recent_high20": float(recent["High"].max()),
-        "recent_low20": float(recent["Low"].min()),
-    }
-
-def ensure_external_features(ctx: Dict[str, Any]) -> Tuple[Dict[str, float], Dict[str, Any]]:
-    pair_label = str(ctx.get("pair_label") or ctx.get("pair") or "USD/JPY")
-    keys = ctx.get("keys") or {}
-    if not isinstance(keys, dict):
-        keys = {}
-
-    if data_layer is None or not hasattr(data_layer, "fetch_external_features"):
-        feats = {
-            "news_sentiment": 0.0,
-            "cpi_surprise": 0.0,
-            "nfp_surprise": 0.0,
-            "rate_diff_change": 0.0,
-            "cot_leveraged_net_pctoi": 0.0,
-            "cot_asset_net_pctoi": 0.0,
+        return {
+            "sma25": 0.0, "sma75": 0.0, "rsi": 50.0, "atr": 0.0,
+            "recent_high20": 0.0, "recent_low20": 0.0,
+            "atr_ratio": 0.0, "trend_strength": 0.0,
         }
-        meta = {"ok": False, "error": "data_layer_unavailable"}
-        ctx.update(feats)
-        ctx["external_meta"] = meta
-        return feats, meta
 
-    try:
-        feats, meta = data_layer.fetch_external_features(pair_label, keys=keys)  # type: ignore[attr-defined]
-    except Exception as e:
-        feats = {
-            "news_sentiment": 0.0,
-            "cpi_surprise": 0.0,
-            "nfp_surprise": 0.0,
-            "rate_diff_change": 0.0,
-            "cot_leveraged_net_pctoi": 0.0,
-            "cot_asset_net_pctoi": 0.0,
-        }
-        meta = {"ok": False, "error": f"fetch_failed:{type(e).__name__}", "detail": str(e)}
+    close = d["Close"]
+    high = d["High"]
+    low = d["Low"]
 
-    ctx.update(feats)
-    ctx["external_meta"] = meta
-    return feats, meta
+    sma25 = close.rolling(25).mean()
+    sma75 = close.rolling(75).mean()
 
-_STATE_NAMES = ("trend_up", "trend_down", "range", "risk_off")
-
-def get_state_probabilities_v1(ctx: Dict[str, Any]) -> Dict[str, float]:
-    price = max(_safe_float(ctx.get("price"), 0.0), 1e-9)
-    atr = max(_safe_float(ctx.get("atr"), 0.0), 1e-9)
-    rsi = _safe_float(ctx.get("rsi"), 50.0)
-    sma25 = _safe_float(ctx.get("sma25"), price)
-    sma75 = _safe_float(ctx.get("sma75"), price)
-
-    news = _safe_float(ctx.get("news_sentiment"), 0.0)
-    cpi = _safe_float(ctx.get("cpi_surprise"), 0.0)
-    nfp = _safe_float(ctx.get("nfp_surprise"), 0.0)
-    spread_chg = _safe_float(ctx.get("rate_diff_change"), 0.0)
-    cot_lev = _safe_float(ctx.get("cot_leveraged_net_pctoi"), 0.0)
-    cot_ast = _safe_float(ctx.get("cot_asset_net_pctoi"), 0.0)
-
-    slope = (sma25 - sma75) / price
-    trend_strength = abs(sma25 - sma75) / atr
-    atr_ratio = atr / price
-    macro = _clamp((cpi + nfp) / 10.0, -2.0, 2.0) + _clamp(spread_chg, -2.0, 2.0)
-
-    risk_off = 0.0
-    risk_off += _clamp((atr_ratio - 0.010) * 80.0, -2.0, 2.0) * 0.35
-    risk_off += _clamp((-news) * 2.0, -2.0, 2.0) * 0.35
-    risk_off += _clamp((-cot_lev) * 2.0, -2.0, 2.0) * 0.20
-    risk_off += _clamp((-cot_ast) * 2.0, -2.0, 2.0) * 0.10
-
-    range_bias = _clamp((1.3 - trend_strength), -2.0, 2.0) + _clamp((0.010 - atr_ratio) * 50.0, -2.0, 2.0)
-
-    logits = {
-        "trend_up":  1.7 * slope + 0.22 * ((rsi - 50.0) / 10.0) + 0.18 * trend_strength + 0.18 * macro + 0.15 * news - 0.55 * risk_off,
-        "trend_down": -1.7 * slope + 0.22 * ((50.0 - rsi) / 10.0) + 0.18 * trend_strength - 0.18 * macro - 0.15 * news + 0.55 * risk_off,
-        "range": 0.85 * range_bias - 0.40 * trend_strength - 0.15 * abs(macro),
-        "risk_off": 0.95 * risk_off + 0.10 * abs(macro),
-    }
-    probs = _softmax(logits)
-    for k in _STATE_NAMES:
-        probs.setdefault(k, 0.0)
-    s = sum(probs.values()) or 1.0
-    return {k: float(probs[k] / s) for k in probs}
-
-_STATE_STATS_MEM: Dict[str, Tuple[float, Dict[str, Any]]] = {}
-
-def _stats_key(symbol: str, horizon_days: int) -> str:
-    return f"{symbol}::h{int(horizon_days)}"
-
-def _stats_path(symbol: str, horizon_days: int) -> str:
-    os.makedirs("cache", exist_ok=True)
-    safe = symbol.replace("=", "_").replace("^", "_")
-    return os.path.join("cache", f"ev_state_stats_{safe}_h{int(horizon_days)}.json")
-
-def _load_stats(symbol: str, horizon_days: int) -> Optional[Dict[str, Any]]:
-    p = _stats_path(symbol, horizon_days)
-    if not os.path.exists(p):
-        return None
-    try:
-        with open(p, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
-
-def _save_stats(symbol: str, horizon_days: int, stats: Dict[str, Any]) -> None:
-    p = _stats_path(symbol, horizon_days)
-    try:
-        with open(p, "w", encoding="utf-8") as f:
-            json.dump(stats, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-def _compute_stats_yfinance(symbol: str, horizon_days: int, period: str = "10y") -> Dict[str, Any]:
-    import yfinance as yf
-    df = yf.Ticker(symbol).history(period=period, interval="1d")
-    if df is None or df.empty:
-        return {st: {"mean_R": 0.0, "p_win": 0.0, "n": 0} for st in _STATE_NAMES}
-    d = df.copy()
-    if isinstance(d.columns, pd.MultiIndex):
-        d.columns = [c[0] for c in d.columns]
-    d = d[["Open","High","Low","Close"]].dropna()
-    d["SMA_25"] = d["Close"].rolling(25).mean()
-    d["SMA_75"] = d["Close"].rolling(75).mean()
-
-    delta = d["Close"].diff()
+    delta = close.diff()
     gain = (delta.where(delta > 0, 0.0)).rolling(14).mean()
     loss = (-delta.where(delta < 0, 0.0)).rolling(14).mean()
-    rs = gain / loss.replace(0, float("nan"))
-    d["RSI"] = 100 - (100 / (1 + rs))
+    rs = gain / loss.replace(0, pd.NA)
+    rsi = 100 - (100 / (1 + rs))
+    rsi = rsi.fillna(50.0)
 
-    hl = d["High"] - d["Low"]
-    hc = (d["High"] - d["Close"].shift()).abs()
-    lc = (d["Low"] - d["Close"].shift()).abs()
-    d["TR"] = pd.concat([hl, hc, lc], axis=1).max(axis=1)
-    d["ATR"] = d["TR"].rolling(14).mean()
+    hl = high - low
+    hc = (high - close.shift()).abs()
+    lc = (low - close.shift()).abs()
+    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+    atr = tr.rolling(14).mean()
 
-    d = d.dropna()
-    d["fwd_ret"] = d["Close"].shift(-horizon_days) / d["Close"] - 1.0
-    d["R"] = d["fwd_ret"] / (d["ATR"] / d["Close"]).replace(0, float("nan"))
-    d = d.dropna(subset=["R"])
+    price = float(close.iloc[-1])
+    atr_v = float(atr.iloc[-1]) if pd.notna(atr.iloc[-1]) else 0.0
+    sma25_v = float(sma25.iloc[-1]) if pd.notna(sma25.iloc[-1]) else price
+    sma75_v = float(sma75.iloc[-1]) if pd.notna(sma75.iloc[-1]) else price
+    rsi_v = float(rsi.iloc[-1]) if pd.notna(rsi.iloc[-1]) else 50.0
 
-    states=[]
-    for _, row in d.iterrows():
-        c = {"price": float(row["Close"]), "atr": float(row["ATR"]), "rsi": float(row["RSI"]), "sma25": float(row["SMA_25"]), "sma75": float(row["SMA_75"])}
-        pr = get_state_probabilities_v1(c)
-        states.append(max(pr, key=pr.get))
-    d["state"] = states
+    recent_high20 = float(high.tail(20).max())
+    recent_low20 = float(low.tail(20).min())
 
-    out={}
-    for st in _STATE_NAMES:
-        sub = d[d["state"] == st]
-        if sub.empty:
-            out[st] = {"mean_R": 0.0, "p_win": 0.0, "n": 0}
-        else:
-            out[st] = {"mean_R": float(sub["R"].mean()), "p_win": float((sub["R"] > 0).mean()), "n": int(len(sub))}
-    return out
+    eps = 1e-9
+    atr_ratio = atr_v / max(price, eps)
+    trend_strength = abs(sma25_v - sma75_v) / max(atr_v, eps) if atr_v > 0 else 0.0
 
-def ensure_state_stats(symbol: str, horizon_days: int, ttl_sec: int = 72 * 3600) -> Dict[str, Any]:
-    symbol = str(symbol or "JPY=X")
-    horizon_days = int(horizon_days or 5)
-    key = _stats_key(symbol, horizon_days)
-    now = time.time()
-
-    if key in _STATE_STATS_MEM:
-        exp, stats = _STATE_STATS_MEM[key]
-        if now <= exp:
-            return stats
+    return {
+        "sma25": sma25_v,
+        "sma75": sma75_v,
+        "rsi": rsi_v,
+        "atr": atr_v,
+        "recent_high20": recent_high20,
+        "recent_low20": recent_low20,
+        "atr_ratio": float(atr_ratio),
+        "trend_strength": float(trend_strength),
+    }
 
 
-def apply_state_stats_smoothing(stats: Dict[str, Any], min_n: int = 30) -> Dict[str, Any]:
-    """For small sample states, shrink mean_R toward 0 to avoid EV overreacting."""
-    if not isinstance(stats, dict):
-        return {}
-    out: Dict[str, Any] = {}
-    for st, s in stats.items():
-        if not isinstance(s, dict):
-            continue
-        n = int(s.get("n", 0) or 0)
-        mean_R = float(s.get("mean_R", 0.0) or 0.0)
-        if n <= 0:
-            mean_adj = 0.0
-        else:
-            w = min(1.0, max(0.0, n / float(min_n)))
-            mean_adj = mean_R * w
-        out[st] = {**s, "mean_R_adj": float(mean_adj), "shrink_w": float(min(1.0, max(0.0, n / float(min_n))) if n>0 else 0.0)}
-    return out
+def _state_probs(ctx: Dict[str, Any]) -> Dict[str, float]:
+    price = float(ctx.get("price") or 0.0)
+    sma25 = float(ctx.get("sma25") or price)
+    sma75 = float(ctx.get("sma75") or price)
+    rsi = float(ctx.get("rsi") or 50.0)
+    atr_ratio = float(ctx.get("atr_ratio") or 0.0)
+    trend_strength = float(ctx.get("trend_strength") or 0.0)
+
+    news = float(ctx.get("news_sentiment") or 0.0)
+    cpi = float(ctx.get("cpi_surprise") or 0.0)
+    nfp = float(ctx.get("nfp_surprise") or 0.0)
+    rate = float(ctx.get("rate_diff_change") or 0.0)
+
+    up = 0.0
+    down = 0.0
+    rng = 0.0
+    risk = 0.0
+
+    ma_spread = (sma25 - sma75) / max(price, 1e-9)
+    up += 6.0 * ma_spread + 0.03 * (rsi - 50.0) + 0.6 * trend_strength
+    down += -6.0 * ma_spread + 0.03 * (50.0 - rsi) + 0.6 * trend_strength
+
+    rng += -1.2 * trend_strength + 0.02 * (1.0 - abs(rsi - 50.0) / 50.0)
+
+    risk += 80.0 * atr_ratio + 0.8 * abs(rate) - 0.3 * news
+    risk += 0.02 * (abs(cpi) + abs(nfp))
+
+    return _softmax({"trend_up": up, "trend_down": down, "range": rng, "risk_off": risk})
 
 
-    stats = _load_stats(symbol, horizon_days)
-    if isinstance(stats, dict) and stats:
-        _STATE_STATS_MEM[key] = (now + ttl_sec, stats)
-        return stats
-
-    stats = _compute_stats_yfinance(symbol, horizon_days, period="10y")
-    _STATE_STATS_MEM[key] = (now + ttl_sec, stats)
-    _save_stats(symbol, horizon_days, stats)
-    return stats
-
-def compute_ev(probs: Dict[str, float], stats: Dict[str, Any]) -> Tuple[float, float]:
-    ev = 0.0
-    pwin = 0.0
-    for st, pr in probs.items():
-        s = stats.get(st, {}) if isinstance(stats, dict) else {}
-        mean_used = float(s.get("mean_R_adj", s.get("mean_R", 0.0)))
-        ev += float(pr) * mean_used
-        pwin += float(pr) * float(s.get("p_win", 0.0))
-    return float(ev), float(pwin)
+def _state_stats_ev_stub() -> Dict[str, Dict[str, float]]:
+    return {
+        "trend_up": {"mean_R": 0.08, "n": 120},
+        "trend_down": {"mean_R": 0.08, "n": 120},
+        "range": {"mean_R": 0.01, "n": 120},
+        "risk_off": {"mean_R": -0.10, "n": 60},
+    }
 
 
-def compute_ev_details(probs: Dict[str, float], stats: Dict[str, Any]) -> Tuple[float, float, Dict[str, float]]:
-    """Return (EV, p_win, contribs) where contribs[state] = P(state) * mean_R_used."""
-    ev = 0.0
-    pwin = 0.0
+def _shrink_mean_R(mean_R: float, n: float, n_ref: float = 30.0) -> float:
+    w = _clamp(float(n) / float(n_ref), 0.0, 1.0)
+    return float(mean_R) * w
+
+
+def _ev_from_probs(state_probs: Dict[str, float], state_stats: Dict[str, Dict[str, float]]) -> Tuple[float, Dict[str, float]]:
     contribs: Dict[str, float] = {}
-    for st, pr in probs.items():
-        s = stats.get(st, {}) if isinstance(stats, dict) else {}
-        mean_used = float(s.get("mean_R_adj", s.get("mean_R", 0.0)))
-        c = float(pr) * mean_used
-        contribs[str(st)] = float(c)
+    ev = 0.0
+    for st, p in state_probs.items():
+        stats = state_stats.get(st, {"mean_R": 0.0, "n": 0.0})
+        mean_R = float(stats.get("mean_R", 0.0))
+        n = float(stats.get("n", 0.0))
+        mean_R_adj = _shrink_mean_R(mean_R, n, n_ref=30.0)
+        c = float(p) * mean_R_adj
+        contribs[st] = c
         ev += c
-        pwin += float(pr) * float(s.get("p_win", 0.0))
-    return float(ev), float(pwin), contribs
+    return float(ev), contribs
 
 
-def build_ev_order_plan(ctx: Dict[str, Any], probs: Dict[str, float], stats: Dict[str, Any], horizon: str = "WEEK") -> Dict[str, Any]:
-    price = _safe_float(ctx.get("price"), 0.0)
-    atr = max(_safe_float(ctx.get("atr"), 0.0), 1e-9)
-    recent_high20 = _safe_float(ctx.get("recent_high20"), price)
-    recent_low20 = _safe_float(ctx.get("recent_low20"), price)
+def _pwin_from_probs(state_probs: Dict[str, float], state_stats: Dict[str, Dict[str, float]]) -> float:
+    pwin = 0.5
+    for st, p in state_probs.items():
+        mean_R = float(state_stats.get(st, {}).get("mean_R", 0.0))
+        pwin += float(p) * _clamp(mean_R, -0.2, 0.2) / 2.0
+    return float(_clamp(pwin, 0.05, 0.95))
 
-    ev, pwin, ev_contribs = compute_ev_details(probs, stats)
-    dom = max(probs, key=probs.get) if probs else "range"
-    min_ev = _safe_float(ctx.get("min_expected_R"), 0.10)
 
-    base = {"state_probs": probs, "expected_R_ev": ev, "p_win_ev": pwin, "ev_contribs": ev_contribs, "state_stats": stats, "external_meta": ctx.get("external_meta", {})}
+def _build_order(ctx: Dict[str, Any], state_probs: Dict[str, float], expected_R_ev: float) -> Dict[str, Any]:
+    price = float(ctx.get("price") or 0.0)
+    atr = float(ctx.get("atr") or 0.0)
+    rh = float(ctx.get("recent_high20") or price)
+    rl = float(ctx.get("recent_low20") or price)
 
-    if ev < min_ev:
-        return {**base, "decision": "NO_TRADE", "side": "NONE", "entry_type": "NONE", "entry": 0.0, "take_profit": 0.0, "stop_loss": 0.0,
-                "horizon": horizon, "confidence": float(max(probs.values()) if probs else 0.0),
-                "why": f"EV<{min_ev:.2f} のため見送り（expected_R={ev:.3f}）", "notes": [f"dominant_state={dom}"]}
+    dom = max(state_probs.items(), key=lambda kv: kv[1])[0]
 
-    decision = "NO_TRADE"; side = "NONE"
-    entry = tp = sl = 0.0
-    entry_type = "NONE"
+    order = {
+        "decision": "NO_TRADE",
+        "side": None,
+        "order_type": None,
+        "entry_type": None,
+        "entry": None,
+        "stop_loss": None,
+        "take_profit": None,
+    }
 
-    if dom == "trend_up":
-        side="BUY"; decision="STOP"; entry_type="BREAKOUT_STOP"
-        buf = 0.15 * atr
-        entry = max(price, recent_high20 + buf)
-        sl = max(recent_low20, entry - 1.2 * atr)
-        tp = entry + 2.0 * atr
-    elif dom == "trend_down":
-        side="SELL"; decision="STOP"; entry_type="BREAKOUT_STOP"
-        buf = 0.15 * atr
-        entry = min(price, recent_low20 - buf)
-        sl = min(recent_high20, entry + 1.2 * atr)
-        tp = entry - 2.0 * atr
-    elif dom == "range":
-        rng = max(recent_high20 - recent_low20, 1e-9)
-        if price <= recent_low20 + 0.35 * rng:
-            side="BUY"; decision="LIMIT"; entry_type="MEANREV_LIMIT"
-            entry = price - 0.10 * atr
-            sl = recent_low20 - 0.60 * atr
-            tp = min(recent_high20, entry + 1.20 * atr)
-        elif price >= recent_high20 - 0.35 * rng:
-            side="SELL"; decision="LIMIT"; entry_type="MEANREV_LIMIT"
-            entry = price + 0.10 * atr
-            sl = recent_high20 + 0.60 * atr
-            tp = max(recent_low20, entry - 1.20 * atr)
+    if dom == "risk_off":
+        return order
+
+    if expected_R_ev <= 0:
+        return order
+
+    if atr <= 0:
+        atr = max(price * 0.005, 0.0001)
+
+    if dom in ("trend_up", "trend_down"):
+        if dom == "trend_up":
+            side = "BUY"
+            entry = rh + 0.2 * atr
+            sl = entry - 1.5 * atr
+            tp = entry + 2.0 * atr
         else:
-            return {**base, "decision": "NO_TRADE", "side": "NONE", "entry_type": "NONE", "entry": 0.0, "take_profit": 0.0, "stop_loss": 0.0,
-                    "horizon": horizon, "confidence": float(max(probs.values()) if probs else 0.0),
-                    "why": "RANGE優勢だが価格がレンジ端に無い（逆張り優位性が弱い）", "notes": [f"dominant_state={dom}"]}
+            side = "SELL"
+            entry = rl - 0.2 * atr
+            sl = entry + 1.5 * atr
+            tp = entry - 2.0 * atr
+        order.update({
+            "decision": "TRADE",
+            "side": side,
+            "order_type": "STOP",
+            "entry_type": "BREAKOUT_STOP",
+            "entry": float(entry),
+            "stop_loss": float(sl),
+            "take_profit": float(tp),
+        })
+        return order
+
+    side = "BUY" if price <= (rl + rh) / 2.0 else "SELL"
+    if side == "BUY":
+        entry = rl + 0.2 * atr
+        sl = entry - 1.2 * atr
+        tp = entry + 1.5 * atr
     else:
-        return {**base, "decision": "NO_TRADE", "side": "NONE", "entry_type": "NONE", "entry": 0.0, "take_profit": 0.0, "stop_loss": 0.0,
-                "horizon": horizon, "confidence": float(max(probs.values()) if probs else 0.0),
-                "why": "risk_off優勢のため見送り（急変動局面を回避）", "notes": [f"dominant_state={dom}"]}
+        entry = rh - 0.2 * atr
+        sl = entry + 1.2 * atr
+        tp = entry - 1.5 * atr
 
-    conf = float(max(probs.values()) if probs else 0.0)
-    conf = float(_clamp(conf * (1.0 + _clamp(ev, -1.0, 1.0) * 0.25), 0.0, 0.99))
-    return {**base, "decision": decision, "side": side, "entry_type": entry_type, "entry": float(entry), "take_profit": float(tp), "stop_loss": float(sl),
-            "horizon": horizon, "confidence": conf, "why": f"EVベース決定: dominant={dom} / expected_R={ev:.3f} / p_win={pwin:.3f}",
-            "notes": [f"entry_type={entry_type}"]}
+    order.update({
+        "decision": "TRADE",
+        "side": side,
+        "order_type": "LIMIT",
+        "entry_type": "MEANREV_LIMIT",
+        "entry": float(entry),
+        "stop_loss": float(sl),
+        "take_profit": float(tp),
+    })
+    return order
 
-def _llm_explain(api_key: str, plan: Dict[str, Any], ctx: Dict[str, Any]) -> Optional[str]:
-    if not api_key:
-        return None
-    try:
-        import google.generativeai as genai  # type: ignore
-    except Exception:
-        return None
-    try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        payload = {
-            "pair": ctx.get("pair_label"),
-            "price": ctx.get("price"),
-            "decision_engine": ctx.get("decision_engine"),
-            "external_features": {k: ctx.get(k) for k in ["news_sentiment","cpi_surprise","nfp_surprise","rate_diff_change","cot_leveraged_net_pctoi","cot_asset_net_pctoi"]},
-            "state_probs": plan.get("state_probs"),
-            "expected_R_ev": plan.get("expected_R_ev"),
-            "plan": {k: plan.get(k) for k in ["decision","side","entry","take_profit","stop_loss","confidence"]},
-        }
-        prompt = "以下の情報を、短く運用者向けに説明してください。数値を変更しないでください。\n" + json.dumps(payload, ensure_ascii=False)
-        r = model.generate_content(prompt)
-        return getattr(r, "text", None)
-    except Exception:
-        return None
 
-def get_ai_order_strategy(api_key: str, context_data: Dict[str, Any], generation_policy: str = "AUTO_HIERARCHY", override_mode: str = "AUTO", override_reason: str = "") -> Dict[str, Any]:
-    ctx = context_data if isinstance(context_data, dict) else {}
-    ensure_external_features(ctx)
+def get_ai_order_strategy(api_key: str, context_data: Dict[str, Any], **kwargs) -> Dict[str, Any]:
+    ctx = dict(context_data or {})
+    min_expected_R = float(ctx.get("min_expected_R") or 0.07)
 
-    symbol = str(ctx.get("pair_symbol") or ctx.get("symbol") or PAIR_MAP.get(str(ctx.get("pair_label") or "USD/JPY"), "JPY=X"))
-    horizon_days = int(ctx.get("horizon_days") or 5)
+    state_probs = _state_probs(ctx)
+    state_stats = _state_stats_ev_stub()
 
-    probs = get_state_probabilities_v1(ctx)
-    stats_raw = ensure_state_stats(symbol, horizon_days)
-    stats = apply_state_stats_smoothing(stats_raw, min_n=30)
-    plan = build_ev_order_plan(ctx, probs, stats, horizon="WEEK")
+    news = float(ctx.get("news_sentiment") or 0.0)
+    rate = float(ctx.get("rate_diff_change") or 0.0)
+    state_stats["trend_up"]["mean_R"] += 0.02 * news
+    state_stats["trend_down"]["mean_R"] += 0.02 * (-news)
+    state_stats["risk_off"]["mean_R"] += -0.02 * abs(rate)
 
-    engine = str(ctx.get("decision_engine") or "HYBRID").upper()
-    if engine == "EV_V1":
-        return plan
-    if engine == "HYBRID" and plan.get("decision") == "NO_TRADE":
-        return plan
+    expected_R_ev, ev_contribs = _ev_from_probs(state_probs, state_stats)
+    p_win_ev = _pwin_from_probs(state_probs, state_stats)
 
-    explanation = _llm_explain(api_key, plan, ctx)
-    if explanation:
-        plan["llm_explanation"] = explanation
-    plan["generation_policy"] = generation_policy
-    return plan
+    why = f"EVゲート: expected_R_ev={expected_R_ev:+.3f} < min_expected_R={min_expected_R:.2f}"
+    confidence = float(_clamp(abs(expected_R_ev) / max(min_expected_R, 1e-9), 0.0, 1.0))
 
-def get_daily_order_strategy(api_key: str, context_data: Dict[str, Any], max_risk_pct: float = 8.0) -> Dict[str, Any]:
-    ctx = context_data if isinstance(context_data, dict) else {}
-    ensure_external_features(ctx)
-    symbol = str(ctx.get("pair_symbol") or ctx.get("symbol") or PAIR_MAP.get(str(ctx.get("pair_label") or "USD/JPY"), "JPY=X"))
-    horizon_days = int(ctx.get("horizon_days") or 3)
-    probs = get_state_probabilities_v1(ctx)
-    stats_raw = ensure_state_stats(symbol, horizon_days)
-    stats = apply_state_stats_smoothing(stats_raw, min_n=30)
-    plan = build_ev_order_plan(ctx, probs, stats, horizon="DAY")
+    order = _build_order(ctx, state_probs, expected_R_ev)
 
-    engine = str(ctx.get("decision_engine") or "HYBRID").upper()
-    if engine == "EV_V1":
-        return plan
+    if expected_R_ev >= min_expected_R and order.get("decision") == "TRADE":
+        why = f"EVゲート通過: expected_R_ev={expected_R_ev:+.3f} ≥ min_expected_R={min_expected_R:.2f}"
+        confidence = float(_clamp(expected_R_ev / max(min_expected_R, 1e-9), 0.0, 1.0))
+        decision = "TRADE"
+    else:
+        decision = "NO_TRADE"
 
-    explanation = _llm_explain(api_key, plan, ctx)
-    if explanation:
-        plan["llm_explanation"] = explanation
-    return plan
+    out: Dict[str, Any] = {
+        "decision": decision if decision == "NO_TRADE" else order.get("decision", "TRADE"),
+        "side": order.get("side"),
+        "order_type": order.get("order_type"),
+        "entry_type": order.get("entry_type"),
+        "entry": order.get("entry"),
+        "stop_loss": order.get("stop_loss"),
+        "take_profit": order.get("take_profit"),
+        "confidence": confidence,
+        "why": why,
+        "state_probs": state_probs,
+        "expected_R_ev": float(expected_R_ev),
+        "p_win_ev": float(p_win_ev),
+        "ev_contribs": ev_contribs,
+        "state_stats_ev": state_stats,
+    }
+    return out
