@@ -267,7 +267,13 @@ def _render_top_trade_panel(pair_label: str, plan: Dict[str, Any], current_price
 """)
     else:
         st.warning("⏸ 見送り（NO_TRADE）")
-        st.markdown(f"**理由**: {plan.get('why','')}")
+        why = str(plan.get("why","") or "")
+        st.markdown(f"**理由**: {why if why else '—'}")
+        veto = plan.get("veto_reasons", None)
+        if isinstance(veto, (list, tuple)) and len(veto) > 0:
+            st.markdown("**見送り理由（veto）内訳**")
+            for r in veto:
+                st.write(f"- {r}")
 
 def _render_risk_dashboard(plan: Dict[str, Any], feats: Dict[str, float]):
     bs = plan.get("black_swan", {}) or {}
