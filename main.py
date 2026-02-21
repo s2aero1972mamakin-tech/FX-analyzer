@@ -43,6 +43,48 @@ PAIR_LIST_DEFAULT = [
     "AUD/JPY",
 ]
 
+
+# =========================
+# Operator-friendly labels
+# =========================
+STATE_LABELS_JA = {
+    "trend_up": "上昇トレンド優勢",
+    "trend_down": "下降トレンド優勢",
+    "range": "レンジ（往復）優勢",
+    "risk_off": "リスクオフ（荒れ/急変）",
+}
+
+def _state_label_full(key: str) -> str:
+    k = str(key or "")
+    ja = STATE_LABELS_JA.get(k, k)
+    return f"{ja} ({k})" if k and ja != k else ja
+
+def _bucket_01(v: float) -> str:
+    try:
+        x = float(v)
+    except Exception:
+        return "—"
+    if x != x:
+        return "—"
+    if x < 0.33:
+        return "低（平常）"
+    if x < 0.66:
+        return "中（警戒）"
+    return "高（危険）"
+
+def _action_hint(global_risk: float, war: float, fin: float, macro: float, bs_flag: bool, gov_enabled: bool) -> str:
+    if bs_flag or (not gov_enabled):
+        return "🛑 新規エントリー停止（強制ガード発動）"
+    g = float(global_risk or 0.0)
+    w = float(war or 0.0)
+    f = float(fin or 0.0)
+    m = float(macro or 0.0)
+    if (g >= 0.80) or (w >= 0.60) or (f >= 0.80) or (m >= 0.80):
+        return "🔴 高リスク：見送り推奨（入るならロット最小・短期・監視必須）"
+    if (g >= 0.55) or (w >= 0.35) or (f >= 0.55) or (m >= 0.55):
+        return "🟡 警戒：ロット縮小/回数制限（見送り増は正常）"
+    return "🟢 平常：通常運用（ただし指標更新遅延やイベントは別途確認）"
+
 def _normalize_pair_label(s: str) -> str:
     s = (s or "").strip().upper().replace(" ", "")
     s = s.replace("-", "/")
@@ -211,7 +253,7 @@ def _parts_status_table(meta: Dict[str, Any]) -> pd.DataFrame:
 
     def _summarize_detail(detail: Any) -> Tuple[Optional[bool], str, Optional[str]]:
         """Return (ok_override, detail_str, err_override)"""
-        if isinstance(detail, dict) and any(isinstance(v, dict) for v in detail.values()):
+        if isinstance(detail, dict) and any(isinstance(v, dict) and ('ok' in v) for v in detail.values()):
             nested_ok_bits = []
             nested_errs = []
             all_ok = True
@@ -238,7 +280,14 @@ def _parts_status_table(meta: Dict[str, Any]) -> pd.DataFrame:
                 if isinstance(v, dict):
                     # keys row etc.
                     if "present" in v:
-                        bits.append(f"{k}:{'✓' if v.get('present') else '×'}")
+                        mark = "✓" if v.get("present") else "×"
+                        used = v.get("used", None)
+                        if used:
+                            u = str(used)
+                            tag = {"keys": "ui", "secrets": "sec", "env": "env"}.get(u, u)
+                            bits.append(f"{k}:{mark}({tag})")
+                        else:
+                            bits.append(f"{k}:{mark}")
                     elif "ok" in v:
                         bits.append(f"{k}:{'ok' if v.get('ok') else 'ng'}")
                     else:
@@ -340,6 +389,7 @@ def _render_top_trade_panel(pair_label: str, plan: Dict[str, Any], current_price
     c3.metric("期待値EV (R)", f"{expected_R_ev:+.3f}")
     c4.metric("動的閾値", f"{dyn_th:.3f}")
     c5.metric("信頼度", f"{confidence:.2f}")
+    st.caption("EV (R) は『損切り幅=1R』基準の期待値です。動的閾値は危険時に上がり、見送りが増えるのは仕様です。信頼度が低い時はロット縮小/見送り寄りで。")
 
     if decision != "NO_TRADE":
         side = plan.get("side", "—")
@@ -366,21 +416,69 @@ def _render_top_trade_panel(pair_label: str, plan: Dict[str, Any], current_price
             for r in veto:
                 st.write(f"- {r}")
 
-def _render_risk_dashboard(plan: Dict[str, Any], feats: Dict[str, float]):
+
+def _render_risk_dashboard(plan: Dict[str, Any], feats: Dict[str, float], ext_meta: Optional[Dict[str, Any]] = None):
+    """
+    運用者が「今、取引してよいか」を一瞬で判断できるように、
+    数字に意味（低/中/高）と推奨アクションを添えて表示する。
+    """
     bs = plan.get("black_swan", {}) or {}
     gov = plan.get("governor", {}) or {}
     overlay = plan.get("overlay_meta", {}) or {}
+    ext_meta = ext_meta or {}
 
-    st.markdown("### リスクダッシュボード（最重要）")
+    global_risk = float(feats.get("global_risk_index", 0.0) or 0.0)
+    war = float(feats.get("war_probability", 0.0) or 0.0)
+    fin = float(feats.get("financial_stress", 0.0) or 0.0)
+    macro = float(feats.get("macro_risk_score", 0.0) or 0.0)
+
+    st.markdown("### 🛡️ リスクダッシュボード（ここが運用の心臓部）")
+    st.caption("※ 0.00〜1.00（0=平常 / 1=危機）。数値だけでなく「低/中/高」と推奨アクションを併記します。")
+
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("GlobalRisk", f"{float(feats.get('global_risk_index',0.0)):.2f}")
-    col2.metric("WarProb", f"{float(feats.get('war_probability',0.0)):.2f}")
-    col3.metric("FinStress", f"{float(feats.get('financial_stress',0.0)):.2f}")
-    col4.metric("MacroRisk", f"{float(feats.get('macro_risk_score',0.0)):.2f}")
-    # ---- External data status (always visible) ----
+    with col1:
+        st.metric("総合リスク（市場全体）", f"{global_risk:.2f}")
+        st.caption(f"意味：市場全体の警戒度。判定：**{_bucket_01(global_risk)}**")
+        st.progress(min(max(global_risk, 0.0), 1.0))
+    with col2:
+        st.metric("戦争/地政学（確率）", f"{war:.2f}")
+        st.caption(f"意味：戦争・地政学ショックの起こりやすさ。判定：**{_bucket_01(war)}**")
+        st.progress(min(max(war, 0.0), 1.0))
+    with col3:
+        st.metric("金融ストレス", f"{fin:.2f}")
+        st.caption(f"意味：金融不安・信用収縮の気配。判定：**{_bucket_01(fin)}**")
+        st.progress(min(max(fin, 0.0), 1.0))
+    with col4:
+        st.metric("マクロ不確実性", f"{macro:.2f}")
+        st.caption(f"意味：金利/指標サプライズ等の不確実性。判定：**{_bucket_01(macro)}**")
+        st.progress(min(max(macro, 0.0), 1.0))
+
+    bs_flag = bool(bs.get("flag"))
+    gov_enabled = bool(gov.get("enabled", True))
+    st.info(_action_hint(global_risk, war, fin, macro, bs_flag, gov_enabled))
+
     try:
-        st.caption("外部データ取得ステータス（0が続く場合はここで原因が分かります）")
-        st.dataframe(_parts_status_table(ext_meta), use_container_width=True, hide_index=True)
+        st.markdown("#### 外部データ取得ステータス（0が続く/異常が出る場合はここを確認）")
+        st.caption("OKでも中身が空/一部失敗があり得るため、detail と error を必ず見ます。")
+        df = _parts_status_table(ext_meta)
+
+        meaning = {
+            "keys": "キー検出状況（secrets/ui/env）",
+            "fred": "VIX/DXY/金利（マクロ系）",
+            "te": "経済指標カレンダー（CPI/NFP等）",
+            "gdelt": "紛争/金融ニュース量（無料）",
+            "newsapi": "記事見出しセンチメント",
+            "openai": "LLMによる地政学/危機推定（JSON）",
+        }
+        if "source" in df.columns and "meaning" not in df.columns:
+            df["meaning"] = df["source"].map(lambda x: meaning.get(str(x), ""))
+
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+        csv = df.to_csv(index=False).encode("utf-8")
+        ts = time.strftime("%Y-%m-%dT%H-%M")
+        st.download_button("ステータスCSVをダウンロード", data=csv, file_name=f"{ts}_risk_status_export.csv", mime="text/csv")
+
         st.caption(f"modules: logic={getattr(logic, '__file__', '?')} / data_layer={getattr(data_layer, '__file__', 'IMPORT_FAILED')}")
     except Exception:
         pass
@@ -390,33 +488,50 @@ def _render_risk_dashboard(plan: Dict[str, Any], feats: Dict[str, float]):
     dxy = feats.get("dxy", float("nan"))
     us10y = feats.get("us10y", float("nan"))
     jp10y = feats.get("jp10y", float("nan"))
-    colA.metric("VIX", f"{vix:.1f}" if pd.notna(vix) else "—")
-    colB.metric("DXY(代替)", f"{dxy:.1f}" if pd.notna(dxy) else "—")
-    colC.metric("US10Y", f"{us10y:.2f}" if pd.notna(us10y) else "—")
-    colD.metric("JP10Y", f"{jp10y:.2f}" if pd.notna(jp10y) else "—")
+    with colA:
+        st.metric("VIX（恐怖指数）", f"{vix:.1f}" if pd.notna(vix) else "—")
+        st.caption("高いほど市場が不安定（一般に上昇で警戒）")
+    with colB:
+        st.metric("DXY（米ドル指数）", f"{dxy:.1f}" if pd.notna(dxy) else "—")
+        st.caption("ドル高/ドル安の地合い（USD/JPY等の背景）")
+    with colC:
+        st.metric("米10年金利", f"{us10y:.2f}" if pd.notna(us10y) else "—")
+        st.caption("金利上昇=リスク資産に逆風になりやすい")
+    with colD:
+        st.metric("日10年金利", f"{jp10y:.2f}" if pd.notna(jp10y) else "—")
+        st.caption("日米金利差は円相場の主要因")
 
     level = str(bs.get("level", "green"))
-    if bs.get("flag"):
-        st.error(f"🛑 Black Swan Guard: {level} — 新規エントリー禁止")
+    if bs_flag:
+        st.error(f"🛑 ブラックスワン検知: {level} — 新規エントリー禁止")
     elif level == "yellow":
-        st.warning("⚠ リスク上昇（yellow）— 閾値が上がり見送りやすくなります")
+        st.warning("⚠ リスク上昇（yellow）— 見送りが増えるのは正常です（動的閾値↑）")
     else:
-        st.info("✅ リスク通常（green）")
+        st.success("✅ リスク通常（green）")
 
     if isinstance(bs.get("reasons"), list) and bs["reasons"]:
-        st.write("**検知理由**")
+        st.write("**検知理由（なぜ止めたか）**")
         for r in bs["reasons"]:
             st.write(f"- {r}")
 
     if isinstance(gov, dict):
-        enabled = bool(gov.get("enabled", True))
-        st.write(f"**Capital Governor**: {'ON（取引可）' if enabled else 'OFF（取引停止）'}")
-        if not enabled:
+        st.write(f"**Capital Governor（資金管理ガード）**: {'ON（取引可）' if gov_enabled else 'OFF（取引停止）'}")
+        if not gov_enabled:
             for r in (gov.get("reasons") or []):
                 st.write(f"- {r}")
 
-    with st.expander("詳細（overlay/metrics）", expanded=False):
-        st.json({"overlay_meta": overlay, "black_swan": bs, "governor": gov})
+    with st.expander("詳細（overlay/metrics：上級者用）", expanded=False):
+        st.json({
+            "overlay_meta": overlay,
+            "black_swan": bs,
+            "governor": gov,
+            "risk_values": {
+                "global_risk_index": global_risk,
+                "war_probability": war,
+                "financial_stress": fin,
+                "macro_risk_score": macro,
+            },
+        })
 
 # =========================
 # UI
@@ -425,7 +540,10 @@ st.set_page_config(page_title="FX EV Auto v4 Integrated", layout="wide")
 st.title("FX 自動AI判断ツール（EV最大化） v4 Integrated")
 
 with st.sidebar:
-    st.header("AUTO運用（最小設定）")
+    st.header("運用設定（サイドバー）")
+    st.caption("迷ったら：モード=自動抽出 / スタイル=標準 / 期間=週 のままでOK")
+    with st.expander("このパネルの役割（運用者向け）", expanded=False):
+        st.markdown("- **モード**：複数ペア走査（運用向け）/ 単一ペア（検証向け）\n- **運用スタイル**：見送りライン（EV閾値）を自動で調整\n- **想定期間**：週=安定 / 日=短期\n- **APIキー**：外部リスクの精度が上がる（無くても動く）\n- **Capital Governor**：DD/損失/連敗で強制停止（本気運用の安全装置）")
     mode = st.selectbox("モード", ["相場全体から最適ペアを自動抽出（推奨）", "単一ペア最適化（徹底）"], index=0)
     style_name = st.selectbox("運用スタイル", ["標準", "保守", "攻撃"], index=0)
     horizon_mode = st.selectbox("想定期間", ["週（推奨）", "日"], index=0)
@@ -433,6 +551,8 @@ with st.sidebar:
     preset = _style_defaults(style_name)
     horizon_days = 7 if "週" in horizon_mode else 3
     min_expected_R = float(preset["min_expected_R"])
+
+    st.caption(f"現在の見送りライン（min_expected_R）: {min_expected_R:.2f}R / 想定期間: {horizon_days}日")
 
     st.divider()
     with st.expander("APIキー（任意・入れた分だけ強くなる）", expanded=False):
@@ -551,7 +671,7 @@ with tabs[0]:
         _render_top_trade_panel(best["pair"], plan, price)
 
         # Risk dashboard (new)
-        _render_risk_dashboard(plan, feats)
+        _render_risk_dashboard(plan, feats, ext_meta=best.get("_ext_meta", {}))
 
         st.markdown("### EVランキング（代替案ペアはここ）")
         view = [{
@@ -559,7 +679,7 @@ with tabs[0]:
             "EV": float(r["EV"]),
             "decision": r["decision"],
             "confidence": float(r["confidence"]),
-            "dominant_state": r["dom_state"],
+            "dominant_state": _state_label_full(r["dom_state"]),
             "global_risk": float(r["_feats"].get("global_risk_index", 0.0)),
             "war": float(r["_feats"].get("war_probability", 0.0)),
         } for r in ranked]
@@ -569,7 +689,8 @@ with tabs[0]:
         ev_contribs = (plan.get("ev_contribs", {}) or {})
         if isinstance(ev_contribs, dict) and ev_contribs:
             cdf = pd.DataFrame([{"state": k, "contrib_R": float(v)} for k, v in ev_contribs.items()]).sort_values("contrib_R")
-            st.bar_chart(cdf.set_index("state"))
+            cdf["state_label"] = cdf["state"].apply(_state_label_full)
+            st.bar_chart(cdf.set_index("state_label")[["contrib_R"]])
         else:
             st.info("EV内訳が空です。")
 
@@ -596,13 +717,14 @@ with tabs[0]:
 
         price = float(ctx.get("price", 0.0))
         _render_top_trade_panel(pair_label, plan, price)
-        _render_risk_dashboard(plan, feats)
+        _render_risk_dashboard(plan, feats, ext_meta=ext_meta)
 
         st.markdown("### EV内訳（何がEVを潰しているか）")
         ev_contribs = plan.get("ev_contribs", {}) or {}
         if isinstance(ev_contribs, dict) and ev_contribs:
             cdf = pd.DataFrame([{"state": k, "contrib_R": float(v)} for k, v in ev_contribs.items()]).sort_values("contrib_R")
-            st.bar_chart(cdf.set_index("state"))
+            cdf["state_label"] = cdf["state"].apply(_state_label_full)
+            st.bar_chart(cdf.set_index("state_label")[["contrib_R"]])
         else:
             st.info("EV内訳が空です。")
 
@@ -659,22 +781,67 @@ with tabs[1]:
 # =========================
 with tabs[2]:
     st.markdown("""
-## 使い方（最短）
-### ① まず「相場全体から最適ペアを自動抽出」
-- 最上段に **最適ペア + 現在値 + 注文形式（Entry/SL/TP）** が出ます（TRADE時）
-- 見送り時は **理由（veto）** が出ます（EV不足 / BlackSwan / Governor など）
+# 📘 運用者向け・画面の見方（メイン/サイドバー）
 
-### ② “代替案ペア” はどこ？
-- **AUTO判断タブの「EVランキング」**が代替案一覧です（2位/3位が次候補）。
+このツールは **「期待値（EV）を最大化しつつ、外部リスクで“止める/弱める”」** ための運用パネルです。  
+**迷ったら** → AUTO判断タブの **「最終判断」→「リスクダッシュボード」→「外部データ取得ステータス」** の順に見てください。
 
-### ③ 世界情勢（地政学）を使うには
-- キー無しでも **GDELT（無料）**で“ニュース量異常”は入ります
-- `FRED_API_KEY` を入れると **VIX/DXY/金利** が入ります
-- `TRADING_ECONOMICS_KEY` を入れると **CPI/NFPサプライズ** が入ります
-- `NEWSAPI_KEY` を入れると **記事見出しセンチメント** が入ります
-- `OPENAI_API_KEY` を入れると **LLMが地政学/危機確率をJSONで返し**、GlobalRiskに反映されます
+---
 
-### ④ 見送りが増える理由
-- v4では **危機が近いほど動的閾値が上がる**（本気資金向け）
-- さらに **Black Swan Guard** や **Capital Governor** が止めます
+## 1) サイドバー（左）の機能
+### モード
+- **相場全体から最適ペアを自動抽出（推奨）**：複数ペアを走査し、EVが最大のペアを出します（運用向け）
+- **単一ペア最適化（徹底）**：指定ペアだけを深く見る（検証/研究向け）
+
+### 運用スタイル（標準/保守/攻撃）
+- **保守**：見送りラインが高く、厳選（資金大きい/イベント多い時）
+- **標準**：バランス
+- **攻撃**：見送りラインが低く、回転（検証や小さめ資金向け）
+
+### 想定期間（週/日）
+- **週（推奨）**：ノイズに強く、判断が安定
+- **日**：短期トレード寄り（シグナルは速いがブレやすい）
+
+### APIキー（任意：入れた分だけ“外部リスク”が精密）
+- **FRED**：VIX/DXY/金利（マクロ・不安定度）
+- **NewsAPI**：記事見出しセンチメント
+- **TradingEconomics**：CPI/NFPなど（ただし無料キーは国制限で403になりがち）
+- **OpenAI**：LLMが地政学/危機確率を推定（JSON）→ **GlobalRisk/WarProb に反映**
+
+### Capital Governor（本気運用の安全装置）
+- 最大DD/日次損失/連敗が閾値を超えると **強制停止**します（運用者が入力）
+
+---
+
+## 2) メインパネル（AUTO判断タブ）の見方
+### 最終判断（ここだけ見ればOK）
+- **TRADE**：推奨エントリー（Entry/SL/TP）が出ます
+- **NO_TRADE**：見送り。理由（veto）が出ます（EV不足/リスク過多/ガバナー停止など）
+
+### 期待値EV (R) / 動的閾値 / 信頼度
+- **EV (R)**：1R（＝損切り幅）を基準にした「1回あたりの期待値」  
+  例）EV=+0.07 → 1回の取引で **平均 +0.07R** を狙う設計
+- **動的閾値**：相場が危険になるほど上がる “見送りライン”  
+  → 危険時に見送りが増えるのは **仕様**
+- **信頼度**：モデルの確信度（0〜1）。低いほど慎重に。
+
+### 🛡️ リスクダッシュボード（運用の心臓部）
+- **総合リスク / 戦争・地政学 / 金融ストレス / マクロ不確実性** を 0〜1 で表示  
+  0=平常 / 1=危機。**低/中/高** と **推奨アクション** が併記されます。
+
+### 外部データ取得ステータス（原因究明）
+- 0固定や異常値の原因は、ここに **http_401/403/429/timeout** として出ます。
+- **keys 行**：キーがどこから読めたか（sec/ui/env）を表示します。
+
+### EV内訳（棒グラフ）
+- 相場タイプ（上昇/下降/レンジ/リスクオフ）の **どれがEVを押し上げ/押し下げ**しているかの内訳です。  
+  「リスクオフが大きくマイナス」なら、見送りになりやすいのは正常です。
+
+---
+
+## 3) よくあるトラブルと対処
+- **OpenAI 401**：APIキー/課金/権限（ChatGPT契約とは別）
+- **TradingEconomics 403**：無料キー国制限（仕様寄り）
+- **GDELT timeout/429**：ネットワーク到達性 or 間隔制御不足（キャッシュ/リトライで緩和）
 """)
+
