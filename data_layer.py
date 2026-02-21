@@ -25,6 +25,22 @@ except Exception:
 # Helpers
 # -------------------------
 DEFAULT_HEADERS = {"User-Agent": "fx-ev-engine/1.0"}
+# --- simple per-process throttles (Streamlit Cloud friendly) ---
+# NOTE: Streamlit Cloud runs multiple processes sometimes; this is best-effort.
+_GDELT_LAST_CALL_TS = 0.0
+_GDELT_BACKOFF_UNTIL_TS = 0.0
+
+def _gdelt_throttle(min_interval_s: float = 1.2) -> None:
+    """Best-effort throttle to reduce GDELT 429 during multi-pair scans."""
+    global _GDELT_LAST_CALL_TS, _GDELT_BACKOFF_UNTIL_TS
+    now = time.time()
+    if now < _GDELT_BACKOFF_UNTIL_TS:
+        time.sleep(max(0.0, _GDELT_BACKOFF_UNTIL_TS - now))
+    wait = (_GDELT_LAST_CALL_TS + float(min_interval_s)) - time.time()
+    if wait > 0:
+        time.sleep(wait)
+    _GDELT_LAST_CALL_TS = time.time()
+
 
 def _now_ts() -> float:
     return time.time()
@@ -180,13 +196,19 @@ def _calc_surprise_from_te(events: List[Dict[str, Any]], indicator_contains: str
 # We'll query 2.1 doc API "doc" for counts via timeline search.
 # -------------------------
 @_cache(ttl=60*60)
+# -------------------------
+# GDELT (free)
+# We'll query 2.1 doc API "doc" for counts via timeline search.
+# -------------------------
 @_cache(ttl=60*10)
 def gdelt_doc_count(query: str, mode: str = "artlist", timespan: str = "1d") -> Tuple[Optional[int], Dict[str, Any]]:
     """
     Returns integer count estimate for query over last timespan (e.g. 1d, 7d).
-    We use "timelinevolraw" which returns series with counts.
+
+    We use `timelinevolraw` which returns series with counts.
+    Handles 429 with backoff + single retry.
     """
-    meta = {"ok": False, "source": "GDELT", "error": None, "query": query, "timespan": timespan}
+    meta: Dict[str, Any] = {"ok": False, "source": "GDELT", "error": None, "query": query, "timespan": timespan}
     base = "https://api.gdeltproject.org/api/v2/doc/doc"
     params = {
         "query": query,
@@ -194,26 +216,43 @@ def gdelt_doc_count(query: str, mode: str = "artlist", timespan: str = "1d") -> 
         "format": "json",
         "timelinesmooth": "0",
         "maxrecords": "250",
-        "format": "json",
         "timespan": timespan,
     }
+
+    # Throttle before request (best-effort).
     _gdelt_throttle()
-    j, err = _http_get_json(base, params=params, timeout=15)
-    if err:
+
+    for attempt in range(2):
+        j, err = _http_get_json(base, params=params, timeout=15)
+        if not err:
+            try:
+                timeline = (j or {}).get("timeline", [])
+                if not timeline:
+                    meta["ok"] = True
+                    return 0, meta
+                s = int(sum(int(t.get("value", 0)) for t in timeline))
+                meta["ok"] = True
+                return s, meta
+            except Exception as e:
+                meta["error"] = f"{type(e).__name__}:{e}"
+                return None, meta
+
+        # 429 backoff
+        if isinstance(err, str) and err.startswith("http_429"):
+            # global backoff window for this process
+            global _GDELT_BACKOFF_UNTIL_TS
+            backoff = 3.0 * (attempt + 1)
+            _GDELT_BACKOFF_UNTIL_TS = max(_GDELT_BACKOFF_UNTIL_TS, time.time() + backoff)
+            meta["error"] = err
+            if attempt == 0:
+                # wait and retry once
+                _gdelt_throttle()
+                continue
+
         meta["error"] = err
         return None, meta
-    try:
-        timeline = (j or {}).get("timeline", [])
-        if not timeline:
-            meta["ok"] = True
-            return 0, meta
-        # sum all bins
-        s = int(sum(int(t.get("value", 0)) for t in timeline))
-        meta["ok"] = True
-        return s, meta
-    except Exception as e:
-        meta["error"] = f"{type(e).__name__}:{e}"
-        return None, meta
+
+    return None, meta
 
 # -------------------------
 # NewsAPI (optional)
@@ -273,6 +312,19 @@ def simple_sentiment_from_articles(articles: List[Dict[str, Any]]) -> float:
     # squash
     score = score / max(n, 1)
     return float(max(-1.0, min(1.0, score / 5.0)))
+
+def sentiment_from_news(articles: List[Dict[str, Any]]) -> Tuple[float, Dict[str, Any]]:
+    """Conservative sentiment + small diagnostics."""
+    meta: Dict[str, Any] = {"ok": True, "n_articles": int(len(articles or []))}
+    try:
+        score = float(simple_sentiment_from_articles(articles))
+        meta["score"] = score
+        return score, meta
+    except Exception as e:
+        meta["ok"] = False
+        meta["error"] = f"{type(e).__name__}:{e}"
+        return 0.0, meta
+
 
 # -------------------------
 
@@ -386,15 +438,17 @@ def _pair_to_geo_query(pair_label: str) -> str:
         return "Australia OR AUD"
     return "FX OR currency"
 
+# -------------------------
+# Integrated feature fetch
+# -------------------------
 @_cache(ttl=60*15)
-def fetch_external_features(pair_label: str, keys: Dict[str, str] | None = None) -> Tuple[Dict[str, float], Dict[str, Any]]:
+def _fetch_global_sources(keys: Dict[str, str]) -> Tuple[Dict[str, float], Dict[str, Any]]:
     """
-    Returns (features, meta). Never raises.
-    This function is pair-agnostic for global risk sources to avoid rate limits in multi-pair scans.
+    Fetches global (pair-agnostic) features & status meta.
+    Cached to avoid rate limits during multi-pair scans.
     """
     keys = keys or {}
 
-    # ---- Defaults (never missing) ----
     feats: Dict[str, float] = {
         "news_sentiment": 0.0,            # [-1,1]
         "cpi_surprise": 0.0,              # [-1,1]
@@ -455,7 +509,11 @@ def fetch_external_features(pair_label: str, keys: Dict[str, str] | None = None)
     # ---- TradingEconomics surprises (optional) ----
     try:
         if te_key:
+            # Some free keys have country restrictions; try US then JP fallback.
             ev_us, m_te = fetch_te_calendar("united states", te_key, limit=80)
+            if isinstance(m_te, dict) and isinstance(m_te.get("error"), str) and str(m_te["error"]).startswith("http_403"):
+                ev_us, m_te = fetch_te_calendar("japan", te_key, limit=80)
+
             cpi = _calc_surprise_from_te(ev_us, "cpi")
             nfp = _calc_surprise_from_te(ev_us, "non-farm") or _calc_surprise_from_te(ev_us, "employment")
             if cpi is not None:
@@ -503,12 +561,10 @@ def fetch_external_features(pair_label: str, keys: Dict[str, str] | None = None)
         meta["parts"]["newsapi"] = {"ok": False, "error": f"{type(e).__name__}", "detail": str(e)}
 
     # ---- OpenAI risk overlay (optional) ----
-    # Purpose: produce conservative global_risk_index override using headlines + gdelt counts + vix.
     try:
         if openai_key:
             ov, m_ov = openai_risk_overlay(openai_key, feats, meta)
             if isinstance(ov, dict):
-                # Override if provided
                 if "global_risk_index" in ov:
                     feats["global_risk_index"] = float(max(0.0, min(1.0, float(ov["global_risk_index"]))))
                 if "war_probability" in ov:
@@ -524,13 +580,61 @@ def fetch_external_features(pair_label: str, keys: Dict[str, str] | None = None)
     return feats, meta
 
 
+@_cache(ttl=60*15)
+def fetch_external_features(pair_label: str, keys: Dict[str, str] | None = None) -> Tuple[Dict[str, float], Dict[str, Any]]:
+    """
+    Returns (features, meta). Never raises.
+
+    NOTE:
+    - Global sources are cached via `_fetch_global_sources` to avoid 429 in multi-pair scans.
+    - `pair_label` is kept for backward compatibility and future pair-specific hooks.
+    """
+    keys = keys or {}
+    feats, meta = _fetch_global_sources(keys)
+    out_feats = dict(feats) if isinstance(feats, dict) else {}
+    out_meta = dict(meta) if isinstance(meta, dict) else {"ok": True, "parts": {}}
+    out_meta["pair_label"] = pair_label
+    return out_feats, out_meta
+
+
+
+def _extract_responses_output_text(j: Any) -> str:
+    if not isinstance(j, dict):
+        return ""
+    if isinstance(j.get("output_text"), str):
+        return j.get("output_text", "") or ""
+    out_txt = ""
+    try:
+        for item in j.get("output", []) or []:
+            if not isinstance(item, dict):
+                continue
+            for c in item.get("content", []) or []:
+                if not isinstance(c, dict):
+                    continue
+                if c.get("type") in ("output_text", "text"):
+                    t = c.get("text")
+                    if isinstance(t, str):
+                        out_txt += t
+    except Exception:
+        return ""
+    return out_txt
+
+
 def openai_risk_overlay(openai_key: str, feats: Dict[str, float], meta: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
     Calls OpenAI to estimate conservative risk scores from already-fetched numbers.
-    Uses Responses API if available; falls back to a lightweight HTTP call.
-    Returns (overlay_dict, meta_dict).
+
+    Output schema:
+      { "global_risk_index": 0..1, "war_probability": 0..1, "financial_stress": 0..1 }
+
+    Never raises.
     """
-    # Build a compact prompt (no long text to avoid cost/latency)
+    url = "https://api.openai.com/v1/responses"
+    headers = {"Authorization": f"Bearer {openai_key}", "Content-Type": "application/json", **DEFAULT_HEADERS}
+
+    # Choose a widely available default model; allow override via env.
+    model = os.getenv("OPENAI_RISK_MODEL", "gpt-4o-mini")
+
     payload = {
         "vix": feats.get("vix"),
         "macro_risk_score": feats.get("macro_risk_score"),
@@ -538,39 +642,69 @@ def openai_risk_overlay(openai_key: str, feats: Dict[str, float], meta: Dict[str
         "gdelt_finance_count_1d": feats.get("gdelt_finance_count_1d"),
         "news_sentiment": feats.get("news_sentiment"),
     }
+
     prompt = (
         "You are a risk overlay engine for FX trading. "
-        "Given the inputs, output strict JSON with keys: "
-        "global_risk_index (0-1), war_probability (0-1), financial_stress (0-1). "
+        "Given the numeric inputs, output strict JSON ONLY (no markdown) with keys: "
+        "global_risk_index (0..1), war_probability (0..1), financial_stress (0..1). "
         "Be conservative: if uncertain, return higher risk. "
         f"inputs={json.dumps(payload, ensure_ascii=False)}"
     )
 
-    try:
-        url = "https://api.openai.com/v1/responses"
-        headers = {"Authorization": f"Bearer {openai_key}", "Content-Type": "application/json"}
-        body = {
-            "model": "gpt-4.1-mini",
-            "input": prompt,
-            "response_format": {"type": "json_object"},
-        }
-        r = requests.post(url, headers=headers, json=body, timeout=20)
-        if r.status_code != 200:
-            return {}, {"ok": False, "error": f"http_{r.status_code}", "detail": r.text[:500]}
-        j = r.json()
-        # responses API returns output array; extract text/json
-        out_txt = ""
+    # Try the modern Responses schema first.
+    body1 = {
+        "model": model,
+        "input": prompt,
+        "temperature": 0.1,
+        "max_output_tokens": 250,
+        "text": {"format": {"type": "json_object"}},
+    }
+
+    # Fallback variant (some SDKs/docs used response_format).
+    body2 = {
+        "model": model,
+        "input": prompt,
+        "temperature": 0.1,
+        "max_output_tokens": 250,
+        "response_format": {"type": "json_object"},
+    }
+
+    for body in (body1, body2):
         try:
-            for item in j.get("output", []):
-                for c in item.get("content", []):
-                    if c.get("type") in ("output_text", "text"):
-                        out_txt += c.get("text", "")
-        except Exception:
-            out_txt = ""
-        if not out_txt:
-            # attempt direct field
-            out_txt = j.get("output_text", "") or ""
-        ov = json.loads(out_txt) if out_txt else {}
-        return ov if isinstance(ov, dict) else {}, {"ok": True}
-    except Exception as e:
-        return {}, {"ok": False, "error": f"{type(e).__name__}", "detail": str(e)}
+            r = requests.post(url, headers=headers, json=body, timeout=25)
+            if r.status_code != 200:
+                # If first attempt fails with 400, we retry with the fallback body.
+                err_meta = {"ok": False, "error": f"http_{r.status_code}", "detail": r.text[:500], "model": model}
+                if r.status_code == 400:
+                    last_err = err_meta
+                    continue
+                return {}, err_meta
+
+            j = r.json()
+            out_txt = _extract_responses_output_text(j).strip()
+            if not out_txt:
+                # Some variants return "output_text"
+                out_txt = (j.get("output_text") if isinstance(j, dict) else "") or ""
+                out_txt = str(out_txt).strip()
+
+            ov: Any = {}
+            if out_txt:
+                try:
+                    ov = json.loads(out_txt)
+                except Exception:
+                    # try extract first JSON object inside
+                    if "{" in out_txt and "}" in out_txt:
+                        blob = out_txt[out_txt.find("{"):out_txt.rfind("}") + 1]
+                        try:
+                            ov = json.loads(blob)
+                        except Exception:
+                            ov = {}
+            if not isinstance(ov, dict):
+                ov = {}
+
+            return ov, {"ok": True, "model": model}
+        except Exception as e:
+            last_err = {"ok": False, "error": f"{type(e).__name__}", "detail": str(e), "model": model}
+            continue
+
+    return {}, (locals().get("last_err") if "last_err" in locals() else {"ok": False, "error": "unknown", "model": model})
