@@ -102,7 +102,7 @@ def _http_get_json_retry(
 # -------------------------
 _GDELT_LAST_TS = 0.0
 
-def _gdelt_throttle(min_interval_s: float = 1.1) -> None:
+def _gdelt_throttle(min_interval_s: float = 5.2) -> None:
     global _GDELT_LAST_TS
     now = time.time()
     wait = (_GDELT_LAST_TS + float(min_interval_s)) - now
@@ -247,9 +247,9 @@ def gdelt_doc_count(query: str, mode: str = "artlist", timespan: str = "1d") -> 
             "timespan": ts,
         }
         # GDELTは429もあるので軽くスロットル
-        _gdelt_throttle(min_interval_s=1.35)
+        _gdelt_throttle(min_interval_s=5.2)
         # 読み取りが遅い環境対策：readを長めに
-        return _http_get_json_retry(base, params=params, timeout=(8, 55), retries=2, backoff_s=1.6)
+        return _http_get_json_retry(base, params=params, timeout=(8, 75), retries=2, backoff_s=1.6)
 
     j, err = _fetch(timespan)
     scale = 1.0
