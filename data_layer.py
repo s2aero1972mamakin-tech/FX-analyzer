@@ -390,158 +390,187 @@ def _pair_to_geo_query(pair_label: str) -> str:
 def fetch_external_features(pair_label: str, keys: Dict[str, str] | None = None) -> Tuple[Dict[str, float], Dict[str, Any]]:
     """
     Returns (features, meta). Never raises.
-    Features include:
-      - news_sentiment [-1,1]
-      - global_risk_index [0,1]
-      - war_probability [0,1]
-      - financial_stress [0,1]
-      - macro_risk_score [0,1]
-      - rate_diff_change (approx) [-1,1]
-      - vix, dxy, us10y, jp10y
-      - cpi_surprise, nfp_surprise (if TE available)
-      - gdelt_war_count_1d, gdelt_finance_count_1d
+    This function is pair-agnostic for global risk sources to avoid rate limits in multi-pair scans.
     """
     keys = keys or {}
-    fred_key, fred_used = _env_any(keys, ["FRED_API_KEY","FRED_KEY","FREDAPI_KEY"])
-    te_key, te_used = _env_any(keys, ["TRADING_ECONOMICS_KEY","TE_API_KEY","TRADING_ECONOMICS_API_KEY"])
-    news_key, news_used = _env_any(keys, ["NEWSAPI_KEY","NEWS_API_KEY","NEWSAPI_API_KEY"])
-    openai_key, openai_used = _env_any(keys, ["OPENAI_API_KEY","OPENAI_KEY"])
+
+    # ---- Defaults (never missing) ----
+    feats: Dict[str, float] = {
+        "news_sentiment": 0.0,            # [-1,1]
+        "cpi_surprise": 0.0,              # [-1,1]
+        "nfp_surprise": 0.0,              # [-1,1]
+        "rate_diff_change": 0.0,          # [-1,1] proxy
+        "macro_risk_score": 0.0,          # [0,1]
+        "global_risk_index": 0.0,         # [0,1]
+        "war_probability": 0.0,           # [0,1]
+        "financial_stress": 0.0,          # [0,1]
+        "gdelt_war_count_1d": 0.0,
+        "gdelt_finance_count_1d": 0.0,
+        "vix": float("nan"),
+        "dxy": float("nan"),
+        "us10y": float("nan"),
+        "jp10y": float("nan"),
+    }
+
+    fred_key, fred_used = _env_any(keys, ["FRED_API_KEY", "FRED_KEY", "FREDAPI_KEY"])
+    te_key, te_used = _env_any(keys, ["TRADING_ECONOMICS_KEY", "TE_API_KEY", "TRADING_ECONOMICS_API_KEY"])
+    news_key, news_used = _env_any(keys, ["NEWSAPI_KEY", "NEWS_API_KEY", "NEWSAPI_API_KEY"])
+    openai_key, openai_used = _env_any(keys, ["OPENAI_API_KEY", "OPENAI_KEY"])
 
     meta: Dict[str, Any] = {"ok": True, "parts": {}}
     meta["parts"]["keys"] = {
-        "FRED": {"present": bool(fred_key), "used": fred_used},
-        "TradingEconomics": {"present": bool(te_key), "used": te_used},
-        "NewsAPI": {"present": bool(news_key), "used": news_used},
-        "OpenAI": {"present": bool(openai_key), "used": openai_used},
+        "ok": True,
+        "detail": {
+            "FRED": {"present": bool(fred_key), "used": fred_used},
+            "TradingEconomics": {"present": bool(te_key), "used": te_used},
+            "NewsAPI": {"present": bool(news_key), "used": news_used},
+            "OpenAI": {"present": bool(openai_key), "used": openai_used},
+        },
     }
 
+    # ---- FRED macro ----
+    try:
+        vix, m_vix = fetch_fred_latest("VIXCLS", fred_key)
+        dxy, m_dxy = fetch_fred_latest("DTWEXBGS", fred_key)  # broad dollar index
+        us10y, m_us10 = fetch_fred_latest("DGS10", fred_key)
+        jp10y, m_jp10 = fetch_fred_latest("IRLTLT01JPM156N", fred_key)  # OECD LT rate JP (monthly)
+        meta["parts"]["fred"] = {"ok": True, "detail": {"vix": m_vix, "dxy": m_dxy, "us10y": m_us10, "jp10y": m_jp10}}
 
-    # --- FRED macro ---
-    vix, m_vix = fetch_fred_latest("VIXCLS", fred_key)
-    dxy, m_dxy = fetch_fred_latest("DTWEXBGS", fred_key)  # broad dollar index
-    us10y, m_us10 = fetch_fred_latest("DGS10", fred_key)
-    jp10y, m_jp10 = fetch_fred_latest("IRLTLT01JPM156N", fred_key)  # OECD long-term interest rate JP (monthly)
-    meta["parts"]["fred"] = {"vix": m_vix, "dxy": m_dxy, "us10y": m_us10, "jp10y": m_jp10}
+        if vix is not None: feats["vix"] = float(vix)
+        if dxy is not None: feats["dxy"] = float(dxy)
+        if us10y is not None: feats["us10y"] = float(us10y)
+        if jp10y is not None: feats["jp10y"] = float(jp10y)
 
-    # Rate diff change proxy (very rough): (us10y - jp10y) / 10
-    rate_diff = None
-    if us10y is not None and jp10y is not None:
-        rate_diff = float(us10y - jp10y)
-    rate_diff_change = 0.0
-    if rate_diff is not None:
-        rate_diff_change = float(max(-1.0, min(1.0, rate_diff / 10.0)))
+        # macro risk: map VIX 15->0, 40->1
+        if vix is not None:
+            feats["macro_risk_score"] = float(max(0.0, min(1.0, (float(vix) - 15.0) / 25.0)))
 
-    # macro_risk_score from VIX + rate volatility proxy
-    macro_risk = 0.0
-    if vix is not None:
-        macro_risk = float(max(0.0, min(1.0, (float(vix) - 15.0) / 25.0)))  # vix 15->0, 40->1
+        # rate diff proxy
+        if us10y is not None and jp10y is not None:
+            rd = float(us10y - jp10y)
+            feats["rate_diff_change"] = float(max(-1.0, min(1.0, rd / 10.0)))
+    except Exception as e:
+        meta["parts"]["fred"] = {"ok": False, "error": f"{type(e).__name__}", "detail": str(e)}
 
-    # --- TradingEconomics surprises (optional) ---
-    cpi_surprise = 0.0
-    nfp_surprise = 0.0
-    if te_key:
-        ev_us, m_te = fetch_te_calendar("united states", te_key, limit=80)
-        cpi = _calc_surprise_from_te(ev_us, "cpi")
-        nfp = _calc_surprise_from_te(ev_us, "non-farm") or _calc_surprise_from_te(ev_us, "employment")
-        if cpi is not None:
-            cpi_surprise = float(max(-1.0, min(1.0, cpi)))
-        if nfp is not None:
-            nfp_surprise = float(max(-1.0, min(1.0, nfp)))
-        meta["parts"]["te"] = m_te
-    else:
-        meta["parts"]["te"] = {"ok": False, "error": "missing_api_key"}
+    # ---- TradingEconomics surprises (optional) ----
+    try:
+        if te_key:
+            ev_us, m_te = fetch_te_calendar("united states", te_key, limit=80)
+            cpi = _calc_surprise_from_te(ev_us, "cpi")
+            nfp = _calc_surprise_from_te(ev_us, "non-farm") or _calc_surprise_from_te(ev_us, "employment")
+            if cpi is not None:
+                feats["cpi_surprise"] = float(max(-1.0, min(1.0, cpi)))
+            if nfp is not None:
+                feats["nfp_surprise"] = float(max(-1.0, min(1.0, nfp)))
+            meta["parts"]["te"] = m_te if isinstance(m_te, dict) else {"ok": True}
+        else:
+            meta["parts"]["te"] = {"ok": False, "error": "missing_api_key"}
+    except Exception as e:
+        meta["parts"]["te"] = {"ok": False, "error": f"{type(e).__name__}", "detail": str(e)}
 
-    # --- GDELT counts (war / finance) ---
-    # NOTE: Use GLOBAL queries (pair-agnostic) to avoid rate limits in multi-pair scans.
-    # We intentionally keep number of requests small (2) and cache for 60 minutes.
-    war_q = '(war OR invasion OR missile OR attack OR sanction OR "state of emergency" OR mobilization)'
-    fin_q = '(bank OR default OR crisis OR recession OR bailout OR "credit crunch" OR "liquidity crunch")'
-    war_cnt, m_war = gdelt_doc_count(war_q, timespan="1d")
-    fin_cnt, m_fin = gdelt_doc_count(fin_q, timespan="1d")
-    meta["parts"]["gdelt"] = {"war": m_war, "finance": m_fin}
+    # ---- GDELT counts (global; cached) ----
+    try:
+        war_q = '(war OR invasion OR missile OR attack OR sanction OR "state of emergency" OR mobilization)'
+        fin_q = '(bank OR default OR crisis OR recession OR bailout OR "credit crunch" OR "liquidity crunch")'
+        war_cnt, m_war = gdelt_doc_count(war_q, timespan="1d")
+        fin_cnt, m_fin = gdelt_doc_count(fin_q, timespan="1d")
+        meta["parts"]["gdelt"] = {"ok": True, "detail": {"war": m_war, "finance": m_fin}}
 
-    war_cnt = int(war_cnt or 0)
-    fin_cnt = int(fin_cnt or 0)
+        war_cnt_i = int(war_cnt or 0)
+        fin_cnt_i = int(fin_cnt or 0)
+        feats["gdelt_war_count_1d"] = float(war_cnt_i)
+        feats["gdelt_finance_count_1d"] = float(fin_cnt_i)
 
-    # Convert counts to probabilities (conservative; saturates slowly)
-    war_prob = float(max(0.0, min(1.0, math.log1p(war_cnt) / 8.0)))
-    fin_stress = float(max(0.0, min(1.0, math.log1p(fin_cnt) / 9.0)))
+        war_prob = float(max(0.0, min(1.0, math.log1p(war_cnt_i) / 8.0)))
+        fin_stress = float(max(0.0, min(1.0, math.log1p(fin_cnt_i) / 9.0)))
+        feats["war_probability"] = war_prob
+        feats["financial_stress"] = fin_stress
+        feats["global_risk_index"] = float(max(0.0, min(1.0, 0.55 * war_prob + 0.45 * fin_stress)))
+    except Exception as e:
+        meta["parts"]["gdelt"] = {"ok": False, "error": f"{type(e).__name__}", "detail": str(e)}
 
-    feats["war_probability"] = war_prob
-    feats["financial_stress"] = fin_stress
-    feats["global_risk_index"] = float(max(0.0, min(1.0, 0.55 * war_prob + 0.45 * fin_stress)))
+    # ---- NewsAPI sentiment (optional) ----
+    try:
+        if news_key:
+            geo_scope = "forex OR (USDJPY OR EURUSD OR GBPUSD OR AUDUSD)"
+            arts, m_news = newsapi_headlines(f"{geo_scope} AND (central bank OR inflation OR war OR crisis)", news_key, page_size=30)
+            news_sent, s_meta = sentiment_from_news(arts)
+            feats["news_sentiment"] = float(max(-1.0, min(1.0, news_sent)))
+            meta["parts"]["newsapi"] = {"ok": True, "detail": {"newsapi": m_news, "sentiment": s_meta}}
+        else:
+            meta["parts"]["newsapi"] = {"ok": False, "error": "missing_api_key"}
+    except Exception as e:
+        meta["parts"]["newsapi"] = {"ok": False, "error": f"{type(e).__name__}", "detail": str(e)}
 
-# --- NewsAPI sentiment (optional) ---
-    news_sent = 0.0
-    if news_key:
-        arts, m_news = newsapi_headlines(f"{geo_scope} AND (FX OR central bank OR inflation OR war OR crisis)", news_key, page_size=20)
-        news_sent = simple_sentiment_from_articles(arts)
-        meta["parts"]["newsapi"] = m_news
-    else:
-        meta["parts"]["newsapi"] = {"ok": False, "error": "missing_api_key"}
+    # ---- OpenAI risk overlay (optional) ----
+    # Purpose: produce conservative global_risk_index override using headlines + gdelt counts + vix.
+    try:
+        if openai_key:
+            ov, m_ov = openai_risk_overlay(openai_key, feats, meta)
+            if isinstance(ov, dict):
+                # Override if provided
+                if "global_risk_index" in ov:
+                    feats["global_risk_index"] = float(max(0.0, min(1.0, float(ov["global_risk_index"]))))
+                if "war_probability" in ov:
+                    feats["war_probability"] = float(max(0.0, min(1.0, float(ov["war_probability"]))))
+                if "financial_stress" in ov:
+                    feats["financial_stress"] = float(max(0.0, min(1.0, float(ov["financial_stress"]))))
+            meta["parts"]["openai"] = m_ov if isinstance(m_ov, dict) else {"ok": True}
+        else:
+            meta["parts"]["openai"] = {"ok": False, "error": "missing_api_key"}
+    except Exception as e:
+        meta["parts"]["openai"] = {"ok": False, "error": f"{type(e).__name__}", "detail": str(e)}
 
-    # --- OpenAI overlay (optional; returns JSON) ---
-    llm_scores: Dict[str, Any] = {}
-    if openai_key:
-        prompt = (
-            "You are a risk analyst. Output ONLY valid JSON with keys: "
-            "war_probability, geopolitical_stress, financial_crisis_probability, pandemic_risk, policy_shift_risk "
-            "each in [0,1]. Use conservative estimates. Context: "
-            f"pair={pair_label}; war_news_count_1d={war_cnt}; finance_news_count_1d={fin_cnt}; "
-            f"vix={vix}; dxy={dxy}; us10y={us10y}; jp10y={jp10y}; cpi_surprise={cpi_surprise}; nfp_surprise={nfp_surprise}; "
-            f"headline_sentiment={news_sent}."
-        )
-        js, m_g = openai_geo_score(prompt, openai_key)
-        meta["parts"]["openai"] = m_g
-        if isinstance(js, dict):
-            llm_scores = js
-    else:
-        meta["parts"]["openai"] = {"ok": False, "error": "missing_api_key"}
-
-    # Merge LLM into probs (as override blend)
-    llm_war = _safe_float(llm_scores.get("war_probability"), None)
-    llm_fin = _safe_float(llm_scores.get("financial_crisis_probability"), None)
-    llm_geo = _safe_float(llm_scores.get("geopolitical_stress"), None)
-    if llm_war is not None:
-        war_prob = float(max(war_prob, float(llm_war) * 0.95))  # conservative
-    if llm_fin is not None:
-        fin_stress = float(max(fin_stress, float(llm_fin) * 0.95))
-    if llm_geo is not None:
-        # geo stress contributes to global risk
-        pass
-
-    # Global risk index: combines war + finance + macro; sentiment reduces slightly
-    geo_stress = _safe_float(llm_geo, 0.0)
-    global_risk = 0.40 * war_prob + 0.30 * fin_stress + 0.30 * macro_risk
-    global_risk = float(max(0.0, min(1.0, global_risk + 0.15 * geo_stress - 0.10 * max(0.0, news_sent))))
-
-    feats = {
-        "news_sentiment": float(news_sent),
-        "cpi_surprise": float(cpi_surprise),
-        "nfp_surprise": float(nfp_surprise),
-        "rate_diff_change": float(rate_diff_change),
-        "macro_risk_score": float(macro_risk),
-        "global_risk_index": float(global_risk),
-        "war_probability": float(war_prob),
-        "financial_stress": float(fin_stress),
-        "gdelt_war_count_1d": float(war_cnt),
-        "gdelt_finance_count_1d": float(fin_cnt),
-        "vix": float(vix) if vix is not None else float("nan"),
-        "dxy": float(dxy) if dxy is not None else float("nan"),
-        "us10y": float(us10y) if us10y is not None else float("nan"),
-        "jp10y": float(jp10y) if jp10y is not None else float("nan"),
-    }
     return feats, meta
-# -------------------------
-# GDELT throttle (429 guard)
-# -------------------------
-_GDELT_LAST_CALL_TS = 0.0
 
-def _gdelt_throttle(min_interval_s: float = 2.2) -> None:
-    global _GDELT_LAST_CALL_TS
-    now = time.time()
-    wait = (_GDELT_LAST_CALL_TS + min_interval_s) - now
-    if wait > 0:
-        time.sleep(wait)
-    _GDELT_LAST_CALL_TS = time.time()
 
+def openai_risk_overlay(openai_key: str, feats: Dict[str, float], meta: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    Calls OpenAI to estimate conservative risk scores from already-fetched numbers.
+    Uses Responses API if available; falls back to a lightweight HTTP call.
+    Returns (overlay_dict, meta_dict).
+    """
+    # Build a compact prompt (no long text to avoid cost/latency)
+    payload = {
+        "vix": feats.get("vix"),
+        "macro_risk_score": feats.get("macro_risk_score"),
+        "gdelt_war_count_1d": feats.get("gdelt_war_count_1d"),
+        "gdelt_finance_count_1d": feats.get("gdelt_finance_count_1d"),
+        "news_sentiment": feats.get("news_sentiment"),
+    }
+    prompt = (
+        "You are a risk overlay engine for FX trading. "
+        "Given the inputs, output strict JSON with keys: "
+        "global_risk_index (0-1), war_probability (0-1), financial_stress (0-1). "
+        "Be conservative: if uncertain, return higher risk. "
+        f"inputs={json.dumps(payload, ensure_ascii=False)}"
+    )
+
+    try:
+        url = "https://api.openai.com/v1/responses"
+        headers = {"Authorization": f"Bearer {openai_key}", "Content-Type": "application/json"}
+        body = {
+            "model": "gpt-4.1-mini",
+            "input": prompt,
+            "response_format": {"type": "json_object"},
+        }
+        r = requests.post(url, headers=headers, json=body, timeout=20)
+        if r.status_code != 200:
+            return {}, {"ok": False, "error": f"http_{r.status_code}", "detail": r.text[:500]}
+        j = r.json()
+        # responses API returns output array; extract text/json
+        out_txt = ""
+        try:
+            for item in j.get("output", []):
+                for c in item.get("content", []):
+                    if c.get("type") in ("output_text", "text"):
+                        out_txt += c.get("text", "")
+        except Exception:
+            out_txt = ""
+        if not out_txt:
+            # attempt direct field
+            out_txt = j.get("output_text", "") or ""
+        ov = json.loads(out_txt) if out_txt else {}
+        return ov if isinstance(ov, dict) else {}, {"ok": True}
+    except Exception as e:
+        return {}, {"ok": False, "error": f"{type(e).__name__}", "detail": str(e)}
