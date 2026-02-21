@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import os
 import time
+import hashlib
+import sys
 import math
 import json
 import random
@@ -25,7 +27,81 @@ except Exception:
 # -------------------------
 # Helpers
 # -------------------------
-DEFAULT_HEADERS = {"User-Agent": "fx-ev-engine/1.0"}
+DEFAULT_HEADERS = {"User-Agent": "fx-engine/1.0"}
+
+
+def _file_sha12(path: str) -> str:
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            h.update(f.read())
+        return h.hexdigest()[:12]
+    except Exception:
+        return "unknown"
+
+
+
+# =========================
+# Build / Diagnostics
+# =========================
+DATA_LAYER_BUILD = "fixed11_20260222"
+# -------------------------
+# Last-known-good risk cache (process lifetime)
+# - Streamlit Cloud can have intermittent outbound/network/API outages.
+# - We keep the last valid risk values so the panel never collapses to "0 = safe".
+# -------------------------
+_LAST_GOOD_RISK: Dict[str, Any] = {"ts": 0.0, "global_risk_index": None, "war_probability": None, "financial_stress": None}
+
+def _set_last_good_risk(g: float | None, w: float | None, f: float | None) -> None:
+    try:
+        if g is None or w is None or f is None:
+            return
+        gg = float(g); ww = float(w); ff = float(f)
+        if math.isnan(gg) or math.isnan(ww) or math.isnan(ff):
+            return
+        # accept only sensible range
+        if not (0.0 <= gg <= 1.0 and 0.0 <= ww <= 1.0 and 0.0 <= ff <= 1.0):
+            return
+        _LAST_GOOD_RISK["ts"] = _now_ts()
+        _LAST_GOOD_RISK["global_risk_index"] = gg
+        _LAST_GOOD_RISK["war_probability"] = ww
+        _LAST_GOOD_RISK["financial_stress"] = ff
+    except Exception:
+        return
+
+def _get_last_good_risk(max_age_s: float = 6 * 3600) -> Optional[Dict[str, float]]:
+    try:
+        ts = float(_LAST_GOOD_RISK.get("ts") or 0.0)
+        if ts <= 0:
+            return None
+        if (_now_ts() - ts) > float(max_age_s):
+            return None
+        g = _LAST_GOOD_RISK.get("global_risk_index")
+        w = _LAST_GOOD_RISK.get("war_probability")
+        f = _LAST_GOOD_RISK.get("financial_stress")
+        if g is None or w is None or f is None:
+            return None
+        return {"global_risk_index": float(g), "war_probability": float(w), "financial_stress": float(f), "age_s": float(_now_ts() - ts)}
+    except Exception:
+        return None
+
+# -------------------------
+# News sentiment lexicon (operator-safe)
+# NOTE: Keep it simple, deterministic, and never raise NameError.
+# -------------------------
+POS_WORDS = (
+    "calm","stabilize","stability","rebound","recover","recovery","relief","deal","ceasefire",
+    "easing","cut","rate cut","disinflation","growth","upbeat","optimism","improve","progress",
+    "strong","soft landing","cooling","support","aid","agreement","de-escalation","dovish",
+    "liquidity","rescue","bailout","contained","reopen","surplus","upgrade","beat","rally",
+)
+NEG_WORDS = (
+    "war","conflict","invasion","attack","strike","missile","terror","hostage","sanction",
+    "escalate","escalation","crisis","panic","collapse","default","bankrupt","bankruptcy",
+    "recession","slump","selloff","sell-off","crash","shock","risk-off","risk off","downgrade",
+    "fraud","inflation","surge","spike","hike","rate hike","tighten","tightening",
+    "liquidation","contagion","systemic","blackout","shutdown","unrest",
+)
 
 def _now_ts() -> float:
     return time.time()
@@ -234,6 +310,7 @@ def gdelt_doc_count(query: str, mode: str = "artlist", timespan: str = "1d") -> 
         "scaled": False,
     }
 
+    meta["timeout"] = "(connect=8, read=75)"
     base = "https://api.gdeltproject.org/api/v2/doc/doc"
 
     def _fetch(ts: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
@@ -307,47 +384,55 @@ def newsapi_headlines(query: str, api_key: str, page_size: int = 20) -> Tuple[Li
         meta["error"] = f"{type(e).__name__}:{e}"
         return [], meta
 
-def simple_sentiment_from_articles(articles: List[Dict[str, Any]]) -> float:
-    """
-    Very conservative sentiment in [-1,1] based on headline keywords.
-    """
-    if not articles:
-        return 0.0
-    score = 0.0
-    n = 0
-    for a in articles[:30]:
-        txt = (a.get("title") or "") + " " + (a.get("description") or "")
-        t = txt.lower()
-        s = 0.0
-        for w in POS_WORDS:
-            if w in t:
-                s += 1.0
-        for w in NEG_WORDS:
-            if w in t:
-                s -= 1.2
-        if s != 0.0:
-            score += s
-            n += 1
-    if n == 0:
-        return 0.0
-    # squash
-    score = score / max(n, 1)
-    return float(max(-1.0, min(1.0, score / 5.0)))
 
-# -------------------------
-
-# -------------------------
-# OpenAI (optional)
-# -------------------------
-@_cache(ttl=60*30)
-def sentiment_from_news(articles: List[Dict[str, Any]]) -> Tuple[float, Dict[str, Any]]:
-    """Return (sentiment_score, meta). Safe and cheap."""
+def simple_sentiment_from_texts(texts: Tuple[str, ...]) -> float:
+    """
+    Very conservative sentiment in [-1,1] based on headline keyword hits.
+    - Deterministic
+    - Never raises (returns 0.0 on any exception)
+    """
     try:
-        n = len(articles or [])
-        s = float(simple_sentiment_from_articles(articles or []))
-        return s, {"ok": True, "n": n}
+        if not texts:
+            return 0.0
+        score = 0.0
+        n = 0
+        for raw in texts[:30]:
+            t = (raw or "").lower()
+            s = 0.0
+            for w in POS_WORDS:
+                if w and w in t:
+                    s += 1.0
+            for w in NEG_WORDS:
+                if w and w in t:
+                    s -= 1.2
+            if s != 0.0:
+                score += s
+                n += 1
+        if n == 0:
+            return 0.0
+        score = score / max(n, 1)
+        return float(max(-1.0, min(1.0, score / 5.0)))
+    except Exception:
+        return 0.0
+
+@_cache(ttl=60*30)
+def sentiment_from_texts(texts: Tuple[str, ...]) -> Tuple[float, Dict[str, Any]]:
+    """Cached wrapper. Returns (sentiment_score, meta)."""
+    try:
+        s = float(simple_sentiment_from_texts(texts))
+        return s, {"ok": True, "n": int(len(texts))}
     except Exception as e:
         return 0.0, {"ok": False, "error": f"{type(e).__name__}", "detail": str(e)}
+
+def simple_sentiment_from_articles(articles: List[Dict[str, Any]]) -> float:
+    """Backward-compat alias. Articles -> texts."""
+    texts = tuple(((a.get("title") or "") + " " + (a.get("description") or "")) for a in (articles or [])[:30])
+    return float(simple_sentiment_from_texts(texts))
+
+def sentiment_from_news(articles: List[Dict[str, Any]]) -> Tuple[float, Dict[str, Any]]:
+    """Backward-compat alias. Articles -> texts."""
+    texts = tuple(((a.get("title") or "") + " " + (a.get("description") or "")) for a in (articles or [])[:30])
+    return sentiment_from_texts(texts)
 
 def openai_geo_score(prompt: str, api_key: str, model: str = "gpt-4o-mini") -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
@@ -455,8 +540,7 @@ def _pair_to_geo_query(pair_label: str) -> str:
         return "Australia OR AUD"
     return "FX OR currency"
 
-@_cache(ttl=60*15)
-def fetch_external_features(pair_label: str, keys: Dict[str, str] | None = None) -> Tuple[Dict[str, float], Dict[str, Any]]:
+def _fetch_external_features_impl(pair_label: str, keys: Dict[str, str] | None = None) -> Tuple[Dict[str, float], Dict[str, Any]]:
     """
     Returns (features, meta). Never raises.
     This function is pair-agnostic for global risk sources to avoid rate limits in multi-pair scans.
@@ -497,7 +581,9 @@ def fetch_external_features(pair_label: str, keys: Dict[str, str] | None = None)
         },
     }
 
-    # ---- FRED macro ----
+    meta["parts"]["build"] = {"ok": True, "detail": {"data_layer_build": DATA_LAYER_BUILD, "file": __file__, "sha12": _file_sha12(__file__)}}
+    meta["parts"]["cfg"] = {"ok": True, "detail": {"gdelt_timeout": "(8,75)", "gdelt_min_interval_s": 5.2, "global_cache_ttl_s": 900}}
+# ---- FRED macro ----
     try:
         vix, m_vix = fetch_fred_latest("VIXCLS", fred_key)
         dxy, m_dxy = fetch_fred_latest("DTWEXBGS", fred_key)  # broad dollar index
@@ -567,11 +653,14 @@ def fetch_external_features(pair_label: str, keys: Dict[str, str] | None = None)
         if news_key:
             geo_scope = "forex OR (USDJPY OR EURUSD OR GBPUSD OR AUDUSD)"
             arts, m_news = newsapi_headlines(f"{geo_scope} AND (central bank OR inflation OR war OR crisis)", news_key, page_size=30)
-            news_sent, s_meta = sentiment_from_news(arts)
+            texts = tuple(((a.get("title") or "") + " " + (a.get("description") or "")) for a in (arts or [])[:30])
+            news_sent, s_meta = sentiment_from_texts(texts)
             feats["news_sentiment"] = float(max(-1.0, min(1.0, news_sent)))
             meta["parts"]["newsapi"] = {"ok": True, "detail": {"newsapi": m_news, "sentiment": s_meta}}
         else:
             meta["parts"]["newsapi"] = {"ok": False, "error": "missing_api_key"}
+    except NameError as e:
+        meta["parts"]["newsapi"] = {"ok": False, "error": "NameError", "detail": {"name": getattr(e, 'name', None), "msg": str(e)}}
     except Exception as e:
         meta["parts"]["newsapi"] = {"ok": False, "error": f"{type(e).__name__}", "detail": str(e)}
 
@@ -614,7 +703,11 @@ def fetch_external_features(pair_label: str, keys: Dict[str, str] | None = None)
                 used = True
 
         if (not gdelt_ok) and (not openai_ok):
-            base = float(max(0.0, min(1.0, 0.45 * macro + 0.15 * news_mag)))
+            # If we have NO reliable signals at all, use a neutral baseline (0.50) instead of 0.0.
+            if macro <= 0.0 and news_mag <= 0.0:
+                base = 0.50
+            else:
+                base = float(max(0.0, min(1.0, 0.45 * macro + 0.15 * news_mag)))
             if _safe_float(feats.get("global_risk_index"), 0.0) <= 0.0:
                 feats["global_risk_index"] = base
                 used = True
@@ -640,8 +733,122 @@ def fetch_external_features(pair_label: str, keys: Dict[str, str] | None = None)
     except Exception:
         pass
 
+    # ---- Data quality / outage handling (operator-safe) ----
+    try:
+        parts = meta.get("parts", {}) if isinstance(meta, dict) else {}
+        fred_ok = bool((parts.get("fred", {}) or {}).get("ok"))
+        news_ok = bool((parts.get("newsapi", {}) or {}).get("ok"))
+        gdelt_ok = bool((parts.get("gdelt", {}) or {}).get("ok"))
+        openai_ok = bool((parts.get("openai", {}) or {}).get("ok"))
+
+        ok_count = int(fred_ok) + int(news_ok) + int(gdelt_ok) + int(openai_ok)
+        reasons = []
+        if not fred_ok: reasons.append("FRED未取得")
+        if not news_ok: reasons.append("NewsAPI未取得")
+        if not gdelt_ok: reasons.append("GDELT未取得")
+        if not openai_ok: reasons.append("OpenAI未取得")
+
+        if ok_count >= 3:
+            level = "OK"
+        elif ok_count >= 1:
+            level = "DEGRADED"
+        else:
+            level = "OUTAGE"
+
+        parts["quality"] = {
+            "ok": (level != "OUTAGE"),
+            "detail": {
+                "level": level,
+                "ok_count": ok_count,
+                "reasons": reasons,
+            },
+        }
+
+        # Store last-good when we have a meaningful risk estimate
+        g = _safe_float(feats.get("global_risk_index"), None)
+        w = _safe_float(feats.get("war_probability"), None)
+        f = _safe_float(feats.get("financial_stress"), None)
+        if g is not None and w is not None and f is not None and (openai_ok or gdelt_ok) and (g > 0 or w > 0 or f > 0):
+            _set_last_good_risk(g, w, f)
+
+        # If everything is down, use last-good (<=6h) or neutral baseline; never show 0=SAFE.
+        if level == "OUTAGE":
+            lg = _get_last_good_risk(max_age_s=6 * 3600)
+            if lg:
+                feats["global_risk_index"] = float(lg["global_risk_index"])
+                feats["war_probability"] = float(lg["war_probability"])
+                feats["financial_stress"] = float(lg["financial_stress"])
+                parts["outage_fallback"] = {"ok": True, "detail": {"mode": "last_good", "age_s": round(float(lg.get("age_s", 0.0)), 1)}}
+
+                # Refresh panel values after fallback
+                try:
+                    parts["risk_values"] = {
+                        "ok": True,
+                        "detail": {
+                            "global_risk_index": round(_safe_float(feats.get("global_risk_index"), 0.0), 3),
+                            "war_probability": round(_safe_float(feats.get("war_probability"), 0.0), 3),
+                            "financial_stress": round(_safe_float(feats.get("financial_stress"), 0.0), 3),
+                            "macro_risk_score": round(_safe_float(feats.get("macro_risk_score"), 0.0), 3),
+                            "news_sentiment": round(_safe_float(feats.get("news_sentiment"), 0.0), 3),
+                            "gdelt_war_count_1d": int(_safe_float(feats.get("gdelt_war_count_1d"), 0.0)),
+                            "gdelt_finance_count_1d": int(_safe_float(feats.get("gdelt_finance_count_1d"), 0.0)),
+                            "data_quality_level": str((parts.get("quality", {}) or {}).get("detail", {}).get("level", "")),
+                        },
+                    }
+                except Exception:
+                    pass
+            else:
+                feats["global_risk_index"] = 0.50
+                feats["war_probability"] = 0.35
+                feats["financial_stress"] = 0.50
+                parts["outage_fallback"] = {"ok": True, "detail": {"mode": "neutral", "note": "外部データ全滅のため中立値を表示"}}
+
+                # Refresh panel values after fallback
+                try:
+                    parts["risk_values"] = {
+                        "ok": True,
+                        "detail": {
+                            "global_risk_index": round(_safe_float(feats.get("global_risk_index"), 0.0), 3),
+                            "war_probability": round(_safe_float(feats.get("war_probability"), 0.0), 3),
+                            "financial_stress": round(_safe_float(feats.get("financial_stress"), 0.0), 3),
+                            "macro_risk_score": round(_safe_float(feats.get("macro_risk_score"), 0.0), 3),
+                            "news_sentiment": round(_safe_float(feats.get("news_sentiment"), 0.0), 3),
+                            "gdelt_war_count_1d": int(_safe_float(feats.get("gdelt_war_count_1d"), 0.0)),
+                            "gdelt_finance_count_1d": int(_safe_float(feats.get("gdelt_finance_count_1d"), 0.0)),
+                            "data_quality_level": str((parts.get("quality", {}) or {}).get("detail", {}).get("level", "")),
+                        },
+                    }
+                except Exception:
+                    pass
+    except Exception as e:
+        try:
+            meta.setdefault("parts", {})["quality"] = {"ok": False, "error": f"{type(e).__name__}", "detail": str(e)}
+        except Exception:
+            pass
+
+    return feats, meta
 
 
+@_cache(ttl=60*15)
+def fetch_global_external_features(keys: Dict[str, str] | None = None) -> Tuple[Dict[str, float], Dict[str, Any]]:
+    """
+    Global external sources (GDELT/NewsAPI/FRED/TE/OpenAI-inputs).
+    Cached WITHOUT pair_label so multi-pair scans do NOT multiply API calls.
+    """
+    feats, meta = _fetch_external_features_impl(pair_label="GLOBAL", keys=keys or {})
+    meta = dict(meta or {})
+    meta["build"] = DATA_LAYER_BUILD
+    meta["scope"] = "global_cached"
+    return feats, meta
+
+def fetch_external_features(pair_label: str, keys: Dict[str, str] | None = None) -> Tuple[Dict[str, float], Dict[str, Any]]:
+    """
+    Backward-compatible wrapper (keeps the old signature).
+    Internally uses global cached fetch to avoid rate limits.
+    """
+    feats, meta = fetch_global_external_features(keys=keys or {})
+    meta = dict(meta or {})
+    meta["pair_label"] = str(pair_label or "")
     return feats, meta
 
 
