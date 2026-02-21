@@ -217,50 +217,76 @@ def _calc_surprise_from_te(events: List[Dict[str, Any]], indicator_contains: str
 @_cache(ttl=60*10)
 def gdelt_doc_count(query: str, mode: str = "artlist", timespan: str = "1d") -> Tuple[Optional[int], Dict[str, Any]]:
     """
-    Returns integer count estimate for query over last timespan (e.g. 1d, 7d).
-    We use "timelinevolraw" which returns series with counts.
+    Returns integer count estimate for query over last timespan (e.g. 12h, 1d, 7d).
+
+    Notes:
+    - Streamlit CloudなどでGDELT応答が遅い/不安定な場合があるため、
+      まず指定timespanで取得し、ReadTimeout系なら短いtimespan(12h)へフォールバックします。
+    - 12hフォールバック時は 1d相当にスケール（×2）して返します（推定）。
     """
-    meta = {"ok": False, "source": "GDELT", "error": None, "query": query, "timespan": timespan}
-    base = "https://api.gdeltproject.org/api/v2/doc/doc"
-    params = {
+    meta: Dict[str, Any] = {
+        "ok": False,
+        "source": "GDELT",
+        "error": None,
         "query": query,
-        "mode": "timelinevolraw",
-        "format": "json",
-        "timelinesmooth": "0",
-        "maxrecords": "250",
-        "format": "json",
         "timespan": timespan,
+        "used_timespan": timespan,
+        "scaled": False,
     }
-    _gdelt_throttle()
-    j, err = _http_get_json_retry(base, params=params, timeout=(10, 35), retries=2, backoff_s=1.4)
+
+    base = "https://api.gdeltproject.org/api/v2/doc/doc"
+
+    def _fetch(ts: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        params = {
+            "query": query,
+            "mode": "timelinevolraw",
+            "format": "json",
+            "timelinesmooth": "0",
+            # timeline系はmaxrecordsが効かない場合もあるが、過大にならないよう保守的に
+            "maxrecords": "120",
+            "timespan": ts,
+        }
+        # GDELTは429もあるので軽くスロットル
+        _gdelt_throttle(min_interval_s=1.35)
+        # 読み取りが遅い環境対策：readを長めに
+        return _http_get_json_retry(base, params=params, timeout=(8, 55), retries=2, backoff_s=1.6)
+
+    j, err = _fetch(timespan)
+    scale = 1.0
+
+    # フォールバック：ReadTimeout/Timeoutなら短いtimespanで再試行
+    if err and str(timespan).lower() in ("1d", "24h") and ("ReadTimeout" in err or "Timeout" in err):
+        j2, err2 = _fetch("12h")
+        if not err2:
+            j, err = j2, None
+            meta["used_timespan"] = "12h"
+            meta["scaled"] = True
+            scale = 2.0
+        else:
+            # 併記して返す（診断用）
+            meta["error"] = (str(err) + " | fallback12h:" + str(err2))[:380]
+            return None, meta
+
     if err:
-        meta["error"] = err
+        meta["error"] = str(err)[:380]
         return None, meta
+
     try:
-        timeline = (j or {}).get("timeline", [])
+        timeline = (j or {}).get("timeline", []) if isinstance(j, dict) else []
         if not timeline:
             meta["ok"] = True
             return 0, meta
-        # sum all bins
+
         s = int(sum(int(t.get("value", 0)) for t in timeline))
+        if scale != 1.0:
+            s = int(round(float(s) * float(scale)))
+
         meta["ok"] = True
         return s, meta
     except Exception as e:
         meta["error"] = f"{type(e).__name__}:{e}"
         return None, meta
 
-# -------------------------
-# NewsAPI (optional)
-# -------------------------
-POS_WORDS = {
-    "deal","agreement","ceasefire","peace","dovish","easing","recovery","growth","stability","calm"
-}
-NEG_WORDS = {
-    "war","attack","missile","invasion","sanction","crisis","collapse","default","panic","bankrun",
-    "pandemic","outbreak","lockdown","emergency","martial","terror","nuclear","escalation","shooting"
-}
-
-@_cache(ttl=60*15)
 def newsapi_headlines(query: str, api_key: str, page_size: int = 20) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     meta = {"ok": False, "source": "NewsAPI", "error": None}
     if not api_key:
