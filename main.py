@@ -45,6 +45,10 @@ PAIR_LIST_DEFAULT = [
 
 
 # =========================
+# Build / Diagnostics
+# =========================
+APP_BUILD = "fixed11_20260222"
+# =========================
 # Operator-friendly labels
 # =========================
 STATE_LABELS_JA = {
@@ -457,10 +461,49 @@ def _render_risk_dashboard(plan: Dict[str, Any], feats: Dict[str, float], ext_me
     gov_enabled = bool(gov.get("enabled", True))
     st.info(_action_hint(global_risk, war, fin, macro, bs_flag, gov_enabled))
 
+    # ---- Data quality banner (no more CSV guessing) ----
+    try:
+        parts = (ext_meta or {}).get("parts", {}) if isinstance(ext_meta, dict) else {}
+        q = (parts.get("quality", {}) or {}).get("detail", {}) if isinstance(parts.get("quality", {}), dict) else {}
+        level = str(q.get("level", "") or "")
+        reasons = q.get("reasons", []) if isinstance(q.get("reasons", []), list) else []
+        if level == "OUTAGE":
+            fb = (parts.get("outage_fallback", {}) or {}).get("detail", {}) if isinstance(parts.get("outage_fallback", {}), dict) else {}
+            mode = str(fb.get("mode", "") or "")
+            if mode == "last_good":
+                st.error(f"🛑 外部データ全滅（OUTAGE）→ 直近の正常値で表示しています（last_good）。理由: {', '.join(reasons) if reasons else '不明'}")
+            else:
+                st.error(f"🛑 外部データ全滅（OUTAGE）→ 中立値で表示しています（neutral）。理由: {', '.join(reasons) if reasons else '不明'}")
+            st.caption("この状態は『バグ』よりも『デプロイ不一致 / Secrets未反映 / 外部API障害』が多いです。まず status の build と data_layer.__file__ を確認してください。")
+        elif level == "DEGRADED":
+            st.warning(f"⚠ 外部データ一部欠損（DEGRADED）: {', '.join(reasons) if reasons else ''}（OpenAI/FREDで補完して運用は継続可能）")
+        elif level == "OK":
+            st.success("✅ 外部データ品質：OK（主要ソースが揃っています）")
+    except Exception:
+        pass
+
+
     try:
         st.markdown("#### 外部データ取得ステータス（0が続く/異常が出る場合はここを確認）")
         st.caption("OKでも中身が空/一部失敗があり得るため、detail と error を必ず見ます。")
         df = _parts_status_table(ext_meta)
+
+        # ---- Runtime fingerprint (one-shot proof of what is actually running) ----
+        try:
+            dl_file = getattr(data_layer, "__file__", "IMPORT_FAILED")
+            dl_build = getattr(data_layer, "DATA_LAYER_BUILD", "?")
+            sha12 = "unknown"
+            try:
+                import hashlib as _hashlib
+                with open(dl_file, "rb") as _f:
+                    sha12 = _hashlib.sha256(_f.read()).hexdigest()[:12]
+            except Exception:
+                pass
+            rows = [{"source": "runtime", "ok": True, "error": None,
+                     "detail": f"main={APP_BUILD}, data_layer={dl_build}, sha12={sha12}, file={dl_file}"}]
+            df = pd.concat([pd.DataFrame(rows), df], ignore_index=True)
+        except Exception:
+            pass
 
         meaning = {
             "keys": "キー検出状況（secrets/ui/env）",
@@ -469,6 +512,10 @@ def _render_risk_dashboard(plan: Dict[str, Any], feats: Dict[str, float], ext_me
             "gdelt": "紛争/金融ニュース量（無料）",
             "newsapi": "記事見出しセンチメント",
             "openai": "LLMによる地政学/危機推定（JSON）",
+            "risk_values": "リスク値（最終：運用判断の基準）",
+            "build": "実行中のコード版（fixed番号）",
+            "failsafe": "外部失敗時の保守的な下駄（0固定回避）",
+            "risk_values": "パネル表示用の集計値（丸め）",
         }
         if "source" in df.columns and "meaning" not in df.columns:
             df["meaning"] = df["source"].map(lambda x: meaning.get(str(x), ""))
@@ -479,7 +526,7 @@ def _render_risk_dashboard(plan: Dict[str, Any], feats: Dict[str, float], ext_me
         ts = time.strftime("%Y-%m-%dT%H-%M")
         st.download_button("ステータスCSVをダウンロード", data=csv, file_name=f"{ts}_risk_status_export.csv", mime="text/csv")
 
-        st.caption(f"modules: logic={getattr(logic, '__file__', '?')} / data_layer={getattr(data_layer, '__file__', 'IMPORT_FAILED')}")
+        st.caption(f"build: main={APP_BUILD} / data_layer={getattr(data_layer, 'DATA_LAYER_BUILD', '?')}  |  modules: logic={getattr(logic, '__file__', '?')} / data_layer={getattr(data_layer, '__file__', 'IMPORT_FAILED')}")
     except Exception:
         pass
 
@@ -544,6 +591,7 @@ with st.sidebar:
     st.caption("迷ったら：モード=自動抽出 / スタイル=標準 / 期間=週 のままでOK")
     with st.expander("このパネルの役割（運用者向け）", expanded=False):
         st.markdown("- **モード**：複数ペア走査（運用向け）/ 単一ペア（検証向け）\n- **運用スタイル**：見送りライン（EV閾値）を自動で調整\n- **想定期間**：週=安定 / 日=短期\n- **APIキー**：外部リスクの精度が上がる（無くても動く）\n- **Capital Governor**：DD/損失/連敗で強制停止（本気運用の安全装置）")
+    outage_policy = st.selectbox("外部データ全滅時の扱い", ["表示のみ（推奨：エントリー機会を殺さない）", "強制見送り（安全優先）"], index=0)
     mode = st.selectbox("モード", ["相場全体から最適ペアを自動抽出（推奨）", "単一ペア最適化（徹底）"], index=0)
     style_name = st.selectbox("運用スタイル", ["標準", "保守", "攻撃"], index=0)
     horizon_mode = st.selectbox("想定期間", ["週（推奨）", "日"], index=0)
@@ -637,6 +685,21 @@ with tabs[0]:
             ctx = _build_ctx(p, df, feats, horizon_days=int(horizon_days), min_expected_R=float(min_expected_R), style_name=style_name, governor_cfg=governor_cfg)
             plan = logic.get_ai_order_strategy(api_key=keys.get("OPENAI_API_KEY",""), context_data=ctx)
 
+            plan_ui = plan
+            try:
+                parts = (ext_meta or {}).get("parts", {}) if isinstance(ext_meta, dict) else {}
+                level = str(((parts.get("quality", {}) or {}).get("detail", {}) or {}).get("level", "") or "")
+                if "強制見送り" in str(locals().get("outage_policy","")) and level == "OUTAGE":
+                    # UI only: do not change logic.py; just stop recommending entries when blind
+                    plan_ui = dict(plan or {})
+                    plan_ui["decision"] = "NO_TRADE"
+                    vr = list(plan_ui.get("veto_reasons") or [])
+                    if "DATA_OUTAGE" not in vr:
+                        vr.append("DATA_OUTAGE（外部データ全滅）")
+                    plan_ui["veto_reasons"] = vr
+            except Exception:
+                plan_ui = plan
+
             ev = float(plan.get("expected_R_ev") or 0.0)
             decision = str(plan.get("decision") or "NO_TRADE")
             conf = float(plan.get("confidence") or 0.0)
@@ -668,10 +731,10 @@ with tabs[0]:
         price = float(best["_ctx"].get("price", 0.0))
 
         # Top panel must show entry format + price (user request)
-        _render_top_trade_panel(best["pair"], plan, price)
+        _render_top_trade_panel(best["pair"], plan_ui, price)
 
         # Risk dashboard (new)
-        _render_risk_dashboard(plan, feats, ext_meta=best.get("_ext_meta", {}))
+        _render_risk_dashboard(plan_ui, feats, ext_meta=best.get("_ext_meta", {}))
 
         st.markdown("### EVランキング（代替案ペアはここ）")
         view = [{
@@ -715,9 +778,23 @@ with tabs[0]:
         ctx = _build_ctx(pair_label, df, feats, horizon_days=int(horizon_days), min_expected_R=float(min_expected_R), style_name=style_name, governor_cfg=governor_cfg)
         plan = logic.get_ai_order_strategy(api_key=keys.get("OPENAI_API_KEY",""), context_data=ctx)
 
+        plan_ui = plan
+        try:
+            parts = (ext_meta or {}).get("parts", {}) if isinstance(ext_meta, dict) else {}
+            level = str(((parts.get("quality", {}) or {}).get("detail", {}) or {}).get("level", "") or "")
+            if "強制見送り" in str(locals().get("outage_policy","")) and level == "OUTAGE":
+                plan_ui = dict(plan or {})
+                plan_ui["decision"] = "NO_TRADE"
+                vr = list(plan_ui.get("veto_reasons") or [])
+                if "DATA_OUTAGE" not in vr:
+                    vr.append("DATA_OUTAGE（外部データ全滅）")
+                plan_ui["veto_reasons"] = vr
+        except Exception:
+            plan_ui = plan
+
         price = float(ctx.get("price", 0.0))
-        _render_top_trade_panel(pair_label, plan, price)
-        _render_risk_dashboard(plan, feats, ext_meta=ext_meta)
+        _render_top_trade_panel(pair_label, plan_ui, price)
+        _render_risk_dashboard(plan_ui, feats, ext_meta=ext_meta)
 
         st.markdown("### EV内訳（何がEVを潰しているか）")
         ev_contribs = plan.get("ev_contribs", {}) or {}
@@ -844,4 +921,3 @@ with tabs[2]:
 - **TradingEconomics 403**：無料キー国制限（仕様寄り）
 - **GDELT timeout/429**：ネットワーク到達性 or 間隔制御不足（キャッシュ/リトライで緩和）
 """)
-
