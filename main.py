@@ -206,36 +206,59 @@ def fetch_external(pair_label: str, keys: Dict[str, str]) -> Tuple[Dict[str, flo
 
 
 def _parts_status_table(meta: Dict[str, Any]) -> pd.DataFrame:
+    """Flatten external meta['parts'] into a compact status table for UI/debug."""
     parts = (meta or {}).get("parts", {}) if isinstance(meta, dict) else {}
-    rows = []
+    rows: List[Dict[str, Any]] = []
+
     if isinstance(parts, dict):
         for name, p in parts.items():
             ok = None
             err = None
-            extra = ""
+            detail = ""
+
             if isinstance(p, dict):
-                # common meta format
-                ok = p.get("ok")
+                if "ok" in p:
+                    ok = bool(p.get("ok"))
                 err = p.get("error")
-                # nested like {"vix": {...}, ...}
-                if ok is None and any(isinstance(v, dict) for v in p.values()):
-                    # summarize nested dicts
-                    nested_ok = []
-                    nested_errs = []
-                    for k,v in p.items():
-                        if isinstance(v, dict):
-                            nested_ok.append(f"{k}:{'ok' if v.get('ok') else 'ng'}")
+
+                # Prefer 'detail'
+                d = p.get("detail")
+                if isinstance(d, dict):
+                    # If nested dict of dicts, summarize each child as ok/ng
+                    child_flags: List[str] = []
+                    child_errs: List[str] = []
+                    child_ok_bools: List[bool] = []
+
+                    for k, v in d.items():
+                        if isinstance(v, dict) and ("ok" in v or "error" in v):
+                            child_ok = bool(v.get("ok")) if "ok" in v else None
+                            if child_ok is not None:
+                                child_ok_bools.append(child_ok)
+                            child_flags.append(f"{k}:{'ok' if child_ok else 'ng'}" if child_ok is not None else f"{k}:—")
                             if v.get("error"):
-                                nested_errs.append(f"{k}:{v.get('error')}")
-                    ok = all("ok" in x and x.endswith("ok") for x in nested_ok) if nested_ok else None
-                    extra = ", ".join(nested_ok)[:120]
-                    err = "; ".join(nested_errs)[:160] if nested_errs else err
+                                child_errs.append(f"{k}:{v.get('error')}")
+                        else:
+                            # non-standard child
+                            child_flags.append(f"{k}:—")
+
+                    if child_flags:
+                        detail = ", ".join(child_flags)[:160]
+                    if not err and child_errs:
+                        err = "; ".join(child_errs)[:200]
+                    if ok is None and child_ok_bools:
+                        ok = all(child_ok_bools)
+                elif d is not None:
+                    detail = str(d)[:160]
+
                 n = p.get("n", None)
                 if n is not None:
-                    extra = (extra + f" n={n}").strip()
-            rows.append({"source": name, "ok": ok, "error": err, "detail": extra})
+                    detail = (detail + f" n={n}").strip()
+
+            rows.append({"source": name, "ok": ok, "error": err, "detail": detail})
+
     if not rows:
         rows = [{"source": "external", "ok": False, "error": "no_meta_parts", "detail": ""}]
+
     return pd.DataFrame(rows)
 
 
@@ -310,7 +333,7 @@ def _render_top_trade_panel(pair_label: str, plan: Dict[str, Any], current_price
             for r in veto:
                 st.write(f"- {r}")
 
-def _render_risk_dashboard(plan: Dict[str, Any], feats: Dict[str, float]):
+def _render_risk_dashboard(plan: Dict[str, Any], feats: Dict[str, float], ext_meta: Optional[Dict[str, Any]] = None):
     bs = plan.get("black_swan", {}) or {}
     gov = plan.get("governor", {}) or {}
     overlay = plan.get("overlay_meta", {}) or {}
@@ -324,7 +347,9 @@ def _render_risk_dashboard(plan: Dict[str, Any], feats: Dict[str, float]):
     # ---- External data status (always visible) ----
     try:
         st.caption("外部データ取得ステータス（0が続く場合はここで原因が分かります）")
-        st.dataframe(_parts_status_table(ext_meta), use_container_width=True, hide_index=True)
+        df_status = _parts_status_table(ext_meta or {})
+        st.dataframe(df_status, use_container_width=True, hide_index=True)
+        st.download_button('Status CSV', data=df_status.to_csv(index=False).encode('utf-8'), file_name='risk_status_export.csv', mime='text/csv')
         st.caption(f"modules: logic={getattr(logic, '__file__', '?')} / data_layer={getattr(data_layer, '__file__', 'IMPORT_FAILED')}")
     except Exception:
         pass
@@ -495,7 +520,7 @@ with tabs[0]:
         _render_top_trade_panel(best["pair"], plan, price)
 
         # Risk dashboard (new)
-        _render_risk_dashboard(plan, feats)
+        _render_risk_dashboard(plan, feats, best.get('_ext_meta', {}))
 
         st.markdown("### EVランキング（代替案ペアはここ）")
         view = [{
@@ -540,7 +565,7 @@ with tabs[0]:
 
         price = float(ctx.get("price", 0.0))
         _render_top_trade_panel(pair_label, plan, price)
-        _render_risk_dashboard(plan, feats)
+        _render_risk_dashboard(plan, feats, ext_meta)
 
         st.markdown("### EV内訳（何がEVを潰しているか）")
         ev_contribs = plan.get("ev_contribs", {}) or {}
