@@ -206,59 +206,92 @@ def fetch_external(pair_label: str, keys: Dict[str, str]) -> Tuple[Dict[str, flo
 
 
 def _parts_status_table(meta: Dict[str, Any]) -> pd.DataFrame:
-    """Flatten external meta['parts'] into a compact status table for UI/debug."""
     parts = (meta or {}).get("parts", {}) if isinstance(meta, dict) else {}
     rows: List[Dict[str, Any]] = []
 
+    def _summarize_detail(detail: Any) -> Tuple[Optional[bool], str, Optional[str]]:
+        """Return (ok_override, detail_str, err_override)"""
+        if isinstance(detail, dict) and any(isinstance(v, dict) for v in detail.values()):
+            nested_ok_bits = []
+            nested_errs = []
+            all_ok = True
+            any_ok_field = False
+            for k, v in detail.items():
+                if not isinstance(v, dict):
+                    continue
+                vok = v.get("ok", None)
+                if vok is not None:
+                    any_ok_field = True
+                    all_ok = all_ok and bool(vok)
+                nested_ok_bits.append(f"{k}:{'ok' if vok else 'ng'}")
+                if v.get("error"):
+                    nested_errs.append(f"{k}:{v.get('error')}")
+            ok_override = all_ok if any_ok_field else None
+            d = ", ".join(nested_ok_bits)[:120]
+            e = "; ".join(nested_errs)[:160] if nested_errs else None
+            return ok_override, d, e
+
+        if isinstance(detail, dict):
+            # compact key:val view
+            bits = []
+            for k, v in list(detail.items())[:12]:
+                if isinstance(v, dict):
+                    # keys row etc.
+                    if "present" in v:
+                        bits.append(f"{k}:{'✓' if v.get('present') else '×'}")
+                    elif "ok" in v:
+                        bits.append(f"{k}:{'ok' if v.get('ok') else 'ng'}")
+                    else:
+                        bits.append(f"{k}:…")
+                else:
+                    bits.append(f"{k}:{v}")
+            return None, ", ".join(bits)[:120], None
+
+        if isinstance(detail, str):
+            return None, detail[:120], None
+
+        return None, "", None
+
     if isinstance(parts, dict):
         for name, p in parts.items():
-            ok = None
-            err = None
-            detail = ""
+            ok: Optional[bool] = None
+            err: Optional[str] = None
+            extra = ""
 
             if isinstance(p, dict):
-                if "ok" in p:
-                    ok = bool(p.get("ok"))
+                ok = p.get("ok")
                 err = p.get("error")
 
-                # Prefer 'detail'
-                d = p.get("detail")
-                if isinstance(d, dict):
-                    # If nested dict of dicts, summarize each child as ok/ng
-                    child_flags: List[str] = []
-                    child_errs: List[str] = []
-                    child_ok_bools: List[bool] = []
+                # Prefer p['detail'] for summary
+                detail = p.get("detail", None)
 
-                    for k, v in d.items():
-                        if isinstance(v, dict) and ("ok" in v or "error" in v):
-                            child_ok = bool(v.get("ok")) if "ok" in v else None
-                            if child_ok is not None:
-                                child_ok_bools.append(child_ok)
-                            child_flags.append(f"{k}:{'ok' if child_ok else 'ng'}" if child_ok is not None else f"{k}:—")
-                            if v.get("error"):
-                                child_errs.append(f"{k}:{v.get('error')}")
-                        else:
-                            # non-standard child
-                            child_flags.append(f"{k}:—")
+                ok2, extra2, err2 = _summarize_detail(detail)
+                if extra2:
+                    extra = extra2
+                # If nested says ng but ok was True, override to False (conservative)
+                if ok2 is not None:
+                    ok = ok2 if ok is None or ok is True else ok
+                if err2 and not err:
+                    err = err2
 
-                    if child_flags:
-                        detail = ", ".join(child_flags)[:160]
-                    if not err and child_errs:
-                        err = "; ".join(child_errs)[:200]
-                    if ok is None and child_ok_bools:
-                        ok = all(child_ok_bools)
-                elif d is not None:
-                    detail = str(d)[:160]
+                # Fallback: summarize nested dicts directly in p if detail empty
+                if not extra:
+                    nested = {k: v for k, v in p.items() if isinstance(v, dict)}
+                    ok3, extra3, err3 = _summarize_detail(nested)
+                    if extra3:
+                        extra = extra3
+                    if ok3 is not None:
+                        ok = ok3 if ok is None or ok is True else ok
+                    if err3 and not err:
+                        err = err3
 
                 n = p.get("n", None)
                 if n is not None:
-                    detail = (detail + f" n={n}").strip()
-
-            rows.append({"source": name, "ok": ok, "error": err, "detail": detail})
+                    extra = (extra + f" n={n}").strip()
+            rows.append({"source": name, "ok": ok, "error": err, "detail": extra})
 
     if not rows:
         rows = [{"source": "external", "ok": False, "error": "no_meta_parts", "detail": ""}]
-
     return pd.DataFrame(rows)
 
 
@@ -333,7 +366,7 @@ def _render_top_trade_panel(pair_label: str, plan: Dict[str, Any], current_price
             for r in veto:
                 st.write(f"- {r}")
 
-def _render_risk_dashboard(plan: Dict[str, Any], feats: Dict[str, float], ext_meta: Optional[Dict[str, Any]] = None):
+def _render_risk_dashboard(plan: Dict[str, Any], feats: Dict[str, float]):
     bs = plan.get("black_swan", {}) or {}
     gov = plan.get("governor", {}) or {}
     overlay = plan.get("overlay_meta", {}) or {}
@@ -347,9 +380,7 @@ def _render_risk_dashboard(plan: Dict[str, Any], feats: Dict[str, float], ext_me
     # ---- External data status (always visible) ----
     try:
         st.caption("外部データ取得ステータス（0が続く場合はここで原因が分かります）")
-        df_status = _parts_status_table(ext_meta or {})
-        st.dataframe(df_status, use_container_width=True, hide_index=True)
-        st.download_button('Status CSV', data=df_status.to_csv(index=False).encode('utf-8'), file_name='risk_status_export.csv', mime='text/csv')
+        st.dataframe(_parts_status_table(ext_meta), use_container_width=True, hide_index=True)
         st.caption(f"modules: logic={getattr(logic, '__file__', '?')} / data_layer={getattr(data_layer, '__file__', 'IMPORT_FAILED')}")
     except Exception:
         pass
@@ -520,7 +551,7 @@ with tabs[0]:
         _render_top_trade_panel(best["pair"], plan, price)
 
         # Risk dashboard (new)
-        _render_risk_dashboard(plan, feats, best.get('_ext_meta', {}))
+        _render_risk_dashboard(plan, feats)
 
         st.markdown("### EVランキング（代替案ペアはここ）")
         view = [{
@@ -565,7 +596,7 @@ with tabs[0]:
 
         price = float(ctx.get("price", 0.0))
         _render_top_trade_panel(pair_label, plan, price)
-        _render_risk_dashboard(plan, feats, ext_meta)
+        _render_risk_dashboard(plan, feats)
 
         st.markdown("### EV内訳（何がEVを潰しているか）")
         ev_contribs = plan.get("ev_contribs", {}) or {}
