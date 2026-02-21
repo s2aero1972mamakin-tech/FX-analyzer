@@ -204,6 +204,41 @@ def fetch_external(pair_label: str, keys: Dict[str, str]) -> Tuple[Dict[str, flo
     except Exception as e:
         return base, {"ok": False, "error": f"fetch_external_failed:{type(e).__name__}", "detail": str(e)}
 
+
+def _parts_status_table(meta: Dict[str, Any]) -> pd.DataFrame:
+    parts = (meta or {}).get("parts", {}) if isinstance(meta, dict) else {}
+    rows = []
+    if isinstance(parts, dict):
+        for name, p in parts.items():
+            ok = None
+            err = None
+            extra = ""
+            if isinstance(p, dict):
+                # common meta format
+                ok = p.get("ok")
+                err = p.get("error")
+                # nested like {"vix": {...}, ...}
+                if ok is None and any(isinstance(v, dict) for v in p.values()):
+                    # summarize nested dicts
+                    nested_ok = []
+                    nested_errs = []
+                    for k,v in p.items():
+                        if isinstance(v, dict):
+                            nested_ok.append(f"{k}:{'ok' if v.get('ok') else 'ng'}")
+                            if v.get("error"):
+                                nested_errs.append(f"{k}:{v.get('error')}")
+                    ok = all("ok" in x and x.endswith("ok") for x in nested_ok) if nested_ok else None
+                    extra = ", ".join(nested_ok)[:120]
+                    err = "; ".join(nested_errs)[:160] if nested_errs else err
+                n = p.get("n", None)
+                if n is not None:
+                    extra = (extra + f" n={n}").strip()
+            rows.append({"source": name, "ok": ok, "error": err, "detail": extra})
+    if not rows:
+        rows = [{"source": "external", "ok": False, "error": "no_meta_parts", "detail": ""}]
+    return pd.DataFrame(rows)
+
+
 def _style_defaults(style_name: str) -> Dict[str, Any]:
     # Presets: avoid manual tuning
     if style_name == "保守":
@@ -286,6 +321,13 @@ def _render_risk_dashboard(plan: Dict[str, Any], feats: Dict[str, float]):
     col2.metric("WarProb", f"{float(feats.get('war_probability',0.0)):.2f}")
     col3.metric("FinStress", f"{float(feats.get('financial_stress',0.0)):.2f}")
     col4.metric("MacroRisk", f"{float(feats.get('macro_risk_score',0.0)):.2f}")
+    # ---- External data status (always visible) ----
+    try:
+        st.caption("外部データ取得ステータス（0が続く場合はここで原因が分かります）")
+        st.dataframe(_parts_status_table(ext_meta), use_container_width=True, hide_index=True)
+        st.caption(f"modules: logic={getattr(logic, '__file__', '?')} / data_layer={getattr(data_layer, '__file__', 'IMPORT_FAILED')}")
+    except Exception:
+        pass
 
     colA, colB, colC, colD = st.columns(4)
     vix = feats.get("vix", float("nan"))
