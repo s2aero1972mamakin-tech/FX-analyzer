@@ -380,7 +380,7 @@ with st.sidebar:
 
     st.divider()
     with st.expander("APIキー（任意・入れた分だけ強くなる）", expanded=False):
-        gemini_key = st.text_input("GEMINI_API_KEY（地政学LLM・任意）", value=_load_secret("GEMINI_API_KEY", ""), type="password")
+        openai_key = st.text_input("OPENAI_API_KEY（地政学LLM・任意）", value=_load_secret("OPENAI_API_KEY", ""), type="password")
         news_key = st.text_input("NEWSAPI_KEY（記事取得・任意）", value=_load_secret("NEWSAPI_KEY", ""), type="password")
         te_key = st.text_input("TRADING_ECONOMICS_KEY（経済指標・任意）", value=_load_secret("TRADING_ECONOMICS_KEY", ""), type="password")
         fred_key = st.text_input("FRED_API_KEY（金利/VIX/DXY・任意）", value=_load_secret("FRED_API_KEY", ""), type="password")
@@ -417,7 +417,7 @@ show_debug = locals().get("show_debug", False)
 pair_custom = locals().get("pair_custom", PAIR_LIST_DEFAULT)
 
 keys = {
-    "GEMINI_API_KEY": (locals().get("gemini_key","") or "").strip(),
+    "OPENAI_API_KEY": (locals().get("openai_key","") or "").strip(),
     "NEWSAPI_KEY": (locals().get("news_key","") or "").strip(),
     "TRADING_ECONOMICS_KEY": (locals().get("te_key","") or "").strip(),
     "FRED_API_KEY": (locals().get("fred_key","") or "").strip(),
@@ -459,7 +459,7 @@ with tabs[0]:
 
             feats, ext_meta = fetch_external(p, keys=keys)
             ctx = _build_ctx(p, df, feats, horizon_days=int(horizon_days), min_expected_R=float(min_expected_R), style_name=style_name, governor_cfg=governor_cfg)
-            plan = logic.get_ai_order_strategy(api_key=keys.get("GEMINI_API_KEY",""), context_data=ctx)
+            plan = logic.get_ai_order_strategy(api_key=keys.get("OPENAI_API_KEY",""), context_data=ctx)
 
             ev = float(plan.get("expected_R_ev") or 0.0)
             decision = str(plan.get("decision") or "NO_TRADE")
@@ -536,7 +536,7 @@ with tabs[0]:
 
         feats, ext_meta = fetch_external(pair_label, keys=keys)
         ctx = _build_ctx(pair_label, df, feats, horizon_days=int(horizon_days), min_expected_R=float(min_expected_R), style_name=style_name, governor_cfg=governor_cfg)
-        plan = logic.get_ai_order_strategy(api_key=keys.get("GEMINI_API_KEY",""), context_data=ctx)
+        plan = logic.get_ai_order_strategy(api_key=keys.get("OPENAI_API_KEY",""), context_data=ctx)
 
         price = float(ctx.get("price", 0.0))
         _render_top_trade_panel(pair_label, plan, price)
@@ -616,7 +616,7 @@ with tabs[2]:
 - `FRED_API_KEY` を入れると **VIX/DXY/金利** が入ります
 - `TRADING_ECONOMICS_KEY` を入れると **CPI/NFPサプライズ** が入ります
 - `NEWSAPI_KEY` を入れると **記事見出しセンチメント** が入ります
-- `GEMINI_API_KEY` を入れると **LLMが地政学/危機確率をJSONで返し**、GlobalRiskに反映されます
+- `OPENAI_API_KEY` を入れると **LLMが地政学/危機確率をJSONで返し**、GlobalRiskに反映されます
 
 ### ④ 見送りが増える理由
 - v4では **危機が近いほど動的閾値が上がる**（本気資金向け）
