@@ -179,7 +179,8 @@ def _calc_surprise_from_te(events: List[Dict[str, Any]], indicator_contains: str
 # GDELT (free)
 # We'll query 2.1 doc API "doc" for counts via timeline search.
 # -------------------------
-@_cache(ttl=60*15)
+@_cache(ttl=60*60)
+@_cache(ttl=60*10)
 def gdelt_doc_count(query: str, mode: str = "artlist", timespan: str = "1d") -> Tuple[Optional[int], Dict[str, Any]]:
     """
     Returns integer count estimate for query over last timespan (e.g. 1d, 7d).
@@ -196,6 +197,7 @@ def gdelt_doc_count(query: str, mode: str = "artlist", timespan: str = "1d") -> 
         "format": "json",
         "timespan": timespan,
     }
+    _gdelt_throttle()
     j, err = _http_get_json(base, params=params, timeout=15)
     if err:
         meta["error"] = err
@@ -273,56 +275,101 @@ def simple_sentiment_from_articles(articles: List[Dict[str, Any]]) -> float:
     return float(max(-1.0, min(1.0, score / 5.0)))
 
 # -------------------------
-# Gemini (optional)
+
+# -------------------------
+# OpenAI (optional)
 # -------------------------
 @_cache(ttl=60*30)
-def gemini_geo_score(prompt: str, api_key: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+def openai_geo_score(prompt: str, api_key: str, model: str = "gpt-4o-mini") -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
-    If key provided, asks Gemini to return JSON with risk scores.
-    Falls back to empty dict.
+    If key provided, asks OpenAI Responses API to return JSON with risk scores.
+    Falls back to empty dict. Never raises.
     """
-    meta = {"ok": False, "source": "Gemini", "error": None}
+    meta = {"ok": False, "source": "OpenAI", "error": None, "model": model}
     if not api_key:
         meta["error"] = "missing_api_key"
         return {}, meta
-    # Endpoint may change; keep best-effort and never crash.
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent"
-    params = {"key": api_key}
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 512},
+
+    url = "https://api.openai.com/v1/responses"
+    headers = {
+        **DEFAULT_HEADERS,
+        "Authorization": f"Bearer {api_key}",
     }
+
+    # Ask for strict JSON (best-effort; we still robust-parse).
+    instructions = (
+        "You are a geopolitics & macro risk analyst for FX. "
+        "Return ONLY valid JSON, no markdown, no commentary. "
+        "Schema: {"
+        "\n  \"war_probability\": number (0..1),"
+        "\n  \"financial_crisis_probability\": number (0..1),"
+        "\n  \"pandemic_risk\": number (0..1),"
+        "\n  \"policy_shift_risk\": number (0..1),"
+        "\n  \"geopolitical_stress\": number (0..1),"
+        "\n  \"summary\": string (<=200 chars)"
+        "\n}"
+    )
+
+    payload = {
+        "model": model,
+        "instructions": instructions,
+        "input": prompt,
+        "temperature": 0.2,
+        "max_output_tokens": 500,
+        "text": {"format": {"type": "json_object"}},
+    }
+
     try:
-        r = requests.post(url, params=params, json=payload, headers=DEFAULT_HEADERS, timeout=20)
+        r = requests.post(url, json=payload, headers=headers, timeout=25)
         if r.status_code >= 400:
             meta["error"] = f"http_{r.status_code}:{r.text[:200]}"
             return {}, meta
         j = r.json()
-        # extract text
+
+        # Prefer output_text if present
         text = ""
-        try:
-            cand = (j.get("candidates") or [])[0]
-            parts = (((cand.get("content") or {}).get("parts")) or [])
-            text = " ".join(p.get("text","") for p in parts if isinstance(p, dict))
-        except Exception:
-            text = ""
-        # Try parse JSON inside
-        text_strip = text.strip()
-        js = None
-        if "{" in text_strip and "}" in text_strip:
-            start = text_strip.find("{")
-            end = text_strip.rfind("}")
-            blob = text_strip[start:end+1]
+        if isinstance(j, dict) and isinstance(j.get("output_text"), str):
+            text = j["output_text"]
+        else:
+            # Fallback: walk output array
             try:
-                js = json.loads(blob)
+                out = j.get("output") or []
+                parts = []
+                for item in out:
+                    if not isinstance(item, dict):
+                        continue
+                    content = item.get("content") or []
+                    for c in content:
+                        if isinstance(c, dict) and c.get("type") in ("output_text", "text"):
+                            t = c.get("text")
+                            if isinstance(t, str):
+                                parts.append(t)
+                text = "\n".join(parts)
             except Exception:
-                js = None
+                text = ""
+
+        js = None
+        t = (text or "").strip()
+        if t:
+            # direct parse
+            try:
+                js = json.loads(t)
+            except Exception:
+                # try extract first JSON object inside
+                if "{" in t and "}" in t:
+                    start = t.find("{")
+                    end = t.rfind("}")
+                    blob = t[start:end+1]
+                    try:
+                        js = json.loads(blob)
+                    except Exception:
+                        js = None
+
         meta["ok"] = True
         return (js or {}), meta
     except Exception as e:
         meta["error"] = f"{type(e).__name__}:{e}"
         return {}, meta
-
 # -------------------------
 # Integrated feature fetch
 # -------------------------
@@ -358,14 +405,14 @@ def fetch_external_features(pair_label: str, keys: Dict[str, str] | None = None)
     fred_key, fred_used = _env_any(keys, ["FRED_API_KEY","FRED_KEY","FREDAPI_KEY"])
     te_key, te_used = _env_any(keys, ["TRADING_ECONOMICS_KEY","TE_API_KEY","TRADING_ECONOMICS_API_KEY"])
     news_key, news_used = _env_any(keys, ["NEWSAPI_KEY","NEWS_API_KEY","NEWSAPI_API_KEY"])
-    gemini_key, gemini_used = _env_any(keys, ["GEMINI_API_KEY","GOOGLE_API_KEY","GEMINI_KEY"])
+    openai_key, openai_used = _env_any(keys, ["OPENAI_API_KEY","OPENAI_KEY"])
 
     meta: Dict[str, Any] = {"ok": True, "parts": {}}
     meta["parts"]["keys"] = {
         "FRED": {"present": bool(fred_key), "used": fred_used},
         "TradingEconomics": {"present": bool(te_key), "used": te_used},
         "NewsAPI": {"present": bool(news_key), "used": news_used},
-        "Gemini": {"present": bool(gemini_key), "used": gemini_used},
+        "OpenAI": {"present": bool(openai_key), "used": openai_used},
     }
 
 
@@ -405,9 +452,10 @@ def fetch_external_features(pair_label: str, keys: Dict[str, str] | None = None)
         meta["parts"]["te"] = {"ok": False, "error": "missing_api_key"}
 
     # --- GDELT counts (war / finance) ---
-    geo_scope = _pair_to_geo_query(pair_label)
-    war_q = f'({geo_scope}) AND (war OR invasion OR missile OR attack OR sanction OR "state of emergency")'
-    fin_q = f'({geo_scope}) AND (bank OR default OR crisis OR recession OR bailout OR "credit crunch")'
+    # NOTE: Use GLOBAL queries (pair-agnostic) to avoid rate limits in multi-pair scans.
+    # We intentionally keep number of requests small (2) and cache for 60 minutes.
+    war_q = '(war OR invasion OR missile OR attack OR sanction OR "state of emergency" OR mobilization)'
+    fin_q = '(bank OR default OR crisis OR recession OR bailout OR "credit crunch" OR "liquidity crunch")'
     war_cnt, m_war = gdelt_doc_count(war_q, timespan="1d")
     fin_cnt, m_fin = gdelt_doc_count(fin_q, timespan="1d")
     meta["parts"]["gdelt"] = {"war": m_war, "finance": m_fin}
@@ -415,11 +463,15 @@ def fetch_external_features(pair_label: str, keys: Dict[str, str] | None = None)
     war_cnt = int(war_cnt or 0)
     fin_cnt = int(fin_cnt or 0)
 
-    # Convert counts to probabilities (very conservative; saturates slowly)
+    # Convert counts to probabilities (conservative; saturates slowly)
     war_prob = float(max(0.0, min(1.0, math.log1p(war_cnt) / 8.0)))
     fin_stress = float(max(0.0, min(1.0, math.log1p(fin_cnt) / 9.0)))
 
-    # --- NewsAPI sentiment (optional) ---
+    feats["war_probability"] = war_prob
+    feats["financial_stress"] = fin_stress
+    feats["global_risk_index"] = float(max(0.0, min(1.0, 0.55 * war_prob + 0.45 * fin_stress)))
+
+# --- NewsAPI sentiment (optional) ---
     news_sent = 0.0
     if news_key:
         arts, m_news = newsapi_headlines(f"{geo_scope} AND (FX OR central bank OR inflation OR war OR crisis)", news_key, page_size=20)
@@ -428,9 +480,9 @@ def fetch_external_features(pair_label: str, keys: Dict[str, str] | None = None)
     else:
         meta["parts"]["newsapi"] = {"ok": False, "error": "missing_api_key"}
 
-    # --- Gemini overlay (optional; returns JSON) ---
+    # --- OpenAI overlay (optional; returns JSON) ---
     llm_scores: Dict[str, Any] = {}
-    if gemini_key:
+    if openai_key:
         prompt = (
             "You are a risk analyst. Output ONLY valid JSON with keys: "
             "war_probability, geopolitical_stress, financial_crisis_probability, pandemic_risk, policy_shift_risk "
@@ -439,12 +491,12 @@ def fetch_external_features(pair_label: str, keys: Dict[str, str] | None = None)
             f"vix={vix}; dxy={dxy}; us10y={us10y}; jp10y={jp10y}; cpi_surprise={cpi_surprise}; nfp_surprise={nfp_surprise}; "
             f"headline_sentiment={news_sent}."
         )
-        js, m_g = gemini_geo_score(prompt, gemini_key)
-        meta["parts"]["gemini"] = m_g
+        js, m_g = openai_geo_score(prompt, openai_key)
+        meta["parts"]["openai"] = m_g
         if isinstance(js, dict):
             llm_scores = js
     else:
-        meta["parts"]["gemini"] = {"ok": False, "error": "missing_api_key"}
+        meta["parts"]["openai"] = {"ok": False, "error": "missing_api_key"}
 
     # Merge LLM into probs (as override blend)
     llm_war = _safe_float(llm_scores.get("war_probability"), None)
@@ -480,3 +532,16 @@ def fetch_external_features(pair_label: str, keys: Dict[str, str] | None = None)
         "jp10y": float(jp10y) if jp10y is not None else float("nan"),
     }
     return feats, meta
+# -------------------------
+# GDELT throttle (429 guard)
+# -------------------------
+_GDELT_LAST_CALL_TS = 0.0
+
+def _gdelt_throttle(min_interval_s: float = 2.2) -> None:
+    global _GDELT_LAST_CALL_TS
+    now = time.time()
+    wait = (_GDELT_LAST_CALL_TS + min_interval_s) - now
+    if wait > 0:
+        time.sleep(wait)
+    _GDELT_LAST_CALL_TS = time.time()
+
