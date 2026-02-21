@@ -232,7 +232,7 @@ def gdelt_doc_count(query: str, mode: str = "artlist", timespan: str = "1d") -> 
         "timespan": timespan,
     }
     _gdelt_throttle()
-    j, err = _http_get_json_retry(base, params=params, timeout=(8, 25), retries=2, backoff_s=1.4)
+    j, err = _http_get_json_retry(base, params=params, timeout=(10, 35), retries=2, backoff_s=1.4)
     if err:
         meta["error"] = err
         return None, meta
@@ -597,6 +597,24 @@ def fetch_external_features(pair_label: str, keys: Dict[str, str] | None = None)
             meta["parts"]["failsafe"] = {"ok": True, "detail": {"macro": macro, "news_mag": news_mag}}
     except Exception as e:
         meta["parts"]["failsafe"] = {"ok": False, "error": f"{type(e).__name__}", "detail": str(e)}
+    # ---- Panel values (for Status/CSV visibility) ----
+    try:
+        meta["parts"]["risk_values"] = {
+            "ok": True,
+            "detail": {
+                "global_risk_index": round(_safe_float(feats.get("global_risk_index"), 0.0), 3),
+                "war_probability": round(_safe_float(feats.get("war_probability"), 0.0), 3),
+                "financial_stress": round(_safe_float(feats.get("financial_stress"), 0.0), 3),
+                "macro_risk_score": round(_safe_float(feats.get("macro_risk_score"), 0.0), 3),
+                "news_sentiment": round(_safe_float(feats.get("news_sentiment"), 0.0), 3),
+                "gdelt_war_count_1d": int(_safe_float(feats.get("gdelt_war_count_1d"), 0.0)),
+                "gdelt_finance_count_1d": int(_safe_float(feats.get("gdelt_finance_count_1d"), 0.0)),
+            },
+        }
+    except Exception:
+        pass
+
+
 
     return feats, meta
 
