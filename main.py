@@ -47,7 +47,7 @@ PAIR_LIST_DEFAULT = [
 # =========================
 # Build / Diagnostics
 # =========================
-APP_BUILD = "fixed11_20260222"
+APP_BUILD = "fixed14_20260222"
 # =========================
 # Operator-friendly labels
 # =========================
@@ -64,30 +64,95 @@ def _state_label_full(key: str) -> str:
     return f"{ja} ({k})" if k and ja != k else ja
 
 def _bucket_01(v: float) -> str:
+    """
+    0-1 のリスク値を「低/中/高」に丸める（表示用）。
+    ※見た目の赤/黄/緑は“時間軸”と“運用スタイル”で少し動かす（見送りを強制しない）。
+    """
     try:
         x = float(v)
     except Exception:
         return "—"
     if x != x:
         return "—"
-    if x < 0.33:
+
+    # 時間軸（horizon_days）でしきい値を調整
+    try:
+        hd = int(globals().get("horizon_days", 3))
+    except Exception:
+        hd = 3
+
+    # base thresholds
+    if hd <= 1:         # スキャ
+        t1, t2 = 0.30, 0.55
+    elif hd <= 4:       # デイトレ
+        t1, t2 = 0.33, 0.66
+    else:               # スイング
+        t1, t2 = 0.40, 0.75
+
+    # スタイル補正（表示だけ）
+    style = str(globals().get("style_name", "標準") or "標準")
+    if style == "保守":
+        t1 -= 0.05
+        t2 -= 0.05
+    elif style == "攻撃":
+        t1 += 0.05
+        t2 += 0.05
+
+    t1 = max(0.05, min(0.90, t1))
+    t2 = max(t1 + 0.05, min(0.95, t2))
+
+    if x < t1:
         return "低（平常）"
-    if x < 0.66:
+    if x < t2:
         return "中（警戒）"
     return "高（危険）"
 
+
 def _action_hint(global_risk: float, war: float, fin: float, macro: float, bs_flag: bool, gov_enabled: bool) -> str:
+    """
+    運用者向けの“日本語の次の行動”だけを返す（強制停止はしない）。
+    しきい値は時間軸（horizon_days）とスタイル（style_name）で少し動かす。
+    """
     if bs_flag or (not gov_enabled):
         return "🛑 新規エントリー停止（強制ガード発動）"
+
     g = float(global_risk or 0.0)
     w = float(war or 0.0)
     f = float(fin or 0.0)
     m = float(macro or 0.0)
-    if (g >= 0.80) or (w >= 0.60) or (f >= 0.80) or (m >= 0.80):
+
+    # ベース：デイトレ想定
+    hi_g, hi_w, hi_f, hi_m = 0.80, 0.60, 0.80, 0.80
+    mid_g, mid_w, mid_f, mid_m = 0.55, 0.35, 0.55, 0.55
+
+    # 時間軸補正（スキャは敏感、スイングは鈍感）
+    try:
+        hd = int(globals().get("horizon_days", 3))
+    except Exception:
+        hd = 3
+
+    if hd <= 1:  # スキャ
+        hi_g, hi_w, hi_f, hi_m = 0.70, 0.55, 0.70, 0.70
+        mid_g, mid_w, mid_f, mid_m = 0.45, 0.30, 0.45, 0.45
+    elif hd >= 7:  # スイング
+        hi_g, hi_w, hi_f, hi_m = 0.85, 0.65, 0.85, 0.85
+        mid_g, mid_w, mid_f, mid_m = 0.60, 0.40, 0.60, 0.60
+
+    # スタイル補正（保守は厳しめ、攻撃は緩め）
+    style = str(globals().get("style_name", "標準") or "標準")
+    delta = -0.05 if style == "保守" else (0.05 if style == "攻撃" else 0.0)
+    hi_g, hi_f, hi_m = hi_g + delta, hi_f + delta, hi_m + delta
+    mid_g, mid_f, mid_m = mid_g + delta, mid_f + delta, mid_m + delta
+    # war は過敏になりやすいので控えめに
+    hi_w = hi_w + (delta * 0.5)
+    mid_w = mid_w + (delta * 0.5)
+
+    if (g >= hi_g) or (w >= hi_w) or (f >= hi_f) or (m >= hi_m):
         return "🔴 高リスク：見送り推奨（入るならロット最小・短期・監視必須）"
-    if (g >= 0.55) or (w >= 0.35) or (f >= 0.55) or (m >= 0.55):
+    if (g >= mid_g) or (w >= mid_w) or (f >= mid_f) or (m >= mid_m):
         return "🟡 警戒：ロット縮小/回数制限（見送り増は正常）"
-    return "🟢 平常：通常運用（ただし指標更新遅延やイベントは別途確認）"
+    return "🟢 平常：通常運用（ただし重要指標/要人発言/週末は別途警戒）"
+
 
 def _normalize_pair_label(s: str) -> str:
     s = (s or "").strip().upper().replace(" ", "")
@@ -237,6 +302,11 @@ def fetch_external(pair_label: str, keys: Dict[str, str]) -> Tuple[Dict[str, flo
         "dxy": float("nan"),
         "us10y": float("nan"),
         "jp10y": float("nan"),
+        "av_inflation": float("nan"),
+        "av_unemployment": float("nan"),
+        "av_fed_funds_rate": float("nan"),
+        "av_treasury_10y": float("nan"),
+        "av_macro_risk": 0.0,
     }
     if data_layer is None:
         return base, {"ok": False, "error": "data_layer_import_failed"}
@@ -380,20 +450,41 @@ def _dominant_state(state_probs: Dict[str, Any]) -> str:
     except Exception:
         return "—"
 
+
 def _render_top_trade_panel(pair_label: str, plan: Dict[str, Any], current_price: float):
+    """
+    運用者が「いま実行すべきか」を迷わないための最上段パネル。
+    - NO_TRADE は「エントリー禁止」ではなく「この条件では期待値が薄い/危険寄りなので見送り推奨」
+    - ロット係数は“推奨値（表示）”。実際の発注に反映するかは運用者が決める。
+    """
     decision = str(plan.get("decision", "NO_TRADE"))
+    decision_jp = _jp_decision(decision)
     expected_R_ev = float(plan.get("expected_R_ev") or 0.0)
     p_win_ev = float(plan.get("p_win_ev") or 0.0)
     confidence = float(plan.get("confidence") or 0.0)
     dyn_th = float(plan.get("dynamic_threshold") or 0.0)
+    lot_mult = float(plan.get("_lot_multiplier_reco") or 1.0)
 
-    c1, c2, c3, c4, c5 = st.columns(5)
+    # override info (manual kill switch / outage)
+    orig = plan.get("_decision_original")
+    ovr = plan.get("_decision_override_reason")
+
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("ペア", pair_label)
-    c2.metric("現在値", f"{current_price:.5f}" if current_price else "—")
+    c2.metric("最終判断", decision_jp)
     c3.metric("期待値EV (R)", f"{expected_R_ev:+.3f}")
     c4.metric("動的閾値", f"{dyn_th:.3f}")
     c5.metric("信頼度", f"{confidence:.2f}")
-    st.caption("EV (R) は『損切り幅=1R』基準の期待値です。動的閾値は危険時に上がり、見送りが増えるのは仕様です。信頼度が低い時はロット縮小/見送り寄りで。")
+    c6.metric("推奨ロット係数", f"{lot_mult:.2f}")
+
+    if orig is not None and ovr:
+        st.warning(f"判断は上書きされています：{_jp_decision(str(orig))} → {decision_jp}（理由：{ovr}）")
+
+    st.caption(
+        "EV (R) は『損切り幅=1R』基準の期待値です。"
+        "動的閾値は危険時に上がります（見送りが増えるのは仕様）。"
+        "推奨ロット係数は“連続補正”で、急に半減などはしません。"
+    )
 
     if decision != "NO_TRADE":
         side = plan.get("side", "—")
@@ -403,28 +494,30 @@ def _render_top_trade_panel(pair_label: str, plan: Dict[str, Any], current_price
         sl = plan.get("stop_loss", None)
         tp = plan.get("take_profit", None)
 
-        st.success("✅ エントリー候補")
+        st.success("✅ エントリー候補（このアプリは発注しません。発注は運用者が実行）")
         st.markdown(f"""
 - **売買**: {side} / **注文**: {order_type} / **種別**: {entry_type}
 - **Entry**: {entry if entry is not None else '—'}
 - **SL**: {sl if sl is not None else '—'}
 - **TP**: {tp if tp is not None else '—'}
 """)
+        st.caption(f"参考：勝率推定 p_win={p_win_ev:.2f}（あくまでモデル推定）。")
     else:
         st.warning("⏸ 見送り（NO_TRADE）")
-        why = str(plan.get("why","") or "")
+        why = str(plan.get("why", "") or "")
         st.markdown(f"**理由**: {why if why else '—'}")
         veto = plan.get("veto_reasons", None)
         if isinstance(veto, (list, tuple)) and len(veto) > 0:
             st.markdown("**見送り理由（veto）内訳**")
-            for r in veto:
-                st.write(f"- {r}")
+            st.write(veto)
+
 
 
 def _render_risk_dashboard(plan: Dict[str, Any], feats: Dict[str, float], ext_meta: Optional[Dict[str, Any]] = None):
     """
-    運用者が「今、取引してよいか」を一瞬で判断できるように、
-    数字に意味（低/中/高）と推奨アクションを添えて表示する。
+    運用者が「危険度」と「データ品質」を見て、実行/見送り/ロット縮小を判断できるパネル。
+    数字だけで終わらず、日本語の“意味”と“次の行動”をセットで出す。
+    さらに、外部APIの取得状態（401/403/429/timeout等）を同じ場所で確認できるようにする。
     """
     bs = plan.get("black_swan", {}) or {}
     gov = plan.get("governor", {}) or {}
@@ -435,150 +528,141 @@ def _render_risk_dashboard(plan: Dict[str, Any], feats: Dict[str, float], ext_me
     war = float(feats.get("war_probability", 0.0) or 0.0)
     fin = float(feats.get("financial_stress", 0.0) or 0.0)
     macro = float(feats.get("macro_risk_score", 0.0) or 0.0)
+    news = float(feats.get("news_sentiment", 0.0) or 0.0)
 
-    st.markdown("### 🛡️ リスクダッシュボード（ここが運用の心臓部）")
-    st.caption("※ 0.00〜1.00（0=平常 / 1=危機）。数値だけでなく「低/中/高」と推奨アクションを併記します。")
-
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("総合リスク（市場全体）", f"{global_risk:.2f}")
-        st.caption(f"意味：市場全体の警戒度。判定：**{_bucket_01(global_risk)}**")
-        st.progress(min(max(global_risk, 0.0), 1.0))
-    with col2:
-        st.metric("戦争/地政学（確率）", f"{war:.2f}")
-        st.caption(f"意味：戦争・地政学ショックの起こりやすさ。判定：**{_bucket_01(war)}**")
-        st.progress(min(max(war, 0.0), 1.0))
-    with col3:
-        st.metric("金融ストレス", f"{fin:.2f}")
-        st.caption(f"意味：金融不安・信用収縮の気配。判定：**{_bucket_01(fin)}**")
-        st.progress(min(max(fin, 0.0), 1.0))
-    with col4:
-        st.metric("マクロ不確実性", f"{macro:.2f}")
-        st.caption(f"意味：金利/指標サプライズ等の不確実性。判定：**{_bucket_01(macro)}**")
-        st.progress(min(max(macro, 0.0), 1.0))
-
-    bs_flag = bool(bs.get("flag"))
+    bs_flag = bool(bs.get("flag", False))
+    bs_level = str(bs.get("level", "") or "")
     gov_enabled = bool(gov.get("enabled", True))
-    st.info(_action_hint(global_risk, war, fin, macro, bs_flag, gov_enabled))
 
-    # ---- Data quality banner (no more CSV guessing) ----
+    # data quality
+    q_level = ""
+    q_reasons: List[str] = []
     try:
         parts = (ext_meta or {}).get("parts", {}) if isinstance(ext_meta, dict) else {}
-        q = (parts.get("quality", {}) or {}).get("detail", {}) if isinstance(parts.get("quality", {}), dict) else {}
-        level = str(q.get("level", "") or "")
-        reasons = q.get("reasons", []) if isinstance(q.get("reasons", []), list) else []
-        if level == "OUTAGE":
-            fb = (parts.get("outage_fallback", {}) or {}).get("detail", {}) if isinstance(parts.get("outage_fallback", {}), dict) else {}
-            mode = str(fb.get("mode", "") or "")
-            if mode == "last_good":
-                st.error(f"🛑 外部データ全滅（OUTAGE）→ 直近の正常値で表示しています（last_good）。理由: {', '.join(reasons) if reasons else '不明'}")
-            else:
-                st.error(f"🛑 外部データ全滅（OUTAGE）→ 中立値で表示しています（neutral）。理由: {', '.join(reasons) if reasons else '不明'}")
-            st.caption("この状態は『バグ』よりも『デプロイ不一致 / Secrets未反映 / 外部API障害』が多いです。まず status の build と data_layer.__file__ を確認してください。")
-        elif level == "DEGRADED":
-            st.warning(f"⚠ 外部データ一部欠損（DEGRADED）: {', '.join(reasons) if reasons else ''}（OpenAI/FREDで補完して運用は継続可能）")
-        elif level == "OK":
-            st.success("✅ 外部データ品質：OK（主要ソースが揃っています）")
+        q = parts.get("quality", {}) if isinstance(parts, dict) else {}
+        qd = (q.get("detail", {}) or {}) if isinstance(q, dict) else {}
+        q_level = str(qd.get("level", "") or "")
+        q_reasons = [str(x) for x in (qd.get("reasons", []) or [])]
     except Exception:
-        pass
+        q_level = ""
 
+    st.markdown("### リスク/ガード（運用判断）")
 
+    # Quality banner
+    if q_level == "OUTAGE":
+        st.error("🚨 外部データ品質：OUTAGE（主要ソースが取れていない可能性）")
+        if q_reasons:
+            st.caption("理由: " + " / ".join(q_reasons[:6]))
+    elif q_level == "DEGRADED":
+        st.warning("⚠️ 外部データ品質：DEGRADED（一部ソース欠け）")
+        if q_reasons:
+            st.caption("理由: " + " / ".join(q_reasons[:6]))
+    else:
+        st.success("✅ 外部データ品質：OK（主要ソースが揃っています）")
+
+    # Main risk meters
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("相場全体リスク", f"{global_risk:.2f}", help="0〜1。高いほど荒れやすい")
+    c2.metric("地政学リスク", f"{war:.2f}", help="0〜1。戦争/紛争の悪化確率（推定）")
+    c3.metric("金融ストレス", f"{fin:.2f}", help="0〜1。信用/金融不安の強さ（推定）")
+    c4.metric("マクロ不安", f"{macro:.2f}", help="0〜1。VIX/DXY/金利等からの合成")
+    c5.metric("ニュースムード", f"{news:.2f}", help="0〜1。高いほどネガ寄り（定義は実装依存）")
+
+    st.caption(
+        f"判定：相場全体={_bucket_01(global_risk)} / 地政学={_bucket_01(war)} / 金融={_bucket_01(fin)} / マクロ={_bucket_01(macro)}"
+    )
+
+    # Black swan / governor
+    if bs_flag:
+        st.error(f"🟥 Black Swan Guard: ON（{bs_level}）")
+        rs = bs.get("reasons", []) or []
+        if rs:
+            st.write(rs)
+    else:
+        st.info("🟩 Black Swan Guard: OFF（通常）")
+
+    if not gov_enabled:
+        st.error("🛑 Capital Governor: 停止（DD/損失/連敗条件に抵触）")
+        rs = gov.get("reasons", []) or []
+        if rs:
+            st.write(rs)
+    else:
+        st.info("✅ Capital Governor: OK（停止条件に非該当）")
+
+    # Next action hint
+    hint = _action_hint(global_risk, war, fin, macro, bs_flag, gov_enabled)
+    st.markdown(f"#### 次のアクション（提案）\n- {hint}")
+    st.caption(f"ガード設定: {str(guard_apply)} / 推奨ロット係数は最上段に表示。")
+
+    # Overlay notes (debug-level)
+    if isinstance(overlay, dict) and overlay:
+        adj = overlay.get("risk_adjustment", {})
+        if isinstance(adj, dict) and adj:
+            st.caption(
+                f"（内部補正）risk_adjustment: global={adj.get('global_risk')} war={adj.get('war')} fin={adj.get('fin')} macro={adj.get('macro')}"
+            )
+
+    # ---- status table (root-cause) ----
     try:
-        st.markdown("#### 外部データ取得ステータス（0が続く/異常が出る場合はここを確認）")
-        st.caption("OKでも中身が空/一部失敗があり得るため、detail と error を必ず見ます。")
-        df = _parts_status_table(ext_meta)
+        show_diag_default = (str(q_level) in ("OUTAGE","DEGRADED"))
+        with st.expander("🧪 外部データ取得ステータス（診断・原因究明）", expanded=show_diag_default or bool(show_debug)):
+            st.markdown("#### 外部データ取得ステータス（0固定/異常が出たら最優先でここ）")
+            st.caption("OKでも中身が空/一部失敗があり得ます。error / detail を必ず見ます。")
+            df = _parts_status_table(ext_meta)
 
-        # ---- Runtime fingerprint (one-shot proof of what is actually running) ----
-        try:
-            dl_file = getattr(data_layer, "__file__", "IMPORT_FAILED")
-            dl_build = getattr(data_layer, "DATA_LAYER_BUILD", "?")
-            sha12 = "unknown"
+            # Runtime fingerprint: proof of what is actually running
+            runtime_line = ""
             try:
-                import hashlib as _hashlib
-                with open(dl_file, "rb") as _f:
-                    sha12 = _hashlib.sha256(_f.read()).hexdigest()[:12]
+                dl_file = getattr(data_layer, "__file__", "IMPORT_FAILED")
+                dl_build = getattr(data_layer, "DATA_LAYER_BUILD", "?")
+                sha12 = "unknown"
+                try:
+                    import hashlib as _hashlib
+                    with open(dl_file, "rb") as _f:
+                        sha12 = _hashlib.sha256(_f.read()).hexdigest()[:12]
+                except Exception:
+                    pass
+                runtime_line = f"main={APP_BUILD}, data_layer={dl_build}, sha12={sha12}, file={dl_file}"
+                rows = [{"source": "runtime", "ok": True, "error": None, "detail": runtime_line}]
+                df = pd.concat([pd.DataFrame(rows), df], ignore_index=True)
             except Exception:
                 pass
-            rows = [{"source": "runtime", "ok": True, "error": None,
-                     "detail": f"main={APP_BUILD}, data_layer={dl_build}, sha12={sha12}, file={dl_file}"}]
-            df = pd.concat([pd.DataFrame(rows), df], ignore_index=True)
-        except Exception:
-            pass
 
-        meaning = {
-            "keys": "キー検出状況（secrets/ui/env）",
-            "fred": "VIX/DXY/金利（マクロ系）",
-            "te": "経済指標カレンダー（CPI/NFP等）",
-            "gdelt": "紛争/金融ニュース量（無料）",
-            "newsapi": "記事見出しセンチメント",
-            "openai": "LLMによる地政学/危機推定（JSON）",
-            "risk_values": "リスク値（最終：運用判断の基準）",
-            "build": "実行中のコード版（fixed番号）",
-            "failsafe": "外部失敗時の保守的な下駄（0固定回避）",
-            "risk_values": "パネル表示用の集計値（丸め）",
-        }
-        if "source" in df.columns and "meaning" not in df.columns:
-            df["meaning"] = df["source"].map(lambda x: meaning.get(str(x), ""))
+            if runtime_line:
+                st.text_area("実行中コード指紋（コピー用）", value=runtime_line, height=70)
 
-        st.dataframe(df, use_container_width=True, hide_index=True)
+            meaning = {
+                "runtime": "実行中のコード指紋（build/sha）",
+                "keys": "キー検出状況（secrets/ui/env）",
+                "fred": "VIX/DXY/金利（マクロ系）",
+                "te": "経済指標カレンダー（CPI/NFP等）",
+                "gdelt": "紛争/金融ニュース量（無料）",
+                "newsapi": "記事見出しセンチメント",
+                "openai": "LLMによる地政学/危機推定（JSON）",
+                "alpha_vantage": "マクロ補助（Alpha Vantage）",
+                "risk_values": "リスク値（最終：運用判断の基準）",
+                "quality": "外部データ品質（OK/DEGRADED/OUTAGE）",
+                "build": "data_layer の build 文字列",
+            }
+            if "source" in df.columns:
+                df["意味"] = df["source"].map(meaning).fillna("")
 
-        csv = df.to_csv(index=False).encode("utf-8")
-        ts = time.strftime("%Y-%m-%dT%H-%M")
-        st.download_button("ステータスCSVをダウンロード", data=csv, file_name=f"{ts}_risk_status_export.csv", mime="text/csv")
+            st.dataframe(df, use_container_width=True)
 
-        st.caption(f"build: main={APP_BUILD} / data_layer={getattr(data_layer, 'DATA_LAYER_BUILD', '?')}  |  modules: logic={getattr(logic, '__file__', '?')} / data_layer={getattr(data_layer, '__file__', 'IMPORT_FAILED')}")
+            try:
+                csv = df.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "📥 ステータスCSVをダウンロード（検証用）",
+                    data=csv,
+                    file_name="risk_status_export.csv",
+                    mime="text/csv",
+                )
+            except Exception:
+                pass
+    
     except Exception:
+        # status table is best-effort; never break trading UI
         pass
-
-    colA, colB, colC, colD = st.columns(4)
-    vix = feats.get("vix", float("nan"))
-    dxy = feats.get("dxy", float("nan"))
-    us10y = feats.get("us10y", float("nan"))
-    jp10y = feats.get("jp10y", float("nan"))
-    with colA:
-        st.metric("VIX（恐怖指数）", f"{vix:.1f}" if pd.notna(vix) else "—")
-        st.caption("高いほど市場が不安定（一般に上昇で警戒）")
-    with colB:
-        st.metric("DXY（米ドル指数）", f"{dxy:.1f}" if pd.notna(dxy) else "—")
-        st.caption("ドル高/ドル安の地合い（USD/JPY等の背景）")
-    with colC:
-        st.metric("米10年金利", f"{us10y:.2f}" if pd.notna(us10y) else "—")
-        st.caption("金利上昇=リスク資産に逆風になりやすい")
-    with colD:
-        st.metric("日10年金利", f"{jp10y:.2f}" if pd.notna(jp10y) else "—")
-        st.caption("日米金利差は円相場の主要因")
-
-    level = str(bs.get("level", "green"))
-    if bs_flag:
-        st.error(f"🛑 ブラックスワン検知: {level} — 新規エントリー禁止")
-    elif level == "yellow":
-        st.warning("⚠ リスク上昇（yellow）— 見送りが増えるのは正常です（動的閾値↑）")
-    else:
-        st.success("✅ リスク通常（green）")
-
-    if isinstance(bs.get("reasons"), list) and bs["reasons"]:
-        st.write("**検知理由（なぜ止めたか）**")
-        for r in bs["reasons"]:
-            st.write(f"- {r}")
-
-    if isinstance(gov, dict):
-        st.write(f"**Capital Governor（資金管理ガード）**: {'ON（取引可）' if gov_enabled else 'OFF（取引停止）'}")
-        if not gov_enabled:
-            for r in (gov.get("reasons") or []):
-                st.write(f"- {r}")
-
-    with st.expander("詳細（overlay/metrics：上級者用）", expanded=False):
-        st.json({
-            "overlay_meta": overlay,
-            "black_swan": bs,
-            "governor": gov,
-            "risk_values": {
-                "global_risk_index": global_risk,
-                "war_probability": war,
-                "financial_stress": fin,
-                "macro_risk_score": macro,
-            },
-        })
 
 # =========================
 # UI
@@ -587,29 +671,55 @@ st.set_page_config(page_title="FX EV Auto v4 Integrated", layout="wide")
 st.title("FX 自動AI判断ツール（EV最大化） v4 Integrated")
 
 with st.sidebar:
-    st.header("運用設定（サイドバー）")
-    st.caption("迷ったら：モード=自動抽出 / スタイル=標準 / 期間=週 のままでOK")
-    with st.expander("このパネルの役割（運用者向け）", expanded=False):
-        st.markdown("- **モード**：複数ペア走査（運用向け）/ 単一ペア（検証向け）\n- **運用スタイル**：見送りライン（EV閾値）を自動で調整\n- **想定期間**：週=安定 / 日=短期\n- **APIキー**：外部リスクの精度が上がる（無くても動く）\n- **Capital Governor**：DD/損失/連敗で強制停止（本気運用の安全装置）")
-    outage_policy = st.selectbox("外部データ全滅時の扱い", ["表示のみ（推奨：エントリー機会を殺さない）", "強制見送り（安全優先）"], index=0)
+    st.header("運用操作（見る順）")
+    st.caption("普段は上から順に。『安全/診断/詳細』は折りたたんであります。")
+
     mode = st.selectbox("モード", ["相場全体から最適ペアを自動抽出（推奨）", "単一ペア最適化（徹底）"], index=0)
-    style_name = st.selectbox("運用スタイル", ["標準", "保守", "攻撃"], index=0)
-    horizon_mode = st.selectbox("想定期間", ["週（推奨）", "日"], index=0)
+    trade_axis = st.selectbox("時間軸", ["デイトレ（短期）", "スイング（中期）", "スキャ（超短期）"], index=0)
+    style_name = st.selectbox("運用スタイル（見送りライン）", ["標準", "保守", "攻撃"], index=0)
+
+    # 時間軸プリセット（詳細設定で上書き可）
+    if "スキャ" in trade_axis:
+        period = "1y"
+        interval = "1h"
+        horizon_mode = "日"
+        horizon_days = 1
+    elif "スイング" in trade_axis:
+        period = "10y"
+        interval = "1d"
+        horizon_mode = "週（推奨）"
+        horizon_days = 7
+    else:  # デイトレ
+        period = "2y"
+        interval = "1d"
+        horizon_mode = "日"
+        horizon_days = 3
 
     preset = _style_defaults(style_name)
-    horizon_days = 7 if "週" in horizon_mode else 3
     min_expected_R = float(preset["min_expected_R"])
+    st.caption(f"見送りライン（min_expected_R）: {min_expected_R:.2f}R / 想定期間: {horizon_days}日 / 価格: {period}・{interval}")
 
-    st.caption(f"現在の見送りライン（min_expected_R）: {min_expected_R:.2f}R / 想定期間: {horizon_days}日")
+    with st.expander("🛡️ 安全/ガード（非常時だけ）", expanded=False):
+        outage_policy = st.selectbox("外部データ全滅時の扱い", ["表示のみ（推奨：機会を殺さない）", "強制見送り（安全優先）"], index=0)
+        guard_apply = st.selectbox(
+            "ガードの反映（UIだけ）",
+            ["表示のみ（推奨）", "推奨ロット係数を表示（自分で調整）", "品質OUTAGE時のみ見送り（安全）"],
+            index=0,
+        )
+        lot_risk_alpha = st.slider("推奨ロット係数の強さ（α）", 0.0, 1.0, 0.35, 0.05, help="lot_mult = clamp(1 - α*global_risk_index, 0.2, 1.0)")
 
-    st.divider()
-    with st.expander("APIキー（任意・入れた分だけ強くなる）", expanded=False):
-        openai_key = st.text_input("OPENAI_API_KEY（地政学LLM・任意）", value=_load_secret("OPENAI_API_KEY", ""), type="password")
-        news_key = st.text_input("NEWSAPI_KEY（記事取得・任意）", value=_load_secret("NEWSAPI_KEY", ""), type="password")
-        te_key = st.text_input("TRADING_ECONOMICS_KEY（経済指標・任意）", value=_load_secret("TRADING_ECONOMICS_KEY", ""), type="password")
-        fred_key = st.text_input("FRED_API_KEY（金利/VIX/DXY・任意）", value=_load_secret("FRED_API_KEY", ""), type="password")
+        force_no_trade_env = (os.getenv("FORCE_NO_TRADE", "") or "").strip().lower() in ("1","true","yes","on")
+        force_no_trade = st.checkbox("🛑 手動緊急停止（最終判断を全てNO_TRADE）", value=force_no_trade_env)
 
-    with st.expander("Capital Governor（本気運用用）", expanded=False):
+    with st.expander("🔑 APIキー（任意・入れた分だけ強くなる）", expanded=False):
+        openai_key = st.text_input("OPENAI_API_KEY（地政学LLM）", value=_load_secret("OPENAI_API_KEY", ""), type="password")
+        news_key = st.text_input("NEWSAPI_KEY（記事取得）", value=_load_secret("NEWSAPI_KEY", ""), type="password")
+        te_key = st.text_input("TRADING_ECONOMICS_KEY（経済指標）", value=_load_secret("TRADING_ECONOMICS_KEY", ""), type="password")
+        fred_key = st.text_input("FRED_API_KEY（金利/VIX/DXY）", value=_load_secret("FRED_API_KEY", ""), type="password")
+        av_key = st.text_input("ALPHAVANTAGE_API_KEY（マクロ補助/予備）", value=_load_secret("ALPHAVANTAGE_API_KEY", ""), type="password")
+        st.caption("※ChatGPT利用とOpenAI APIは別物です。OpenAIは課金/権限が無いと401になります。")
+
+    with st.expander("Capital Governor（本気運用の安全装置）", expanded=False):
         max_dd = st.slider("最大DD（停止）", 0.05, 0.30, 0.15, 0.01)
         daily_stop = st.slider("日次損失（停止）", 0.01, 0.10, 0.03, 0.01)
         max_streak = st.slider("連敗停止", 2, 12, 5, 1)
@@ -617,34 +727,38 @@ with st.sidebar:
         daily_loss = st.number_input("本日損失率（運用者入力）", value=0.0, step=0.01)
         losing_streak = st.number_input("連敗数（運用者入力）", value=0, step=1)
 
-    st.divider()
-    with st.expander("詳細設定（上級者用）", expanded=False):
-        period = st.selectbox("価格期間", ["1y", "2y", "5y", "10y"], index=3)
-        interval = st.selectbox("価格間隔", ["1d", "1h"], index=0)
-        show_meta = st.checkbox("取得メタ表示", value=False)
-        show_debug = st.checkbox("デバッグ表示", value=False)
-        allow_override = st.checkbox("EV閾値を手動上書き", value=False)
+    with st.expander("🔧 詳細/診断（普段は不要）", expanded=False):
+        # プリセットの上書き
+        period = st.selectbox("価格期間（上書き）", ["1y", "2y", "5y", "10y"], index=["1y","2y","5y","10y"].index(period))
+        interval = st.selectbox("価格間隔（上書き）", ["1d", "1h"], index=["1d","1h"].index(interval))
+        show_meta = st.checkbox("取得メタ表示（検証用）", value=False)
+        show_debug = st.checkbox("デバッグ表示（検証用）", value=False)
+        allow_override = st.checkbox("EV閾値/想定期間を手動上書き", value=False)
         if allow_override:
-            min_expected_R = st.slider("min_expected_R", 0.0, 0.3, float(min_expected_R), 0.01)
-            horizon_days = st.slider("horizon_days", 1, 14, int(horizon_days), 1)
+            min_expected_R = st.slider("min_expected_R", 0.0, 0.30, float(min_expected_R), 0.01)
+            horizon_days = st.slider("horizon_days", 1, 30, int(horizon_days), 1)
         pair_custom = st.multiselect("スキャン対象（任意）", PAIR_LIST_DEFAULT, default=PAIR_LIST_DEFAULT)
 
-    if st.button("🔄 キャッシュクリアして再取得"):
-        st.cache_data.clear()
-        st.rerun()
-
-# defaults
+        if st.button("🔄 キャッシュクリアして再取得"):
+            st.cache_data.clear()
+            st.rerun()
 period = locals().get("period", "10y")
 interval = locals().get("interval", "1d")
 show_meta = locals().get("show_meta", False)
 show_debug = locals().get("show_debug", False)
 pair_custom = locals().get("pair_custom", PAIR_LIST_DEFAULT)
 
+
+guard_apply = locals().get("guard_apply", "表示のみ（推奨）")
+lot_risk_alpha = float(locals().get("lot_risk_alpha", 0.35))
+force_no_trade = bool(locals().get("force_no_trade", False))
+
 keys = {
     "OPENAI_API_KEY": (locals().get("openai_key","") or "").strip(),
     "NEWSAPI_KEY": (locals().get("news_key","") or "").strip(),
     "TRADING_ECONOMICS_KEY": (locals().get("te_key","") or "").strip(),
     "FRED_API_KEY": (locals().get("fred_key","") or "").strip(),
+    "ALPHAVANTAGE_API_KEY": (locals().get("av_key","") or "").strip(),
 }
 
 governor_cfg = {
@@ -674,16 +788,66 @@ with tabs[0]:
         st.caption("複数ペアを同じロジックで評価し、EV最大のペアを自動選択します（日足はStooq優先で安定化）。")
 
         rows: List[Dict[str, Any]] = []
+        # 外部リスクはグローバル（ペア依存しない）なので、マルチペアでも1回だけ取得
+        feats_global, ext_meta_global = fetch_external("GLOBAL", keys=keys)
         for p in pairs:
             sym = _pair_label_to_symbol(p)
-            df, price_meta = fetch_price_history(p, sym, period=period, interval="1d", prefer_stooq=True)
+            df, price_meta = fetch_price_history(p, sym, period=period, interval=interval, prefer_stooq=(str(interval)=="1d"))
             if df.empty:
                 rows.append({"pair": p, "EV": None, "decision": "NO_DATA", "confidence": None, "dom_state": None})
                 continue
 
-            feats, ext_meta = fetch_external(p, keys=keys)
+            feats, ext_meta = feats_global, ext_meta_global
             ctx = _build_ctx(p, df, feats, horizon_days=int(horizon_days), min_expected_R=float(min_expected_R), style_name=style_name, governor_cfg=governor_cfg)
             plan = logic.get_ai_order_strategy(api_key=keys.get("OPENAI_API_KEY",""), context_data=ctx)
+
+            # ---- operator guard (UI-level; default display-only) ----
+
+            lot_mult = _lot_multiplier(feats.get("global_risk_index", 0.0), lot_risk_alpha)
+
+            decision_override = None
+
+            override_reason = ""
+
+            # 手動緊急停止は最優先
+
+            if force_no_trade:
+
+                decision_override = "NO_TRADE"
+
+                override_reason = "手動緊急停止"
+
+            # 品質OUTAGE時のみ見送り（安全）
+
+            try:
+
+                parts = (ext_meta or {}).get("parts", {}) if isinstance(ext_meta, dict) else {}
+
+                level = str((((parts.get("quality", {}) or {}).get("detail", {}) or {}).get("level", "") or ""))
+
+            except Exception:
+
+                level = ""
+
+            if decision_override is None and ("品質OUTAGE時のみ見送り" in str(guard_apply)) and level == "OUTAGE":
+
+                decision_override = "NO_TRADE"
+
+                override_reason = "外部データ品質OUTAGE"
+
+            if decision_override is not None:
+
+                plan = dict(plan or {})
+
+                plan["_decision_original"] = plan.get("decision")
+
+                plan["decision"] = decision_override
+
+                plan["_decision_override_reason"] = override_reason
+
+            plan = dict(plan or {})
+
+            plan["_lot_multiplier_reco"] = float(lot_mult)
 
             plan_ui = plan
             try:
@@ -768,7 +932,7 @@ with tabs[0]:
         pair_label = _normalize_pair_label(st.text_input("通貨ペア（単一最適化）", value="USD/JPY"))
         symbol = _pair_label_to_symbol(pair_label)
 
-        df, price_meta = fetch_price_history(pair_label, symbol, period=period, interval=interval, prefer_stooq=False)
+        df, price_meta = fetch_price_history(pair_label, symbol, period=period, interval=interval, prefer_stooq=(str(interval)=="1d"))
         if df.empty:
             st.error("価格データ取得に失敗しました。")
             st.json(price_meta)
@@ -777,6 +941,54 @@ with tabs[0]:
         feats, ext_meta = fetch_external(pair_label, keys=keys)
         ctx = _build_ctx(pair_label, df, feats, horizon_days=int(horizon_days), min_expected_R=float(min_expected_R), style_name=style_name, governor_cfg=governor_cfg)
         plan = logic.get_ai_order_strategy(api_key=keys.get("OPENAI_API_KEY",""), context_data=ctx)
+
+        # ---- operator guard (UI-level; default display-only) ----
+
+        lot_mult = _lot_multiplier(feats.get("global_risk_index", 0.0), lot_risk_alpha)
+
+        decision_override = None
+
+        override_reason = ""
+
+        # 手動緊急停止は最優先
+
+        if force_no_trade:
+
+            decision_override = "NO_TRADE"
+
+            override_reason = "手動緊急停止"
+
+        # 品質OUTAGE時のみ見送り（安全）
+
+        try:
+
+            parts = (ext_meta or {}).get("parts", {}) if isinstance(ext_meta, dict) else {}
+
+            level = str((((parts.get("quality", {}) or {}).get("detail", {}) or {}).get("level", "") or ""))
+
+        except Exception:
+
+            level = ""
+
+        if decision_override is None and ("品質OUTAGE時のみ見送り" in str(guard_apply)) and level == "OUTAGE":
+
+            decision_override = "NO_TRADE"
+
+            override_reason = "外部データ品質OUTAGE"
+
+        if decision_override is not None:
+
+            plan = dict(plan or {})
+
+            plan["_decision_original"] = plan.get("decision")
+
+            plan["decision"] = decision_override
+
+            plan["_decision_override_reason"] = override_reason
+
+        plan = dict(plan or {})
+
+        plan["_lot_multiplier_reco"] = float(lot_mult)
 
         plan_ui = plan
         try:
