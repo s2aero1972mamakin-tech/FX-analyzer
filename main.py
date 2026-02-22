@@ -8,23 +8,6 @@ from typing import Dict, Any, Tuple, Optional, List
 import streamlit as st
 import pandas as pd
 
-# ---- UI (mobile-first) ----
-st.set_page_config(page_title="FX EV Auto v4 Integrated", layout="centered")
-st.markdown("""
-<style>
-/* Mobile-first spacing */
-.block-container {padding-top: 0.8rem; padding-bottom: 2rem; padding-left: 1rem; padding-right: 1rem; max-width: 820px;}
-/* Make metrics wrap nicer */
-[data-testid="stMetricValue"] {font-size: 1.35rem;}
-[data-testid="stMetricLabel"] {font-size: 0.85rem;}
-/* Reduce huge headers */
-h1 {font-size: 1.7rem;}
-h2 {font-size: 1.25rem;}
-h3 {font-size: 1.05rem;}
-</style>
-""", unsafe_allow_html=True)
-
-
 # ---- optional deps ----
 try:
     import yfinance as yf
@@ -64,7 +47,7 @@ PAIR_LIST_DEFAULT = [
 # =========================
 # Build / Diagnostics
 # =========================
-APP_BUILD = "fixed16_20260222"
+APP_BUILD = "fixed15_20260222"
 # =========================
 # Operator-friendly labels
 # =========================
@@ -508,28 +491,11 @@ def _dominant_state(state_probs: Dict[str, Any]) -> str:
         return "—"
 
 
-def _unique_str_list(items: Any) -> List[str]:
-    """重複や空を除いた文字列リスト（順序維持）。"""
-    out: List[str] = []
-    if isinstance(items, str):
-        items = [items]
-    if not isinstance(items, (list, tuple)):
-        return out
-    for x in items:
-        s = str(x or "").strip()
-        if not s:
-            continue
-        if s not in out:
-            out.append(s)
-    return out
-
-
 def _render_top_trade_panel(pair_label: str, plan: Dict[str, Any], current_price: float):
     """
-    運用者が「いま実行すべきか」を迷わないための最上段パネル（スマホ前提で縦に読みやすく）。
-    - NO_TRADE は「禁止」ではなく「期待値が薄い/危険寄りなので見送り推奨」
+    運用者が「いま実行すべきか」を迷わないための最上段パネル。
+    - NO_TRADE は「エントリー禁止」ではなく「この条件では期待値が薄い/危険寄りなので見送り推奨」
     - ロット係数は“推奨値（表示）”。実際の発注に反映するかは運用者が決める。
-    - 理由表示は「主因 1行 + 詳細（折りたたみ）」にして重複を排除する。
     """
     decision = str(plan.get("decision", "NO_TRADE"))
     decision_jp = _jp_decision(decision)
@@ -543,23 +509,27 @@ def _render_top_trade_panel(pair_label: str, plan: Dict[str, Any], current_price
     orig = plan.get("_decision_original")
     ovr = plan.get("_decision_override_reason")
 
-    # --- Mobile-friendly metrics (2 columns x 3 rows) ---
+    # モバイル前提：6列だと潰れるため、2列×3段で表示
     r1c1, r1c2 = st.columns(2)
     r1c1.metric("ペア", pair_label)
     r1c2.metric("最終判断", decision_jp)
 
     r2c1, r2c2 = st.columns(2)
-    r2c1.metric("期待値EV (R)", f"{expected_R_ev:+.3f}", help="損切り幅=1Rの期待値")
-    r2c2.metric("動的閾値", f"{dyn_th:.3f}", help="危険時に上がる（見送りが増えるのは仕様）")
+    r2c1.metric("期待値EV (R)", f"{expected_R_ev:+.3f}")
+    r2c2.metric("動的閾値", f"{dyn_th:.3f}")
 
     r3c1, r3c2 = st.columns(2)
     r3c1.metric("信頼度", f"{confidence:.2f}")
-    r3c2.metric("推奨ロット係数", f"{lot_mult:.2f}", help="連続補正（急に半減しない）")
+    r3c2.metric("推奨ロット係数", f"{lot_mult:.2f}")
 
     if orig is not None and ovr:
         st.warning(f"判断は上書きされています：{_jp_decision(str(orig))} → {decision_jp}（理由：{ovr}）")
 
-    st.caption("EV(R)は損切り幅=1R基準。閾値は危険時に上がります。推奨ロット係数は連続補正です。")
+    st.caption(
+        "EV (R) は『損切り幅=1R』基準の期待値です。"
+        "動的閾値は危険時に上がります（見送りが増えるのは仕様）。"
+        "推奨ロット係数は“連続補正”で、急に半減などはしません。"
+    )
 
     if decision != "NO_TRADE":
         side = plan.get("side", "—")
@@ -568,40 +538,40 @@ def _render_top_trade_panel(pair_label: str, plan: Dict[str, Any], current_price
         entry = plan.get("entry", None)
         sl = plan.get("stop_loss", None)
         tp = plan.get("take_profit", None)
+
         st.success("✅ エントリー候補（このアプリは発注しません。発注は運用者が実行）")
-        st.markdown(
-            f"- **売買**: {side} / **注文**: {order_type} / **種別**: {entry_type}\\n"
-            f"- **Entry**: {entry if entry is not None else '—'}\\n"
-            f"- **SL**: {sl if sl is not None else '—'}\\n"
-            f"- **TP**: {tp if tp is not None else '—'}"
-        )
-        st.caption(f"参考：勝率推定 p_win={p_win_ev:.2f}（モデル推定）。")
-        return
+        st.markdown(f"""
+- **売買**: {side} / **注文**: {order_type} / **種別**: {entry_type}
+- **Entry**: {entry if entry is not None else '—'}
+- **SL**: {sl if sl is not None else '—'}
+- **TP**: {tp if tp is not None else '—'}
+""")
+        st.caption(f"参考：勝率推定 p_win={p_win_ev:.2f}（あくまでモデル推定）。")
+    else:
+        st.warning("⏸ 見送り（NO_TRADE）")
 
-    # ---- NO_TRADE ----
-    st.warning("⏸ 見送り（NO_TRADE）")
+        # 表示は「主因」を1行に統一（重複を避ける）
+        why = str(plan.get("why", "") or "").strip()
+        veto = plan.get("veto_reasons", None)
 
-    why = str(plan.get("why", "") or "").strip()
-    veto = plan.get("veto_reasons", None)
-    reasons = _unique_str_list([why] + (list(veto) if isinstance(veto, (list, tuple)) else []))
+        primary = ""
+        if why:
+            primary = why
+        elif isinstance(veto, (list, tuple)) and len(veto) > 0:
+            primary = str(veto[0])
+        else:
+            primary = "—"
 
-    # 主因は1行だけ（重複を排除）
-    primary = reasons[0] if reasons else "—"
-    st.markdown(f"**主因**: {primary}")
+        st.markdown(f"**主因**: {primary}")
+        st.caption(f"判定値：EV {expected_R_ev:+.3f}  <  動的閾値 {dyn_th:.3f}")
 
-    # 数値を“正”として一行で固定表示（どれが正しいか迷わないように）
-    st.caption(f"判定値：EV={expected_R_ev:+.3f} / 閾値={dyn_th:.3f}（EV < 閾値 → 見送り）")
+        with st.expander("詳細（見送り理由）", expanded=False):
+            if why:
+                st.markdown(f"- **理由（why）**: {why}")
+            if isinstance(veto, (list, tuple)) and len(veto) > 0:
+                st.markdown("- **veto内訳**:")
+                st.write(list(veto))
 
-    # 詳細（必要な時だけ）
-    extra = reasons[1:]
-    if extra or (isinstance(veto, (list, tuple)) and len(veto) > 0):
-        with st.expander("詳細（内部ログ/見送り理由）", expanded=False):
-            if reasons:
-                st.markdown("**見送り理由（重複除外）**")
-                st.write(reasons)
-            if bool(globals().get("show_debug", False)):
-                st.markdown("**raw plan（デバッグ）**")
-                st.json(plan)
 
 
 def _render_risk_dashboard(plan: Dict[str, Any], feats: Dict[str, float], ext_meta: Optional[Dict[str, Any]] = None):
@@ -650,16 +620,14 @@ def _render_risk_dashboard(plan: Dict[str, Any], feats: Dict[str, float], ext_me
             st.caption("理由: " + " / ".join(q_reasons[:6]))
     else:
         st.success("✅ 外部データ品質：OK（主要ソースが揃っています）")
-    # Main risk meters (mobile-friendly)
-    r1c1, r1c2 = st.columns(2)
-    r1c1.metric("相場全体リスク", f"{global_risk:.2f}", help="0〜1。高いほど荒れやすい")
-    r1c2.metric("地政学リスク", f"{war:.2f}", help="0〜1。戦争/紛争の悪化確率（推定）")
 
-    r2c1, r2c2 = st.columns(2)
-    r2c1.metric("金融ストレス", f"{fin:.2f}", help="0〜1。信用/金融不安の強さ（推定）")
-    r2c2.metric("マクロ不安", f"{macro:.2f}", help="0〜1。VIX/DXY/金利等からの合成")
-
-    st.metric("ニュースムード（ネガ度）", f"{news:.2f}", help="0〜1。高いほどネガ寄り（定義は実装依存）")
+    # Main risk meters
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("相場全体リスク", f"{global_risk:.2f}", help="0〜1。高いほど荒れやすい")
+    c2.metric("地政学リスク", f"{war:.2f}", help="0〜1。戦争/紛争の悪化確率（推定）")
+    c3.metric("金融ストレス", f"{fin:.2f}", help="0〜1。信用/金融不安の強さ（推定）")
+    c4.metric("マクロ不安", f"{macro:.2f}", help="0〜1。VIX/DXY/金利等からの合成")
+    c5.metric("ニュースムード", f"{news:.2f}", help="0〜1。高いほどネガ寄り（定義は実装依存）")
 
     st.caption(
         f"判定：相場全体={_bucket_01(global_risk)} / 地政学={_bucket_01(war)} / 金融={_bucket_01(fin)} / マクロ={_bucket_01(macro)}"
@@ -760,6 +728,7 @@ def _render_risk_dashboard(plan: Dict[str, Any], feats: Dict[str, float], ext_me
 # =========================
 # UI
 # =========================
+st.set_page_config(page_title="FX EV Auto v4 Integrated", layout="centered", initial_sidebar_state="collapsed")
 st.title("FX 自動AI判断ツール（EV最大化） v4 Integrated")
 
 with st.sidebar:
@@ -1006,38 +975,35 @@ with tabs[0]:
 
         st.markdown("### EV内訳（最適ペア）")
 
-# モバイル前提：棒グラフだけだと「0の棒が見えない」ため、
-# まず表で「確率(%) / 寄与(R)」を明示し、図は折りたたみにします。
-ev_contribs = (plan.get("ev_contribs", {}) or {})
-state_probs = (plan.get("state_probs", {}) or {})
-# 固定順で表示（欠けているキーは0埋め）
-_states = ["trend_up", "trend_down", "range", "risk_off"]
+        # モバイル前提：棒グラフだけだと「0の棒が見えない」ため、
+        # まず表で「確率(%) / 寄与EV(R)」を明示し、図は折りたたみにします。
+        ev_contribs = (plan.get("ev_contribs", {}) or {})
+        state_probs = (plan.get("state_probs", {}) or {})
+        _states = ["trend_up", "trend_down", "range", "risk_off"]
 
-rows = []
-for st_name in _states:
-    c = float((ev_contribs or {}).get(st_name, 0.0) or 0.0)
-    p = float((state_probs or {}).get(st_name, 0.0) or 0.0)
-    rows.append({
-        "状態": _state_label_full(st_name),
-        "確率(%)": round(p * 100.0, 1),
-        "寄与EV(R)": round(c, 4),
-    })
+        rows_ev = []
+        for st_name in _states:
+            c = float((ev_contribs or {}).get(st_name, 0.0) or 0.0)
+            p = float((state_probs or {}).get(st_name, 0.0) or 0.0)
+            rows_ev.append({
+                "状態": _state_label_full(st_name),
+                "確率(%)": round(p * 100.0, 1),
+                "寄与EV(R)": round(c, 4),
+            })
 
-cdf = pd.DataFrame(rows)
-if not cdf.empty:
-    st.dataframe(cdf, use_container_width=True)
-    # “棒がない”＝0付近の寄与。異常ではなく、確率が小さい/寄与がほぼ0のときに起こります。
-    st.caption("※ 棒グラフで棒が見えない場合でも、表の「寄与EV(R)」が 0.000 付近になっているだけです（計算されていない訳ではありません）。")
+        cdf = pd.DataFrame(rows_ev)
+        if not cdf.empty:
+            st.dataframe(cdf, use_container_width=True)
+            st.caption("※ 棒が見えない＝寄与が0付近です。未計算ではありません。")
 
-    with st.expander("棒グラフ（参考）", expanded=False):
-        cdf2 = cdf.copy()
-        # 棒グラフは状態名をインデックスにして表示
-        st.bar_chart(cdf2.set_index("状態")[["寄与EV(R)"]])
-else:
-    st.info("EV内訳が空です。")
+            with st.expander("棒グラフ（参考）", expanded=False):
+                st.bar_chart(cdf.set_index("状態")[["寄与EV(R)"]])
+        else:
+            st.info("EV内訳が空です。")
+
         with st.expander("詳細（最適ペア）", expanded=False):
             st.json({"plan": plan})
-            if bool(globals().get("show_debug", False)):
+            if show_debug:
                 st.json({"ctx": best["_ctx"], "feats": feats})
             if show_meta:
                 st.json({"price_meta": best.get("_price_meta", {}), "external_meta": best.get("_ext_meta", {})})
@@ -1133,7 +1099,7 @@ else:
 
         with st.expander("詳細", expanded=False):
             st.json(plan.get("state_probs", {}))
-            if bool(globals().get("show_debug", False)):
+            if show_debug:
                 st.json({"ctx": ctx, "feats": feats})
             if show_meta:
                 st.json({"price_meta": price_meta, "external_meta": ext_meta})
