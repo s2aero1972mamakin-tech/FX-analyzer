@@ -44,7 +44,7 @@ def _file_sha12(path: str) -> str:
 # =========================
 # Build / Diagnostics
 # =========================
-DATA_LAYER_BUILD = "fixed11_20260222"
+DATA_LAYER_BUILD = "fixed12_20260222"
 # -------------------------
 # Last-known-good risk cache (process lifetime)
 # - Streamlit Cloud can have intermittent outbound/network/API outages.
@@ -310,7 +310,7 @@ def gdelt_doc_count(query: str, mode: str = "artlist", timespan: str = "1d") -> 
         "scaled": False,
     }
 
-    meta["timeout"] = "(connect=8, read=75)"
+    meta["timeout"] = "75s"
     base = "https://api.gdeltproject.org/api/v2/doc/doc"
 
     def _fetch(ts: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
@@ -326,7 +326,7 @@ def gdelt_doc_count(query: str, mode: str = "artlist", timespan: str = "1d") -> 
         # GDELTは429もあるので軽くスロットル
         _gdelt_throttle(min_interval_s=5.2)
         # 読み取りが遅い環境対策：readを長めに
-        return _http_get_json_retry(base, params=params, timeout=(8, 75), retries=2, backoff_s=1.6)
+        return _http_get_json_retry(base, params=params, timeout=75, retries=2, backoff_s=1.6)
 
     j, err = _fetch(timespan)
     scale = 1.0
