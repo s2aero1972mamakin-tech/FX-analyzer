@@ -736,25 +736,21 @@ with st.sidebar:
     st.caption("普段は上から順に。『安全/診断/詳細』は折りたたんであります。")
 
     mode = st.selectbox("モード", ["相場全体から最適ペアを自動抽出（推奨）", "単一ペア最適化（徹底）"], index=0)
-    trade_axis = st.selectbox("時間軸", ["デイトレ（短期）", "スイング（中期）", "スキャ（超短期）"], index=0)
+    trade_axis = st.selectbox("時間軸（保有期間）", ["スイング（1週〜1ヶ月）", "中長期（1〜3ヶ月）"], index=0)
     style_name = st.selectbox("運用スタイル（見送りライン）", ["標準", "保守", "攻撃"], index=0)
 
     # 時間軸プリセット（詳細設定で上書き可）
-    if "スキャ" in trade_axis:
-        period = "1y"
-        interval = "1h"
-        horizon_mode = "日"
-        horizon_days = 1
-    elif "スイング" in trade_axis:
+    # ※「ポジショントレード」はUI名ではなく“保有期間”の呼び方です。1ヶ月寄りなら「中長期」や interval=1wk を推奨。
+    if "中長期" in trade_axis:
+        period = "max"
+        interval = "1wk"
+        horizon_mode = "月（推奨）"
+        horizon_days = 30
+    else:  # スイング（1週〜1ヶ月）
         period = "10y"
         interval = "1d"
-        horizon_mode = "週（推奨）"
-        horizon_days = 7
-    else:  # デイトレ
-        period = "2y"
-        interval = "1d"
-        horizon_mode = "日"
-        horizon_days = 3
+        horizon_mode = "週〜月（推奨）"
+        horizon_days = 14
 
     preset = _style_defaults(style_name)
     min_expected_R = float(preset["min_expected_R"])
@@ -791,7 +787,7 @@ with st.sidebar:
     with st.expander("🔧 詳細/診断（普段は不要）", expanded=False):
         # プリセットの上書き
         period = st.selectbox("価格期間（上書き）", ["1y", "2y", "5y", "10y"], index=["1y","2y","5y","10y"].index(period))
-        interval = st.selectbox("価格間隔（上書き）", ["1d", "1h"], index=["1d","1h"].index(interval))
+        interval = st.selectbox("価格間隔（上書き）", ["1d", "1wk", "1h"], index=["1d","1wk","1h"].index(interval))
         show_meta = st.checkbox("取得メタ表示（検証用）", value=False)
         show_debug = st.checkbox("デバッグ表示（検証用）", value=False)
         allow_override = st.checkbox("EV閾値/想定期間を手動上書き", value=False)
