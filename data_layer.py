@@ -44,7 +44,7 @@ def _file_sha12(path: str) -> str:
 # =========================
 # Build / Diagnostics
 # =========================
-DATA_LAYER_BUILD = "fixed12_20260222"
+DATA_LAYER_BUILD = "fixed14_20260222"
 # -------------------------
 # Last-known-good risk cache (process lifetime)
 # - Streamlit Cloud can have intermittent outbound/network/API outages.
@@ -243,6 +243,81 @@ def fetch_fred_latest(series_id: str, api_key: str) -> Tuple[Optional[float], Di
     return float(vals[-1][1]), meta
 
 # -------------------------
+
+# -------------------------
+# Alpha Vantage (Economic Indicators)
+# -------------------------
+AV_CACHE_TTL_S = int(os.getenv("AV_CACHE_TTL_S", "86400"))  # 24h default (free tier is tight)
+
+@_cache(ttl=AV_CACHE_TTL_S)
+def fetch_alpha_vantage_indicator(function: str, api_key: str, **extra_params: Any) -> Tuple[Optional[float], Dict[str, Any]]:
+    """
+    Alpha Vantage economic indicators.
+    Docs: https://www.alphavantage.co/documentation/
+    Returns (latest_value, meta).
+    """
+    meta: Dict[str, Any] = {"ok": False, "source": "AlphaVantage", "function": function, "error": None, "detail": None}
+    if not api_key:
+        meta["error"] = "missing_api_key"
+        return None, meta
+
+    url = "https://www.alphavantage.co/query"
+    params = {"function": function, "apikey": api_key}
+    for k, v in (extra_params or {}).items():
+        if v is None:
+            continue
+        params[str(k)] = v
+
+    j, err = _http_get_json_retry(url, params=params, timeout=(8, 25), retries=1)
+    if err:
+        meta["error"] = err
+        return None, meta
+    if not isinstance(j, dict):
+        meta["error"] = "bad_json"
+        meta["detail"] = str(type(j))
+        return None, meta
+
+    # Rate limit / informational responses
+    note = j.get("Note") or j.get("Information") or j.get("Error Message")
+    if note:
+        meta["error"] = "rate_limit_or_info"
+        meta["detail"] = str(note)[:240]
+        return None, meta
+
+    data = j.get("data")
+    if not isinstance(data, list) or not data:
+        meta["error"] = "no_data"
+        meta["detail"] = str(j)[:240]
+        return None, meta
+
+    best_row = None
+    best_date = ""
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        d = str(row.get("date") or "")
+        v = row.get("value")
+        if not d or v in (None, "", "."):
+            continue
+        if d >= best_date:
+            best_date = d
+            best_row = row
+
+    if not best_row:
+        meta["error"] = "no_valid_points"
+        return None, meta
+
+    try:
+        val = float(best_row.get("value"))
+    except Exception as e:
+        meta["error"] = f"parse_value:{type(e).__name__}:{e}"
+        meta["detail"] = str(best_row)[:240]
+        return None, meta
+
+    meta["ok"] = True
+    meta["detail"] = {"latest_date": best_date, "latest_value": val}
+    return val, meta
+
 # TradingEconomics (optional)
 # Note: TE has multiple auth styles. We support the simplest:
 # - If TRADING_ECONOMICS_KEY is present, we call as ?c=<key>
@@ -563,9 +638,15 @@ def _fetch_external_features_impl(pair_label: str, keys: Dict[str, str] | None =
         "dxy": float("nan"),
         "us10y": float("nan"),
         "jp10y": float("nan"),
+        "av_inflation": float("nan"),
+        "av_unemployment": float("nan"),
+        "av_fed_funds_rate": float("nan"),
+        "av_treasury_10y": float("nan"),
+        "av_macro_risk": 0.0,
     }
 
     fred_key, fred_used = _env_any(keys, ["FRED_API_KEY", "FRED_KEY", "FREDAPI_KEY"])
+    av_key, av_used = _env_any(keys, ["ALPHAVANTAGE_API_KEY", "ALPHA_VANTAGE_API_KEY", "AV_API_KEY"])
     te_key, te_used = _env_any(keys, ["TRADING_ECONOMICS_KEY", "TE_API_KEY", "TRADING_ECONOMICS_API_KEY"])
     news_key, news_used = _env_any(keys, ["NEWSAPI_KEY", "NEWS_API_KEY", "NEWSAPI_API_KEY"])
     openai_key, openai_used = _env_any(keys, ["OPENAI_API_KEY", "OPENAI_KEY"])
@@ -578,6 +659,7 @@ def _fetch_external_features_impl(pair_label: str, keys: Dict[str, str] | None =
             "TradingEconomics": {"present": bool(te_key), "used": te_used},
             "NewsAPI": {"present": bool(news_key), "used": news_used},
             "OpenAI": {"present": bool(openai_key), "used": openai_used},
+            "AlphaVantage": {"present": bool(av_key), "used": av_used},
         },
     }
 
@@ -599,6 +681,47 @@ def _fetch_external_features_impl(pair_label: str, keys: Dict[str, str] | None =
         # macro risk: map VIX 15->0, 40->1
         if vix is not None:
             feats["macro_risk_score"] = float(max(0.0, min(1.0, (float(vix) - 15.0) / 25.0)))
+
+        # Alpha Vantage macro (optional; backup/extra macro view)
+        try:
+            if av_key:
+                av_details: Dict[str, Any] = {}
+                infl, m_infl = fetch_alpha_vantage_indicator("INFLATION", av_key)
+                unemp, m_unemp = fetch_alpha_vantage_indicator("UNEMPLOYMENT", av_key)
+                ffr, m_ffr = fetch_alpha_vantage_indicator("FEDERAL_FUNDS_RATE", av_key, interval="monthly")
+                t10y, m_t10y = fetch_alpha_vantage_indicator("TREASURY_YIELD", av_key, interval="monthly", maturity="10year")
+
+                av_details["INFLATION"] = m_infl
+                av_details["UNEMPLOYMENT"] = m_unemp
+                av_details["FEDERAL_FUNDS_RATE"] = m_ffr
+                av_details["TREASURY_YIELD_10Y"] = m_t10y
+
+                meta["parts"]["alpha_vantage"] = {"ok": True, "detail": av_details}
+
+                if infl is not None: feats["av_inflation"] = float(infl)
+                if unemp is not None: feats["av_unemployment"] = float(unemp)
+                if ffr is not None: feats["av_fed_funds_rate"] = float(ffr)
+                if t10y is not None: feats["av_treasury_10y"] = float(t10y)
+
+                # av macro risk (0-1) from inflation/unemployment/rate (lightweight)
+                rs = []
+                if infl is not None:
+                    rs.append(max(0.0, min(1.0, (float(infl) - 2.0) / 6.0)))  # 2%->0, 8%->1
+                if unemp is not None:
+                    rs.append(max(0.0, min(1.0, (float(unemp) - 4.0) / 6.0)))  # 4%->0, 10%->1
+                if ffr is not None:
+                    rs.append(max(0.0, min(1.0, (float(ffr) - 2.0) / 5.0)))  # 2%->0, 7%->1
+
+                if rs:
+                    feats["av_macro_risk"] = float(sum(rs) / len(rs))
+
+                    # combine with VIX-based macro_risk_score (keep old behavior; add gentle bump)
+                    base_m = float(feats.get("macro_risk_score") or 0.0)
+                    feats["macro_risk_score"] = float(max(0.0, min(1.0, base_m + 0.25 * float(feats["av_macro_risk"]))))
+            else:
+                meta["parts"]["alpha_vantage"] = {"ok": False, "error": "missing_api_key"}
+        except Exception as e:
+            meta["parts"]["alpha_vantage"] = {"ok": False, "error": f"{type(e).__name__}", "detail": str(e)}
 
         # rate diff proxy
         if us10y is not None and jp10y is not None:
