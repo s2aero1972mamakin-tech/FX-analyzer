@@ -47,7 +47,7 @@ PAIR_LIST_DEFAULT = [
 # =========================
 # Build / Diagnostics
 # =========================
-APP_BUILD = "fixed14_20260222"
+APP_BUILD = "fixed15_20260222"
 # =========================
 # Operator-friendly labels
 # =========================
@@ -107,6 +107,46 @@ def _bucket_01(v: float) -> str:
         return "中（警戒）"
     return "高（危険）"
 
+
+
+def _jp_decision(decision: str) -> str:
+    """Decision label for operators (JP)."""
+    d = str(decision or "").upper()
+    mapping = {
+        "TRADE": "エントリー可",
+        "NO_TRADE": "見送り",
+        "HOLD": "様子見",
+        "WAIT": "待機",
+        "PAUSE": "一時停止",
+    }
+    return mapping.get(d, d or "—")
+
+
+def _lot_multiplier(global_risk_index: Any, alpha: Any, floor: float = 0.2, ceil: float = 1.0) -> float:
+    """Recommended lot multiplier (display-only). Safe (never raises NameError)."""
+    try:
+        r = float(global_risk_index)
+    except Exception:
+        return 1.0
+    try:
+        a = float(alpha)
+    except Exception:
+        a = 0.0
+
+    # sanitize
+    if r != r or r is None:
+        return 1.0
+    if a != a or a is None:
+        a = 0.0
+    r = max(0.0, min(1.0, r))
+    a = max(0.0, min(2.0, a))
+
+    x = 1.0 - a * r
+    if x < floor:
+        x = floor
+    if x > ceil:
+        x = ceil
+    return float(x)
 
 def _action_hint(global_risk: float, war: float, fin: float, macro: float, bs_flag: bool, gov_enabled: bool) -> str:
     """
