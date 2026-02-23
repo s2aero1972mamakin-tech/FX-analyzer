@@ -518,6 +518,13 @@ def _render_top_trade_panel(pair_label: str, plan: Dict[str, Any], current_price
     r2c1.metric("期待値EV (R)", f"{expected_R_ev:+.3f}")
     r2c2.metric("動的閾値", f"{dyn_th:.3f}")
 
+    # 判定に使ったEVが「生EV」か「リスク調整後EV」かを明示（検証用）
+    ev_raw = plan.get("expected_R_ev_raw", None)
+    ev_adj = plan.get("expected_R_ev_adj", None)
+    gate_mode = plan.get("gate_mode", None)
+    if ev_raw is not None and ev_adj is not None and gate_mode:
+        st.caption(f"判定モード: {gate_mode} / EV(生)={ev_raw:+.3f} / EV(調整後)={ev_adj:+.3f}")
+
     r3c1, r3c2 = st.columns(2)
     r3c1.metric("信頼度", f"{confidence:.2f}")
     r3c2.metric("推奨ロット係数", f"{lot_mult:.2f}")
