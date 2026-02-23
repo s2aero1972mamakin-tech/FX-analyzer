@@ -154,8 +154,8 @@ def _apply_overlays(state_probs: Dict[str, float], ctx: Dict[str, Any]) -> Tuple
     fin_stress = _clamp(_safe_float(ctx.get("financial_stress"), 0.0), 0.0, 1.0)
 
     # Overlay strength: conservative. push more weight into risk_off when risk rises.
-    bump = 0.35 * global_risk + 0.20 * macro + 0.20 * war_prob + 0.15 * fin_stress
-    bump = _clamp(bump, 0.0, 0.65)
+    bump = 0.18 * global_risk + 0.10 * macro + 0.12 * war_prob + 0.10 * fin_stress
+    bump = _clamp(bump, 0.0, 0.35)
 
     # Take from non-risk states proportionally
     non = max(1e-9, p["trend_up"] + p["trend_down"] + p["range"])
@@ -400,18 +400,33 @@ def get_ai_order_strategy(api_key: str, context_data: Dict[str, Any], **kwargs) 
     state_stats["trend_down"]["mean_R"] += 0.02 * (-news)
     state_stats["risk_off"]["mean_R"] += -0.02 * abs(rate)
 
-    expected_R_ev, ev_contribs = _ev_from_probs(probs, state_stats)
-    p_win_ev = _pwin_from_probs(probs, state_stats)
+    # --- EV (raw vs overlay-adjusted) ---
+    expected_R_ev_raw, ev_contribs_raw = _ev_from_probs(probs0, state_stats)
+    expected_R_ev_adj, ev_contribs_adj = _ev_from_probs(probs, state_stats)
+    # Win-prob proxy uses raw stats (informational)
+    p_win_ev = _pwin_from_probs(probs0, state_stats)
 
-    # Dynamic threshold: raise threshold in risky regimes
-    macro = _clamp(_safe_float(ctx.get("macro_risk_score"), 0.0), 0.0, 1.0)
-    global_risk = _clamp(_safe_float(ctx.get("global_risk_index"), 0.0), 0.0, 1.0)
-    war = _clamp(_safe_float(ctx.get("war_probability"), 0.0), 0.0, 1.0)
-    fin = _clamp(_safe_float(ctx.get("financial_stress"), 0.0), 0.0, 1.0)
+    # Decision gate mode:
+    #  - default: gate by RAW EV (market structure) and use overlays as SAFETY STOPS + position sizing hints
+    #  - optional: gate by ADJUSTED EV (more conservative) if ctx['use_risk_adjusted_ev_gate']=True
+    use_adj_gate = bool(ctx.get('use_risk_adjusted_ev_gate', False))
+    ev_for_gate = float(expected_R_ev_adj if use_adj_gate else expected_R_ev_raw)
 
-    dynamic_threshold = base_threshold * (1.0 + 0.8*macro + 1.0*global_risk + 0.6*war + 0.6*fin)
-    dynamic_threshold = float(_clamp(dynamic_threshold, base_threshold, 0.35))
-
+    # --- Dynamic threshold ---
+    # NOTE: double-counting risk (both in probs overlay AND threshold) causes 'NO_TRADE forever'.
+    # Default behavior keeps threshold near base and uses black_swan/governor as hard stops.
+    macro = _clamp(_safe_float(ctx.get('macro_risk_score'), 0.0), 0.0, 1.0)
+    global_risk = _clamp(_safe_float(ctx.get('global_risk_index'), 0.0), 0.0, 1.0)
+    war = _clamp(_safe_float(ctx.get('war_probability'), 0.0), 0.0, 1.0)
+    fin = _clamp(_safe_float(ctx.get('financial_stress'), 0.0), 0.0, 1.0)
+    if use_adj_gate:
+        # conservative mode: raise threshold moderately
+        dynamic_threshold = base_threshold * (1.0 + 0.35*macro + 0.45*global_risk + 0.25*war + 0.25*fin)
+        dynamic_threshold = float(_clamp(dynamic_threshold, base_threshold, 0.30))
+    else:
+        # swing-normal mode: keep threshold mostly stable (avoid killing entries)
+        dynamic_threshold = base_threshold * (1.0 + 0.20*macro)
+        dynamic_threshold = float(_clamp(dynamic_threshold, base_threshold, 0.20))
     veto_reasons: List[str] = []
 
     # Governor & Black Swan guard
@@ -424,20 +439,21 @@ def get_ai_order_strategy(api_key: str, context_data: Dict[str, Any], **kwargs) 
         veto_reasons.append("BlackSwanGuard: " + (" / ".join(bs["reasons"]) if bs["reasons"] else "red"))
 
     # Build order candidate
-    order = _build_order(ctx, probs, expected_R_ev)
+    # Build order candidate from RAW market-state (avoid 'risk_off' dominating side selection)
+    order = _build_order(ctx, probs0, ev_for_gate)
 
     # EV gate
-    if expected_R_ev < dynamic_threshold:
-        veto_reasons.append(f"EV不足: {expected_R_ev:+.3f} < 動的閾値 {dynamic_threshold:.3f}")
+    if ev_for_gate < dynamic_threshold:
+        veto_reasons.append(f"EV不足({'adj' if use_adj_gate else 'raw'}): {ev_for_gate:+.3f} < 動的閾値 {dynamic_threshold:.3f}")
 
     # Final decision
     decision = "TRADE"
     if veto_reasons or order.get("decision") != "TRADE":
         decision = "NO_TRADE"
 
-    confidence = float(_clamp(abs(expected_R_ev) / max(dynamic_threshold, 1e-9), 0.0, 1.0))
+    confidence = float(_clamp(abs(ev_for_gate) / max(dynamic_threshold, 1e-9), 0.0, 1.0))
 
-    why = " / ".join(veto_reasons) if veto_reasons else f"EV通過: {expected_R_ev:+.3f} ≥ {dynamic_threshold:.3f}"
+    why = ' / '.join(veto_reasons) if veto_reasons else f"EV通過: {ev_for_gate:+.3f} ≥ {dynamic_threshold:.3f}"
 
     out: Dict[str, Any] = {
         "decision": decision,
@@ -451,11 +467,17 @@ def get_ai_order_strategy(api_key: str, context_data: Dict[str, Any], **kwargs) 
         "confidence": confidence,
         "why": why,
         "state_probs": probs,
-        "expected_R_ev": float(expected_R_ev),
+        "state_probs_raw": probs0,
+        "expected_R_ev": float(ev_for_gate),
+        "expected_R_ev_raw": float(expected_R_ev_raw),
+        "expected_R_ev_adj": float(expected_R_ev_adj),
         "p_win_ev": float(p_win_ev),
-        "ev_contribs": ev_contribs,
+        "ev_contribs": ev_contribs_adj,
+        "ev_contribs_raw": ev_contribs_raw,
+        "ev_contribs_adj": ev_contribs_adj,
         "state_stats_ev": state_stats,
         "overlay_meta": overlay_meta,
+        "gate_mode": "EV_ADJUSTED" if use_adj_gate else "EV_RAW",
         "dynamic_threshold": float(dynamic_threshold),
         "black_swan": bs,
         "governor": gov,
