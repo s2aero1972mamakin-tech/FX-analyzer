@@ -47,7 +47,7 @@ PAIR_LIST_DEFAULT = [
 # =========================
 # Build / Diagnostics
 # =========================
-APP_BUILD = "fixed15_20260222"
+APP_BUILD = "fixed20_20260223"
 # =========================
 # Operator-friendly labels
 # =========================
