@@ -1295,7 +1295,7 @@ def _render_risk_dashboard(plan: Dict[str, Any], feats: Dict[str, float], ext_me
 # UI
 # =========================
 st.set_page_config(page_title="FX EV Auto v4 Integrated", layout="centered", initial_sidebar_state="collapsed")
-st.title("FX 自動AI判断ツール（EV最大化） v4 Integrated")
+st.title("FX 自動AI判断ツール")
 
 with st.sidebar:
     st.header("運用操作（見る順）")
@@ -2002,3 +2002,4 @@ with st.expander("🔧 Webhook診断（送信テスト/失敗理由の表示）"
         st.caption("直近の送信結果（デバッグ）")
         st.json(st.session_state["last_webhook_result"])
 # --- /Webhook Diagnostics ---
+
