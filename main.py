@@ -1124,14 +1124,31 @@ with tabs[0]:
             # Does not change internal calculations; only tightens final permission when user selects 勝率優先.
             try:
                 if str(st.session_state.get('priority_mode','')) == '勝率優先（見送り増）':
-                    p_win_min = 0.56   # tighten
-                    conf_min = 0.60
+                    # 勝率優先 = 「p_winをハード閾値で切り捨て」ではなく、
+                    # 低p_winを"強いEVでのみ許可"する階段ゲートにする（ゼロ化を防ぐ）
                     p_win = float(plan.get("p_win_ev", 0.0) or 0.0)
                     conf = float(plan.get("confidence", 0.0) or 0.0)
-                    if str(plan.get("decision","")) == "TRADE" and (p_win < p_win_min or conf < conf_min):
+                    ev_raw = float(plan.get("expected_R_ev_raw", plan.get("expected_R_ev", 0.0)) or 0.0)
+                    thr = float(plan.get("dynamic_threshold", 0.0) or 0.0)
+
+                    # ゲート設定（固定・後方互換）
+                    conf_min = 0.55
+                    hard_pwin_min = 0.50
+                    soft_pwin_min = 0.54
+                    ev_margin_if_soft = 0.02  # p_winが弱いときは、EVで補強されている場合のみ許可
+
+                    veto = None
+                    if conf < conf_min:
+                        veto = f"勝率優先フィルタ: conf={conf:.2f} < {conf_min:.2f}"
+                    elif p_win < hard_pwin_min:
+                        veto = f"勝率優先フィルタ: p_win={p_win:.2f} < {hard_pwin_min:.2f}"
+                    elif p_win < soft_pwin_min and ev_raw < (thr + ev_margin_if_soft):
+                        veto = f"勝率優先フィルタ: p_win={p_win:.2f}（弱）→ EV補強不足 {ev_raw:+.3f} < {thr + ev_margin_if_soft:.3f}"
+
+                    if str(plan.get("decision","")) == "TRADE" and veto:
                         plan["decision"] = "NO_TRADE"
                         reasons = list(plan.get("veto_reasons", []) or [])
-                        reasons.append(f"勝率優先フィルタ: p_win={p_win:.2f} / conf={conf:.2f}")
+                        reasons.append(veto)
                         plan["veto_reasons"] = reasons
                         plan["why"] = reasons[-1]
             except Exception:
