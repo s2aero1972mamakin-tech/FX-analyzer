@@ -532,6 +532,56 @@ def _parts_status_table(meta: Dict[str, Any]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+
+
+
+def _recommend_min_expected_R_from_audit(rows: List[Dict[str, Any]], target_trade_rate: float = 0.20) -> Dict[str, Any]:
+    """Recommend base min_expected_R using ev_audit rows.
+
+    dynamic_threshold = base_threshold * mult
+    mult = 1 + 0.8*macro + 1.0*global + 0.6*war + 0.6*fin
+
+    For EV_RAW gate, TRADE if:
+      ev_raw >= base_threshold * mult
+    => base_threshold <= ev_raw / mult
+
+    To target trade rate r, choose base_threshold as the (1-r) quantile
+    of (ev_raw/mult) over recent rows.
+    """
+    try:
+        r = float(target_trade_rate)
+        r = max(0.01, min(0.80, r))
+    except Exception:
+        r = 0.20
+
+    vals: List[float] = []
+    for row in rows:
+        try:
+            ev_raw = float(row.get("ev_raw", ""))
+            macro = float(row.get("macro_risk_score", 0.0) or 0.0)
+            global_risk = float(row.get("global_risk_index", 0.0) or 0.0)
+            war = float(row.get("war_probability", 0.0) or 0.0)
+            fin = float(row.get("financial_stress", 0.0) or 0.0)
+            mult = 1.0 + 0.8*macro + 1.0*global_risk + 0.6*war + 0.6*fin
+            mult = max(1.0, float(mult))
+            vals.append(ev_raw / mult)
+        except Exception:
+            continue
+
+    if len(vals) < 5:
+        return {"ok": False, "n": len(vals), "recommended": None, "reason": "ログ件数が不足（5件以上で暫定推奨）"}
+
+    vals_sorted = sorted(vals)
+    q = 1.0 - r
+    k = int(round(q * (len(vals_sorted) - 1)))
+    k = max(0, min(len(vals_sorted) - 1, k))
+    rec = float(vals_sorted[k])
+
+    # Guard rails for swing
+    rec = float(max(0.01, min(0.12, rec)))
+
+    return {"ok": True, "n": len(vals), "recommended": rec, "target_trade_rate": r}
+
 def _style_defaults(style_name: str) -> Dict[str, Any]:
     # Presets: avoid manual tuning
     if style_name == "保守":
@@ -805,6 +855,25 @@ def _render_risk_dashboard(plan: Dict[str, Any], feats: Dict[str, float], ext_me
 
         with st.expander("📒 EV監査ログ（直近2週間：rawは良いのにadjで潰れる/閾値で潰れるを可視化）", expanded=False):
             rows = _ev_audit_load()
+
+            # --- 自動最適化（min_expected_R 推奨） ---
+            rec = _recommend_min_expected_R_from_audit(rows, target_trade_rate=0.20) if rows else {"ok": False, "n": 0, "recommended": None, "reason": "ログなし"}
+            colA, colB = st.columns([2, 1])
+            with colA:
+                if rec.get("ok"):
+                    st.success(f"自動推奨 min_expected_R（目標TRADE率 {int(rec['target_trade_rate']*100)}%）: **{rec['recommended']:.3f}R**（n={rec['n']}）")
+                else:
+                    st.info(f"自動推奨 min_expected_R: まだ算出できません（{rec.get('reason','')} / n={rec.get('n',0)}）")
+            with colB:
+                if rec.get("ok"):
+                    if st.button("この推奨値を適用", use_container_width=True):
+                        st.session_state["min_expected_R_override"] = float(rec["recommended"])
+                        st.toast(f"min_expected_R を {rec['recommended']:.3f} に固定しました（自動最適化）")
+                if st.button("自動最適化を解除", use_container_width=True):
+                    st.session_state["min_expected_R_override"] = None
+                    st.toast("min_expected_R の自動最適化を解除しました（プリセットに戻ります）")
+            st.caption("※自動最適化は『直近ログのEV_raw分布』から、目標TRADE率になるよう min_expected_R を推奨します。外部リスクでEVを削らず、閾値だけ調整します。")
+            # --- /自動最適化 ---
             summ = _ev_audit_summary(rows, days=14)
             st.write(f"直近{summ['days']}日：判定 {summ['total']}件 / TRADE {summ['trade']}件 / NO_TRADE {summ['no_trade']}件")
             st.write(f"直近{summ['days']}日：**『EV_rawならTRADEだが EV_adjならNO_TRADE』= {summ['killed_by_adj']}件**（二重ブレーキ確認用）")
@@ -918,7 +987,18 @@ with st.sidebar:
 
     preset = _style_defaults(style_name)
     min_expected_R = float(preset["min_expected_R"])
-    st.caption(f"見送りライン（min_expected_R）: {min_expected_R:.2f}R / 想定期間: {horizon_days}日 / 価格: {period}・{interval}")
+
+    # Optional override (from EV監査ログの自動最適化)
+    if "min_expected_R_override" in st.session_state and st.session_state["min_expected_R_override"] is not None:
+        try:
+            min_expected_R = float(st.session_state["min_expected_R_override"])
+        except Exception:
+            pass
+
+    st.caption(
+        f"見送りライン（min_expected_R）: {min_expected_R:.3f}R / 想定期間: {horizon_days}日 / 価格: {period}・{interval}"
+        + ("（自動最適化適用）" if "min_expected_R_override" in st.session_state and st.session_state["min_expected_R_override"] is not None else "")
+    )
 
     with st.expander("🛡️ 安全/ガード（非常時だけ）", expanded=False):
         outage_policy = st.selectbox("外部データ全滅時の扱い", ["表示のみ（推奨：機会を殺さない）", "強制見送り（安全優先）"], index=0)
