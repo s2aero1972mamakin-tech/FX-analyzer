@@ -50,7 +50,7 @@ PAIR_LIST_DEFAULT = [
 # =========================
 # Build / Diagnostics
 # =========================
-APP_BUILD = "fixed26_20260224"
+APP_BUILD = "fixed27_20260224"
 # ---- EV audit (operator logs) ----
 EV_AUDIT_PATH = "logs/ev_audit.csv"
 
@@ -1573,3 +1573,117 @@ def _profit_max_reco(plan: dict) -> dict:
     except Exception:
         return {"tp_ext": plan.get("take_profit"), "trail_sl": plan.get("stop_loss"), "extend_factor": 1.0}
 
+
+
+def _try_post_json(url: str, payload: dict, timeout_s: int = 6):
+    """POST JSON and return (ok: bool, status_code: int|None, response_text: str, error: str)."""
+    try:
+        r = requests.post(url, json=payload, timeout=timeout_s)
+        return (200 <= getattr(r, "status_code", 0) < 300), getattr(r, "status_code", None), (r.text or ""), ""
+    except Exception as e:
+        return False, None, "", str(e)
+
+def _post_json_webhook(payload: dict):
+    """Optional external sink: POST JSON to LOG_WEBHOOK_URL if provided in Streamlit Secrets.
+    Returns (ok, status_code, response_text, error). Never raises."""
+    try:
+        url = st.secrets.get("LOG_WEBHOOK_URL", "")
+        if not url:
+            return False, None, "", "LOG_WEBHOOK_URL not set"
+        return _try_post_json(url, payload, timeout_s=6)
+    except Exception as e:
+        return False, None, "", str(e)
+
+def _supabase_insert(table: str, row: dict):
+    """Optional Supabase sink (REST): requires SUPABASE_URL and SUPABASE_ANON_KEY in secrets.
+    Returns (ok, status_code, response_text, error). Never raises."""
+    try:
+        sb_url = st.secrets.get("SUPABASE_URL", "")
+        sb_key = st.secrets.get("SUPABASE_ANON_KEY", "")
+        if not sb_url or not sb_key or not table:
+            return False, None, "", "Supabase secrets/table not set"
+        endpoint = sb_url.rstrip("/") + f"/rest/v1/{table}"
+        headers = {
+            "apikey": sb_key,
+            "Authorization": f"Bearer {sb_key}",
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal",
+        }
+        r = requests.post(endpoint, headers=headers, json=[row], timeout=6)
+        ok = 200 <= getattr(r, "status_code", 0) < 300
+        return ok, getattr(r, "status_code", None), (r.text or ""), ""
+    except Exception as e:
+        return False, None, "", str(e)
+
+def _external_log_event(kind: str, row: dict):
+    """Send an event to external sinks (webhook and/or Supabase) if configured.
+    Returns a dict with per-sink results."""
+    payload = {"kind": kind, **row}
+    results = {"webhook": None, "supabase": None}
+
+    ok, sc, txt, err = _post_json_webhook(payload)
+    results["webhook"] = {"ok": ok, "status_code": sc, "response": (txt[:500] if txt else ""), "error": err}
+
+    try:
+        table = st.secrets.get("SUPABASE_LOG_TABLE", "")
+    except Exception:
+        table = ""
+    if table:
+        ok2, sc2, txt2, err2 = _supabase_insert(table, payload)
+        results["supabase"] = {"ok": ok2, "status_code": sc2, "response": (txt2[:500] if txt2 else ""), "error": err2}
+
+    return results
+
+
+
+# --- Webhook Diagnostics (fixed27) ---
+with st.expander("🔧 Webhook診断（送信テスト/失敗理由の表示）", expanded=False):
+    url = ""
+    try:
+        url = st.secrets.get("LOG_WEBHOOK_URL", "")
+    except Exception:
+        url = ""
+
+    if url:
+        masked = url[:32] + "..." + url[-12:] if len(url) > 48 else url
+        st.write(f"LOG_WEBHOOK_URL: `{masked}`")
+    else:
+        st.warning("LOG_WEBHOOK_URL が Secrets に設定されていません。B1(Webhook) は無効です。")
+
+    test_payload = {
+        "ts_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "pair": st.session_state.get("selected_pair", ""),
+        "decision": "TEST",
+        "ev_raw": 0.123,
+        "ev_adj": 0.045,
+        "dynamic_threshold": 0.010,
+        "gate_mode": "EV_RAW",
+    }
+
+    colA, colB = st.columns(2)
+    with colA:
+        if st.button("Webhookへテスト送信", use_container_width=True):
+            if not url:
+                st.error("LOG_WEBHOOK_URL が未設定です。")
+            else:
+                res = _external_log_event("debug_test", test_payload)
+                st.session_state["last_webhook_result"] = res
+                wh = (res or {}).get("webhook") or {}
+                if wh.get("ok"):
+                    st.success(f"Webhook送信OK (HTTP {wh.get('status_code')})")
+                else:
+                    st.error(f"Webhook送信NG: {wh.get('error') or 'unknown'} (HTTP {wh.get('status_code')})")
+                sb = (res or {}).get("supabase")
+                if sb is not None:
+                    if sb.get("ok"):
+                        st.success(f"Supabase INSERT OK (HTTP {sb.get('status_code')})")
+                    else:
+                        st.error(f"Supabase INSERT NG: {sb.get('error') or 'unknown'} (HTTP {sb.get('status_code')})")
+    with colB:
+        st.caption("送信payload（確認用）")
+        st.json({"kind": "debug_test", **test_payload})
+
+    if "last_webhook_result" in st.session_state:
+        st.caption("直近の送信結果（デバッグ）")
+        st.json(st.session_state["last_webhook_result"])
+# --- /Webhook Diagnostics ---
