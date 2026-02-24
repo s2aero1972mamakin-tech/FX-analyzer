@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Dict, Any, Tuple, Optional, List
 
 import streamlit as st
+import requests
 import pandas as pd
 
 # ---- optional deps ----
@@ -49,7 +50,7 @@ PAIR_LIST_DEFAULT = [
 # =========================
 # Build / Diagnostics
 # =========================
-APP_BUILD = "fixed24_20260224"
+APP_BUILD = "fixed26_20260224"
 # ---- EV audit (operator logs) ----
 EV_AUDIT_PATH = "logs/ev_audit.csv"
 
@@ -1535,3 +1536,40 @@ with tabs[2]:
 - **TradingEconomics 403**：無料キー国制限（仕様寄り）
 - **GDELT timeout/429**：ネットワーク到達性 or 間隔制御不足（キャッシュ/リトライで緩和）
 """)
+
+def _profit_max_reco(plan: dict) -> dict:
+    """Compute an extended take-profit and a simple trail-stop suggestion (advisory)."""
+    try:
+        side = (plan.get("side") or "").upper()
+        entry = float(plan.get("entry") or 0.0)
+        sl = float(plan.get("stop_loss") or 0.0)
+        tp = float(plan.get("take_profit") or 0.0)
+        conf = float(plan.get("confidence") or 0.0)
+        dom = str(plan.get("dominant_state") or "")
+        overlay = plan.get("overlay_meta") or {}
+        gri = float(overlay.get("global_risk_index") or 0.0)
+        war = float(overlay.get("war_probability") or 0.0)
+        fin = float(overlay.get("financial_stress") or 0.0)
+
+        risk = max(0.0, min(1.0, 0.5*gri + 0.3*war + 0.2*fin))
+        extend = 1.0 + 0.9 * max(0.0, conf - 0.5) * (1.0 - risk)
+        if "risk_off" in dom:
+            extend = 1.0
+        extend = max(1.0, min(1.8, extend))
+
+        dist_tp = abs(tp - entry)
+        if dist_tp <= 0:
+            tp_ext = tp
+        else:
+            tp_ext = entry + dist_tp * extend if side == "BUY" else (entry - dist_tp * extend if side == "SELL" else tp)
+
+        dist_sl = abs(entry - sl)
+        if dist_sl <= 0:
+            trail_sl = sl
+        else:
+            trail_sl = entry + 0.5*dist_sl if side == "BUY" else (entry - 0.5*dist_sl if side == "SELL" else sl)
+
+        return {"tp_ext": tp_ext, "trail_sl": trail_sl, "extend_factor": extend}
+    except Exception:
+        return {"tp_ext": plan.get("take_profit"), "trail_sl": plan.get("stop_loss"), "extend_factor": 1.0}
+
