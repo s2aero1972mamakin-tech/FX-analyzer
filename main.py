@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import os
 import time
+import csv
+from datetime import datetime, timezone
 from typing import Dict, Any, Tuple, Optional, List
 
 import streamlit as st
@@ -47,7 +49,79 @@ PAIR_LIST_DEFAULT = [
 # =========================
 # Build / Diagnostics
 # =========================
-APP_BUILD = "fixed20_20260223"
+APP_BUILD = "fixed21_20260224"
+# ---- EV audit (operator logs) ----
+EV_AUDIT_PATH = "logs/ev_audit.csv"
+
+def _ev_audit_append(row: Dict[str, Any], path: str = EV_AUDIT_PATH) -> None:
+    """Append one row to ev_audit.csv. Never raises to caller."""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fieldnames = [
+            "ts_utc",
+            "timeframe_mode",
+            "pair",
+            "decision_adj",
+            "decision_raw",
+            "killed_by_adj",
+            "ev_raw",
+            "ev_adj",
+            "dynamic_threshold",
+            "dominant_state",
+            "confidence",
+            "global_risk_index",
+            "war_probability",
+            "financial_stress",
+            "macro_risk_score",
+            "risk_off_bump",
+        ]
+        file_exists = os.path.exists(path)
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            if not file_exists:
+                w.writeheader()
+            w.writerow({k: row.get(k, "") for k in fieldnames})
+    except Exception:
+        # Audit must never break trading UI
+        return
+
+def _ev_audit_load(path: str = EV_AUDIT_PATH, max_rows: int = 20000) -> List[Dict[str, Any]]:
+    try:
+        if not os.path.exists(path):
+            return []
+        rows: List[Dict[str, Any]] = []
+        with open(path, "r", newline="", encoding="utf-8") as f:
+            r = csv.DictReader(f)
+            for i, row in enumerate(r):
+                rows.append(row)
+                if i >= max_rows:
+                    break
+        return rows
+    except Exception:
+        return []
+
+def _ev_audit_summary(rows: List[Dict[str, Any]], days: int = 14) -> Dict[str, Any]:
+    """Summarize last N days rows (best-effort; ts_utc ISO8601)."""
+    from datetime import datetime, timezone, timedelta
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    def parse_ts(s: str):
+        try:
+            # expecting 2026-02-23T12:34:56Z
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            return datetime.fromisoformat(s)
+        except Exception:
+            return None
+    recent = []
+    for r in rows:
+        ts = parse_ts(str(r.get("ts_utc","")))
+        if ts and ts >= cutoff:
+            recent.append(r)
+    total = len(recent)
+    trade = sum(1 for r in recent if str(r.get("decision_adj","")) == "TRADE")
+    killed = sum(1 for r in recent if str(r.get("killed_by_adj","")).lower() in ("true","1","yes"))
+    return {"days": days, "total": total, "trade": trade, "no_trade": total-trade, "killed_by_adj": killed}
+
 # =========================
 # Operator-friendly labels
 # =========================
@@ -727,6 +801,89 @@ def _render_risk_dashboard(plan: Dict[str, Any], feats: Dict[str, float], ext_me
                 )
             except Exception:
                 pass
+
+
+        with st.expander("📒 EV監査ログ（直近2週間：rawは良いのにadjで潰れる/閾値で潰れるを可視化）", expanded=False):
+            rows = _ev_audit_load()
+            summ = _ev_audit_summary(rows, days=14)
+            st.write(f"直近{summ['days']}日：判定 {summ['total']}件 / TRADE {summ['trade']}件 / NO_TRADE {summ['no_trade']}件")
+            st.write(f"直近{summ['days']}日：**『EV_rawならTRADEだが EV_adjならNO_TRADE』= {summ['killed_by_adj']}件**（二重ブレーキ確認用）")
+
+            # ---- Optimization hint (data-driven) ----
+            if rows and summ["total"] >= 20:
+                try:
+                    import pandas as _pd
+                    df_opt = _pd.DataFrame(rows)
+                    # coerce
+                    for c in ["ev_raw","ev_adj","dynamic_threshold","macro_risk_score","confidence"]:
+                        if c in df_opt.columns:
+                            df_opt[c] = _pd.to_numeric(df_opt[c], errors="coerce")
+                    # focus on recent 14d already counted by summary: we re-filter by ts_utc
+                    df_opt = df_opt.dropna(subset=["ev_raw","dynamic_threshold"])
+                    # eligible: confident trend states (avoid pure risk_off)
+                    if "dominant_state" in df_opt.columns:
+                        df_opt = df_opt[df_opt["dominant_state"].astype(str).isin(["trend_up","trend_down","range","risk_off"])]
+
+                    # Estimate base_threshold used by logic (swing-normal assumes: dyn = base*(1+0.20*macro))
+                    if "macro_risk_score" in df_opt.columns and df_opt["macro_risk_score"].notna().any():
+                        macro = df_opt["macro_risk_score"].fillna(0.0).clip(lower=0.0)
+                        base_est = (df_opt["dynamic_threshold"] / (1.0 + 0.20*macro)).clip(lower=0.0)
+                    else:
+                        base_est = df_opt["dynamic_threshold"]
+
+                    base_est_med = float(base_est.dropna().median()) if base_est.notna().any() else None
+
+                    st.markdown("#### 🎯 しきい値（min_expected_R）の最適化提案（直近ログから推定）")
+                    if base_est_med is not None:
+                        st.caption(f"現在の推定 base_threshold（中央値）: {base_est_med:.3f}")
+
+                    # Target: at least 4 TRADE / 14d (≈2/週) as a sane starting point
+                    target_trades = st.number_input("目標TRADE件数（直近14日）", min_value=0, max_value=500, value=4, step=1)
+                    # For each row, trade if base <= ev_raw / (1+0.20*macro)
+                    if "macro_risk_score" in df_opt.columns and df_opt["macro_risk_score"].notna().any():
+                        macro = df_opt["macro_risk_score"].fillna(0.0).clip(lower=0.0)
+                        ratios = (df_opt["ev_raw"] / (1.0 + 0.20*macro)).replace([_pd.NA, _pd.NaT], _pd.NA)
+                    else:
+                        ratios = df_opt["ev_raw"]
+
+                    ratios = _pd.to_numeric(ratios, errors="coerce").dropna()
+                    ratios = ratios[ratios > 0]  # only meaningful positive EV_raw
+
+                    if len(ratios) >= 10 and target_trades > 0:
+                        ratios_sorted = ratios.sort_values(ascending=False).reset_index(drop=True)
+                        k = int(min(target_trades, len(ratios_sorted)))
+                        reco_base = float(ratios_sorted.iloc[k-1])
+                        # simulate
+                        sim_trades = int((ratios >= reco_base).sum())
+                        st.write(f"推奨 min_expected_R（ベース）: **{reco_base:.3f}** （この値なら直近ログ上の予測TRADE: {sim_trades}件/14日）")
+                        st.caption("※これは『過去ログに対するシミュレーション』です。市場が変われば変動します。")
+                        if st.button("この推奨値を『min_expected_R』に適用（診断用）"):
+                            st.session_state["min_expected_R"] = float(reco_base)
+                            st.success("min_expected_R を推奨値に更新しました。画面を再計算してください。")
+                    else:
+                        st.caption("ログがまだ少ないため、推奨値の推定ができません（目安：10件以上）。")
+                except Exception:
+                    st.caption("最適化提案の計算に失敗しました（ログ形式の違いの可能性）。")
+            # ---- /Optimization hint ----
+            if rows:
+                st.caption("※直近200件を表示。必要ならCSVをダウンロードして集計してください。")
+                # show latest first
+                import pandas as _pd
+                df_a = _pd.DataFrame(list(reversed(rows))[:200])
+                st.dataframe(df_a, use_container_width=True)
+                try:
+                    csv_a = _pd.DataFrame(rows).to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        "📥 EV監査ログCSVをダウンロード（ev_audit.csv）",
+                        data=csv_a,
+                        file_name="ev_audit.csv",
+                        mime="text/csv",
+                    )
+                except Exception:
+                    pass
+            else:
+                st.info("監査ログはまだありません。判定を数回実行すると蓄積されます（デプロイし直すと消える場合があります）。")
+
     
     except Exception:
         # status table is best-effort; never break trading UI
@@ -865,6 +1022,38 @@ with tabs[0]:
             ctx = _build_ctx(p, df, feats, horizon_days=int(horizon_days), min_expected_R=float(min_expected_R), style_name=style_name, governor_cfg=governor_cfg)
             plan = logic.get_ai_order_strategy(api_key=keys.get("OPENAI_API_KEY",""), context_data=ctx)
 
+
+            # ---- EV audit row (for 2-week verification) ----
+            try:
+                overlay = plan.get("overlay_meta", {}) or {}
+                ev_raw = plan.get("expected_R_ev_raw", plan.get("expected_R_ev", 0.0))
+                ev_adj = plan.get("expected_R_ev_adj", plan.get("expected_R_ev", 0.0))
+                thr = plan.get("dynamic_threshold", 0.0)
+                # "killed" means: would TRADE on raw, but would be NO_TRADE on adj (for analysis)
+                decision_raw = "TRADE" if float(ev_raw) >= float(thr) else "NO_TRADE"
+                decision_adj = "TRADE" if float(ev_adj) >= float(thr) else "NO_TRADE"
+                killed_by_adj = (decision_raw == "TRADE" and decision_adj != "TRADE")
+                _ev_audit_append({
+                    "ts_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "timeframe_mode": str(st.session_state.get("timeframe_mode", "")),
+                    "pair": str(p),
+                    "decision_adj": str(plan.get("decision","")),
+                    "decision_raw": decision_raw,
+                    "killed_by_adj": str(bool(killed_by_adj)),
+                    "ev_raw": float(ev_raw),
+                    "ev_adj": float(ev_adj),
+                    "dynamic_threshold": float(thr),
+                    "dominant_state": str(plan.get("dominant_state","")),
+                    "confidence": float(plan.get("confidence", 0.0) or 0.0),
+                    "global_risk_index": float(overlay.get("global_risk_index", 0.0) or 0.0),
+                    "war_probability": float(overlay.get("war_probability", 0.0) or 0.0),
+                    "financial_stress": float(overlay.get("financial_stress", 0.0) or 0.0),
+                    "macro_risk_score": float(overlay.get("macro_risk_score", 0.0) or 0.0),
+                    "risk_off_bump": float(overlay.get("risk_off_bump", 0.0) or 0.0),
+                })
+            except Exception:
+                pass
+            # ---- /EV audit row ----
             # ---- operator guard (UI-level; default display-only) ----
 
             lot_mult = _lot_multiplier(feats.get("global_risk_index", 0.0), lot_risk_alpha)
