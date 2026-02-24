@@ -54,7 +54,7 @@ PAIR_LIST_DEFAULT = [
 # =========================
 # Build / Diagnostics
 # =========================
-APP_BUILD = "fixed27_20260224"
+APP_BUILD = "fixed28b_20260224"
 # ---- EV audit (operator logs) ----
 EV_AUDIT_PATH = "logs/ev_audit.csv"
 
@@ -89,6 +89,68 @@ def _ev_audit_append(row: Dict[str, Any], path: str = EV_AUDIT_PATH) -> None:
     except Exception:
         # Audit must never break trading UI
         return
+
+# =========================
+# External sinks (Webhook / Supabase) for ops logging
+# =========================
+def _try_post_json(url: str, payload: dict, timeout_s: int = 6):
+    """POST JSON and return (ok: bool, status_code: int|None, response_text: str, error: str)."""
+    try:
+        r = requests.post(url, json=payload, timeout=timeout_s)
+        return (200 <= getattr(r, "status_code", 0) < 300), getattr(r, "status_code", None), (r.text or ""), ""
+    except Exception as e:
+        return False, None, "", str(e)
+
+def _post_json_webhook(payload: dict):
+    """Optional external sink: POST JSON to LOG_WEBHOOK_URL if provided in Streamlit Secrets.
+    Returns (ok, status_code, response_text, error). Never raises."""
+    try:
+        url = st.secrets.get("LOG_WEBHOOK_URL", "")
+        if not url:
+            return False, None, "", "LOG_WEBHOOK_URL not set"
+        return _try_post_json(url, payload, timeout_s=6)
+    except Exception as e:
+        return False, None, "", str(e)
+
+def _supabase_insert(table: str, row: dict):
+    """Optional Supabase sink (REST): requires SUPABASE_URL and SUPABASE_ANON_KEY in secrets.
+    Returns (ok, status_code, response_text, error). Never raises."""
+    try:
+        sb_url = st.secrets.get("SUPABASE_URL", "")
+        sb_key = st.secrets.get("SUPABASE_ANON_KEY", "")
+        if not sb_url or not sb_key or not table:
+            return False, None, "", "Supabase secrets/table not set"
+        endpoint = sb_url.rstrip("/") + f"/rest/v1/{table}"
+        headers = {
+            "apikey": sb_key,
+            "Authorization": f"Bearer {sb_key}",
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal",
+        }
+        r = requests.post(endpoint, headers=headers, json=[row], timeout=6)
+        ok = 200 <= getattr(r, "status_code", 0) < 300
+        return ok, getattr(r, "status_code", None), (r.text or ""), ""
+    except Exception as e:
+        return False, None, "", str(e)
+
+def _external_log_event(kind: str, row: dict):
+    """Send an event to external sinks (webhook and/or Supabase) if configured.
+    Returns a dict with per-sink results."""
+    payload = {"kind": kind, **row}
+    results = {"webhook": None, "supabase": None}
+
+    ok, sc, txt, err = _post_json_webhook(payload)
+    results["webhook"] = {"ok": ok, "status_code": sc, "response": (txt[:500] if txt else ""), "error": err}
+
+    try:
+        table = st.secrets.get("SUPABASE_LOG_TABLE", "")
+    except Exception:
+        table = ""
+    if table:
+        ok2, sc2, txt2, err2 = _supabase_insert(table, payload)
+        results["supabase"] = {"ok": ok2, "status_code": sc2, "response": (txt2[:500] if txt2 else ""), "error": err2}
+
+    return results
 
 def _ev_audit_load(path: str = EV_AUDIT_PATH, max_rows: int = 20000) -> List[Dict[str, Any]]:
     try:
@@ -1233,7 +1295,7 @@ def _render_risk_dashboard(plan: Dict[str, Any], feats: Dict[str, float], ext_me
 # UI
 # =========================
 st.set_page_config(page_title="FX EV Auto v4 Integrated", layout="centered", initial_sidebar_state="collapsed")
-st.title("FX 自動AI判断ツール")
+st.title("FX 自動AI判断ツール（EV最大化） v4 Integrated")
 
 with st.sidebar:
     st.header("運用操作（見る順）")
@@ -1889,67 +1951,6 @@ def _profit_max_reco(plan: dict) -> dict:
 
 
 
-def _try_post_json(url: str, payload: dict, timeout_s: int = 6):
-    """POST JSON and return (ok: bool, status_code: int|None, response_text: str, error: str)."""
-    try:
-        r = requests.post(url, json=payload, timeout=timeout_s)
-        return (200 <= getattr(r, "status_code", 0) < 300), getattr(r, "status_code", None), (r.text or ""), ""
-    except Exception as e:
-        return False, None, "", str(e)
-
-def _post_json_webhook(payload: dict):
-    """Optional external sink: POST JSON to LOG_WEBHOOK_URL if provided in Streamlit Secrets.
-    Returns (ok, status_code, response_text, error). Never raises."""
-    try:
-        url = st.secrets.get("LOG_WEBHOOK_URL", "")
-        if not url:
-            return False, None, "", "LOG_WEBHOOK_URL not set"
-        return _try_post_json(url, payload, timeout_s=6)
-    except Exception as e:
-        return False, None, "", str(e)
-
-def _supabase_insert(table: str, row: dict):
-    """Optional Supabase sink (REST): requires SUPABASE_URL and SUPABASE_ANON_KEY in secrets.
-    Returns (ok, status_code, response_text, error). Never raises."""
-    try:
-        sb_url = st.secrets.get("SUPABASE_URL", "")
-        sb_key = st.secrets.get("SUPABASE_ANON_KEY", "")
-        if not sb_url or not sb_key or not table:
-            return False, None, "", "Supabase secrets/table not set"
-        endpoint = sb_url.rstrip("/") + f"/rest/v1/{table}"
-        headers = {
-            "apikey": sb_key,
-            "Authorization": f"Bearer {sb_key}",
-            "Content-Type": "application/json",
-            "Prefer": "return=minimal",
-        }
-        r = requests.post(endpoint, headers=headers, json=[row], timeout=6)
-        ok = 200 <= getattr(r, "status_code", 0) < 300
-        return ok, getattr(r, "status_code", None), (r.text or ""), ""
-    except Exception as e:
-        return False, None, "", str(e)
-
-def _external_log_event(kind: str, row: dict):
-    """Send an event to external sinks (webhook and/or Supabase) if configured.
-    Returns a dict with per-sink results."""
-    payload = {"kind": kind, **row}
-    results = {"webhook": None, "supabase": None}
-
-    ok, sc, txt, err = _post_json_webhook(payload)
-    results["webhook"] = {"ok": ok, "status_code": sc, "response": (txt[:500] if txt else ""), "error": err}
-
-    try:
-        table = st.secrets.get("SUPABASE_LOG_TABLE", "")
-    except Exception:
-        table = ""
-    if table:
-        ok2, sc2, txt2, err2 = _supabase_insert(table, payload)
-        results["supabase"] = {"ok": ok2, "status_code": sc2, "response": (txt2[:500] if txt2 else ""), "error": err2}
-
-    return results
-
-
-
 # --- Webhook Diagnostics (fixed27) ---
 with st.expander("🔧 Webhook診断（送信テスト/失敗理由の表示）", expanded=False):
     url = ""
@@ -2001,4 +2002,3 @@ with st.expander("🔧 Webhook診断（送信テスト/失敗理由の表示）"
         st.caption("直近の送信結果（デバッグ）")
         st.json(st.session_state["last_webhook_result"])
 # --- /Webhook Diagnostics ---
-
