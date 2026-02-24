@@ -4,6 +4,9 @@ from __future__ import annotations
 import os
 import time
 import csv
+import uuid
+import math
+import json
 from datetime import datetime, timezone
 from typing import Dict, Any, Tuple, Optional, List
 
@@ -122,6 +125,258 @@ def _ev_audit_summary(rows: List[Dict[str, Any]], days: int = 14) -> Dict[str, A
     trade = sum(1 for r in recent if str(r.get("decision_adj","")) == "TRADE")
     killed = sum(1 for r in recent if str(r.get("killed_by_adj","")).lower() in ("true","1","yes"))
     return {"days": days, "total": total, "trade": trade, "no_trade": total-trade, "killed_by_adj": killed}
+
+
+# =========================
+# Signal / Trade logs (for real operations)
+# =========================
+SIGNAL_LOG_PATH = "logs/signals.csv"
+TRADE_LOG_PATH = "logs/trades.csv"
+
+def _now_utc_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def _safe_makedirs_for(path: str) -> None:
+    try:
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+
+def _append_csv_row(path: str, fieldnames: List[str], row: Dict[str, Any]) -> bool:
+    """Append row to CSV with header creation. Returns True on success. Never raises."""
+    try:
+        _safe_makedirs_for(path)
+        file_exists = os.path.exists(path)
+        # If file exists but header differs, write to a versioned file instead (avoid corrupting).
+        if file_exists:
+            try:
+                with open(path, "r", encoding="utf-8", newline="") as f:
+                    first = f.readline().strip()
+                if first and (first.split(",") != fieldnames):
+                    base, ext = os.path.splitext(path)
+                    path = f"{base}_v2{ext}"
+                    file_exists = os.path.exists(path)
+            except Exception:
+                pass
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            if not file_exists:
+                w.writeheader()
+            w.writerow({k: row.get(k, "") for k in fieldnames})
+        return True
+    except Exception:
+        return False
+
+def _load_csv_df(path: str) -> pd.DataFrame:
+    try:
+        if not os.path.exists(path):
+            return pd.DataFrame()
+        return pd.read_csv(path)
+    except Exception:
+        return pd.DataFrame()
+
+def _make_signal_id(pair_symbol: str) -> str:
+    ps = re.sub(r"[^A-Z0-9_\-]", "", (pair_symbol or "").upper())
+    return f"{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}_{ps}_{uuid.uuid4().hex[:6]}"
+
+def _norm_side(x: Any) -> str:
+    s = str(x or "").upper().strip()
+    if s in ("LONG", "BUY"):
+        return "LONG"
+    if s in ("SHORT", "SELL"):
+        return "SHORT"
+    return s or "—"
+
+def _float_or_none(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        v = float(x)
+        if math.isfinite(v):
+            return v
+        return None
+    except Exception:
+        return None
+
+def _calc_r_multiple(side: str, entry: float, exit_price: float, stop: float) -> Optional[float]:
+    """R-multiple based on stop distance. Returns None if cannot compute."""
+    try:
+        side = _norm_side(side)
+        risk = abs(entry - stop)
+        if risk <= 0:
+            return None
+        if side == "LONG":
+            return (exit_price - entry) / risk
+        if side == "SHORT":
+            return (entry - exit_price) / risk
+        return None
+    except Exception:
+        return None
+
+def _build_signal_row(pair_label: str, ctx: Dict[str, Any], feats: Dict[str, Any], plan: Dict[str, Any],
+                      price_meta: Dict[str, Any], ext_meta: Dict[str, Any]) -> Dict[str, Any]:
+    sym = str(ctx.get("pair_symbol") or _pair_label_to_symbol(pair_label))
+    sid = _make_signal_id(sym)
+    return {
+        "ts_utc": _now_utc_iso(),
+        "signal_id": sid,
+        "pair": str(pair_label),
+        "symbol": sym,
+        "timeframe_mode": str(st.session_state.get("timeframe_mode", "")),
+        "style_name": str(ctx.get("style_name", "")),
+        "priority_mode": str(st.session_state.get("priority_mode", "")),
+        "decision": str(plan.get("decision", "")),
+        "gate_mode": str(plan.get("gate_mode", "")),
+        "ev_raw": _float_or_none(plan.get("expected_R_ev_raw", plan.get("expected_R_ev"))),
+        "ev_adj": _float_or_none(plan.get("expected_R_ev_adj", plan.get("expected_R_ev"))),
+        "ev_used": _float_or_none(plan.get("expected_R_ev")),
+        "dynamic_threshold": _float_or_none(plan.get("dynamic_threshold")),
+        "confidence": _float_or_none(plan.get("confidence")),
+        "p_win": _float_or_none(plan.get("p_win_ev")),
+        "dominant_state": _dominant_state(plan.get("state_probs", {})),
+        "direction": _norm_side(plan.get("direction", "")),
+        "entry_hint": _float_or_none(plan.get("entry_price")),
+        "sl_hint": _float_or_none(plan.get("stop_loss")),
+        "tp_hint": _float_or_none(plan.get("take_profit")),
+        "trail_sl_hint": _float_or_none(plan.get("trail_sl")),
+        "tp_extend_factor": _float_or_none(plan.get("extend_factor")),
+        "global_risk_index": _float_or_none(feats.get("global_risk_index")),
+        "war_probability": _float_or_none(feats.get("war_probability")),
+        "financial_stress": _float_or_none(feats.get("financial_stress")),
+        "macro_risk_score": _float_or_none(feats.get("macro_risk_score")),
+        "price_close": _float_or_none(ctx.get("price")),
+        "price_meta": (json.dumps(price_meta, ensure_ascii=False)[:2000] if isinstance(price_meta, dict) else ""),
+        "external_meta": (json.dumps(ext_meta, ensure_ascii=False)[:2000] if isinstance(ext_meta, dict) else ""),
+        "why": str(plan.get("why", ""))[:500],
+        "veto_reasons": (json.dumps(plan.get("veto_reasons", []), ensure_ascii=False)[:500] if plan.get("veto_reasons") else ""),
+    }
+
+def _append_signal(row: Dict[str, Any]) -> bool:
+    fieldnames = [
+        "ts_utc","signal_id","pair","symbol","timeframe_mode","style_name","priority_mode",
+        "decision","gate_mode","ev_raw","ev_adj","ev_used","dynamic_threshold","confidence","p_win","dominant_state",
+        "direction","entry_hint","sl_hint","tp_hint","trail_sl_hint","tp_extend_factor",
+        "global_risk_index","war_probability","financial_stress","macro_risk_score","price_close",
+        "why","veto_reasons","price_meta","external_meta",
+    ]
+    return _append_csv_row(SIGNAL_LOG_PATH, fieldnames, row)
+
+def _append_trade(row: Dict[str, Any]) -> bool:
+    fieldnames = [
+        "ts_record_utc","trade_id","signal_id","pair","symbol","side","ts_open_utc","ts_close_utc",
+        "entry","exit","stop","take_profit","r_multiple","comment",
+    ]
+    return _append_csv_row(TRADE_LOG_PATH, fieldnames, row)
+
+def _compute_trade_metrics(df_trades: pd.DataFrame) -> Dict[str, Any]:
+    if df_trades is None or df_trades.empty:
+        return {"n": 0}
+    d = df_trades.copy()
+    # numeric coercions
+    for c in ["entry","exit","stop","take_profit","r_multiple"]:
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+    if "r_multiple" not in d.columns:
+        return {"n": int(len(d))}
+    r = d["r_multiple"].dropna()
+    if r.empty:
+        return {"n": int(len(d))}
+    wins = r[r > 0]
+    losses = r[r <= 0]
+    pf = (wins.sum() / abs(losses.sum())) if (not losses.empty and abs(losses.sum()) > 1e-9) else (float("inf") if wins.sum() > 0 else None)
+    cum = r.cumsum()
+    dd = (cum - cum.cummax()).min() if len(cum) else 0.0
+    return {
+        "n": int(len(r)),
+        "expectancy_R": float(r.mean()),
+        "median_R": float(r.median()),
+        "win_rate": float((r > 0).mean()),
+        "profit_factor": (float(pf) if pf is not None and math.isfinite(pf) else pf),
+        "max_drawdown_R": float(dd),
+        "sum_R": float(r.sum()),
+    }
+
+def _render_logging_panel(pair_label: str, plan_ui: Dict[str, Any], ctx: Dict[str, Any], feats: Dict[str, Any],
+                          price_meta: Dict[str, Any], ext_meta: Dict[str, Any]):
+    """UI: save signal + record trade outcome. Keeps everything optional and non-blocking."""
+    st.markdown("### 📝 シグナル/損益ログ（運用用）")
+    with st.expander("📝 保存（signals / trades）+ 外部Sink（Webhook/Supabase）", expanded=False):
+        row = _build_signal_row(pair_label, ctx, feats, plan_ui, price_meta=price_meta, ext_meta=ext_meta)
+        st.caption("運用の第一歩：**『シグナル保存 → 決済後に損益保存 → パフォーマンス自動集計』** の流れを固定します。")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("✅ このシグナルを保存", key=f"save_signal_{row['signal_id']}"):
+                ok_local = _append_signal(row)
+                st.session_state["last_signal_id"] = row["signal_id"]
+                st.session_state["last_signal_row"] = row
+                st.session_state["last_plan"] = plan_ui
+                st.session_state["last_ctx"] = ctx
+                st.session_state["last_feats"] = feats
+                # external sinks (best-effort)
+                ext = _external_log_event("signal", row)
+                if ok_local:
+                    st.success(f"保存OK: signal_id={row['signal_id']}")
+                else:
+                    st.warning("ローカル保存に失敗（外部Sinkの結果を確認してください）")
+                st.json(ext)
+        with c2:
+            st.write("**signal_id**")
+            st.code(row["signal_id"])
+            st.caption("このIDを決済記録に紐づけると分析が強くなります。")
+
+        st.divider()
+        st.subheader("決済後：トレード結果を保存（Rの自動計算）")
+
+        default_sid = str(st.session_state.get("last_signal_id", row["signal_id"]))
+        default_side = _norm_side(plan_ui.get("direction", "LONG"))
+        default_entry = _float_or_none(plan_ui.get("entry_price")) or _float_or_none(ctx.get("price")) or 0.0
+        default_stop = _float_or_none(plan_ui.get("stop_loss")) or 0.0
+        default_tp = _float_or_none(plan_ui.get("take_profit")) or 0.0
+
+        form_key = f"trade_close_{pair_label.replace('/','_')}"
+        with st.form(form_key, clear_on_submit=False):
+            signal_id = st.text_input("signal_id（任意だが推奨）", value=default_sid)
+            side = st.selectbox("方向", ["LONG", "SHORT"], index=0 if default_side == "LONG" else 1)
+            entry = st.number_input("Entry（約定値）", value=float(default_entry), format="%.5f")
+            exit_price = st.number_input("Exit（決済値）", value=float(default_tp or default_entry), format="%.5f")
+            stop = st.number_input("Stop（実際のSL）", value=float(default_stop or default_entry), format="%.5f")
+            take_profit = st.number_input("TP（実際のTP）", value=float(default_tp or default_entry), format="%.5f")
+            ts_open_utc = st.text_input("Open時刻（UTC, ISO）", value=_now_utc_iso())
+            ts_close_utc = st.text_input("Close時刻（UTC, ISO）", value=_now_utc_iso())
+            comment = st.text_input("メモ（任意）", value="")
+            submitted = st.form_submit_button("💾 決済結果を保存")
+
+        if submitted:
+            r_mult = _calc_r_multiple(side, float(entry), float(exit_price), float(stop))
+            trade_row = {
+                "ts_record_utc": _now_utc_iso(),
+                "trade_id": uuid.uuid4().hex[:12],
+                "signal_id": str(signal_id),
+                "pair": str(pair_label),
+                "symbol": str(ctx.get("pair_symbol") or _pair_label_to_symbol(pair_label)),
+                "side": _norm_side(side),
+                "ts_open_utc": str(ts_open_utc),
+                "ts_close_utc": str(ts_close_utc),
+                "entry": float(entry),
+                "exit": float(exit_price),
+                "stop": float(stop),
+                "take_profit": float(take_profit),
+                "r_multiple": (float(r_mult) if r_mult is not None else ""),
+                "comment": str(comment)[:500],
+            }
+            ok_local = _append_trade(trade_row)
+            ext = _external_log_event("trade_close", trade_row)
+            if ok_local:
+                st.success(f"保存OK: trade_id={trade_row['trade_id']} / R={r_mult if r_mult is not None else '—'}")
+            else:
+                st.warning("ローカル保存に失敗（外部Sinkの結果を確認してください）")
+            st.json(ext)
+
+        st.divider()
+        st.caption("ローカル保存先: logs/signals.csv / logs/trades.csv（Streamlit Cloudではデプロイで消える場合があるため、外部Sinkを併用推奨）")
 
 # =========================
 # Operator-friendly labels
@@ -977,7 +1232,7 @@ def _render_risk_dashboard(plan: Dict[str, Any], feats: Dict[str, float], ext_me
 # UI
 # =========================
 st.set_page_config(page_title="FX EV Auto v4 Integrated", layout="centered", initial_sidebar_state="collapsed")
-st.title("FX 自動AI判断ツール")
+st.title("FX 自動AI判断ツール（EV最大化） v4 Integrated")
 
 with st.sidebar:
     st.header("運用操作（見る順）")
@@ -1088,7 +1343,7 @@ governor_cfg = {
     "losing_streak": int(locals().get("losing_streak", 0)),
 }
 
-tabs = st.tabs(["🟢 AUTO判断", "🧪 バックテスト（WFA）", "📘 使い方"])
+tabs = st.tabs(["🟢 AUTO判断", "🧪 バックテスト（WFA）", "📊 パフォーマンス", "📘 使い方"])
 
 # =========================
 # Tab 1: AUTO
@@ -1260,6 +1515,7 @@ with tabs[0]:
                 "confidence": conf,
                 "dom_state": dom,
                 "_plan": plan,
+                "_plan_ui": plan_ui,
                 "_ctx": ctx,
                 "_feats": feats,
                 "_price_meta": price_meta,
@@ -1275,14 +1531,18 @@ with tabs[0]:
 
         best = ranked[0]
         plan = best["_plan"]
+        plan_ui_best = best.get("_plan_ui", plan)
         feats = best["_feats"]
         price = float(best["_ctx"].get("price", 0.0))
 
         # Top panel must show entry format + price (user request)
-        _render_top_trade_panel(best["pair"], plan_ui, price)
+        _render_top_trade_panel(best["pair"], plan_ui_best, price)
 
         # Risk dashboard (new)
-        _render_risk_dashboard(plan_ui, feats, ext_meta=best.get("_ext_meta", {}))
+        _render_risk_dashboard(plan_ui_best, feats, ext_meta=best.get("_ext_meta", {}))
+
+        # Logging (optional)
+        _render_logging_panel(best["pair"], plan_ui_best, best.get("_ctx", {}), feats, best.get("_price_meta", {}), best.get("_ext_meta", {}))
 
         st.markdown("### EVランキング（代替案ペアはここ）")
         view = [{
@@ -1411,6 +1671,8 @@ with tabs[0]:
         _render_top_trade_panel(pair_label, plan_ui, price)
         _render_risk_dashboard(plan_ui, feats, ext_meta=ext_meta)
 
+        _render_logging_panel(pair_label, plan_ui, ctx, feats, price_meta, ext_meta)
+
         st.markdown("### EV内訳（何がEVを潰しているか）")
         ev_contribs = plan.get("ev_contribs", {}) or {}
         if isinstance(ev_contribs, dict) and ev_contribs:
@@ -1468,10 +1730,61 @@ with tabs[1]:
         except Exception as e:
             st.error(f"バックテストでエラー: {type(e).__name__}: {e}")
 
+
+# =========================
+# Tab 3: Performance
+# =========================
+with tabs[2]:
+    st.subheader("パフォーマンス（損益ログから自動集計）")
+    st.caption("signals / trades を保存していれば、ここで期待値・勝率・ドローダウンを自動で見えます。")
+
+    df_s = _load_csv_df(SIGNAL_LOG_PATH)
+    df_t = _load_csv_df(TRADE_LOG_PATH)
+
+    m = _compute_trade_metrics(df_t)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("トレード数", f"{m.get('n',0)}")
+    if m.get("n",0) > 0:
+        c2.metric("期待値（平均R）", f"{m.get('expectancy_R',0.0):+.3f}")
+        c3.metric("勝率", f"{m.get('win_rate',0.0)*100:.1f}%")
+        pf = m.get("profit_factor")
+        c4.metric("PF", ("∞" if pf == float("inf") else (f"{pf:.2f}" if isinstance(pf,(int,float)) else "—")))
+    else:
+        c2.metric("期待値（平均R）", "—")
+        c3.metric("勝率", "—")
+        c4.metric("PF", "—")
+
+    if m.get("n",0) > 0 and "r_multiple" in df_t.columns:
+        d = df_t.copy()
+        d["r_multiple"] = pd.to_numeric(d["r_multiple"], errors="coerce")
+        d = d.dropna(subset=["r_multiple"])
+        d["cum_R"] = d["r_multiple"].cumsum()
+        st.line_chart(d.set_index(pd.RangeIndex(len(d)))["cum_R"])
+        st.caption(f"最大DD（R）: {m.get('max_drawdown_R',0.0):.3f} / 総R: {m.get('sum_R',0.0):+.3f}")
+
+    st.markdown("### 直近のトレード（trades）")
+    st.dataframe(df_t.tail(200), use_container_width=True)
+
+    st.markdown("### 直近のシグナル（signals）")
+    st.dataframe(df_s.tail(200), use_container_width=True)
+
+    # downloads
+    try:
+        if not df_t.empty:
+            st.download_button("trades.csv をダウンロード", data=df_t.to_csv(index=False).encode("utf-8"),
+                               file_name="trades.csv", mime="text/csv")
+        if not df_s.empty:
+            st.download_button("signals.csv をダウンロード", data=df_s.to_csv(index=False).encode("utf-8"),
+                               file_name="signals.csv", mime="text/csv")
+    except Exception:
+        pass
+
+
 # =========================
 # Tab 3: Guide
 # =========================
-with tabs[2]:
+with tabs[3]:
     st.markdown("""
 # 📘 運用者向け・画面の見方（メイン/サイドバー）
 
@@ -1687,4 +2000,3 @@ with st.expander("🔧 Webhook診断（送信テスト/失敗理由の表示）"
         st.caption("直近の送信結果（デバッグ）")
         st.json(st.session_state["last_webhook_result"])
 # --- /Webhook Diagnostics ---
-
