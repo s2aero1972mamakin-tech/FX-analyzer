@@ -44,7 +44,7 @@ def _file_sha12(path: str) -> str:
 # =========================
 # Build / Diagnostics
 # =========================
-DATA_LAYER_BUILD = "fixed15_20260222"
+DATA_LAYER_BUILD = "fixed20_20260223"
 # -------------------------
 # Last-known-good risk cache (process lifetime)
 # - Streamlit Cloud can have intermittent outbound/network/API outages.
