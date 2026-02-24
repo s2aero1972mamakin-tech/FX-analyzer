@@ -49,7 +49,7 @@ PAIR_LIST_DEFAULT = [
 # =========================
 # Build / Diagnostics
 # =========================
-APP_BUILD = "fixed21_20260224"
+APP_BUILD = "fixed24_20260224"
 # ---- EV audit (operator logs) ----
 EV_AUDIT_PATH = "logs/ev_audit.csv"
 
@@ -221,6 +221,19 @@ def _lot_multiplier(global_risk_index: Any, alpha: Any, floor: float = 0.2, ceil
     if x > ceil:
         x = ceil
     return float(x)
+
+def _fmt_price(x: Any, decimals: int = 3) -> str:
+    """Format price for UI: max `decimals` places, trim trailing zeros. Internal calc stays full precision."""
+    if x is None:
+        return "—"
+    try:
+        v = float(x)
+    except Exception:
+        return str(x)
+    s = f"{v:.{decimals}f}"
+    s = s.rstrip("0").rstrip(".")
+    return s
+
 
 def _action_hint(global_risk: float, war: float, fin: float, macro: float, bs_flag: bool, gov_enabled: bool) -> str:
     """
@@ -673,9 +686,9 @@ def _render_top_trade_panel(pair_label: str, plan: Dict[str, Any], current_price
         st.success("✅ エントリー候補（このアプリは発注しません。発注は運用者が実行）")
         st.markdown(f"""
 - **売買**: {side} / **注文**: {order_type} / **種別**: {entry_type}
-- **Entry**: {entry if entry is not None else '—'}
-- **SL**: {sl if sl is not None else '—'}
-- **TP**: {tp if tp is not None else '—'}
+- **Entry**: {_fmt_price(entry)}
+- **SL**: {_fmt_price(sl)}
+- **TP**: {_fmt_price(tp)}
 """)
         st.caption(f"参考：勝率推定 p_win={p_win_ev:.2f}（あくまでモデル推定）。")
     else:
@@ -857,7 +870,8 @@ def _render_risk_dashboard(plan: Dict[str, Any], feats: Dict[str, float], ext_me
             rows = _ev_audit_load()
 
             # --- 自動最適化（min_expected_R 推奨） ---
-            rec = _recommend_min_expected_R_from_audit(rows, target_trade_rate=0.20) if rows else {"ok": False, "n": 0, "recommended": None, "reason": "ログなし"}
+            target_rate = 0.10 if st.session_state.get('priority_mode') == '勝率優先（見送り増）' else 0.20
+            rec = _recommend_min_expected_R_from_audit(rows, target_trade_rate=target_rate) if rows else {"ok": False, "n": 0, "recommended": None, "reason": "ログなし"}
             colA, colB = st.columns([2, 1])
             with colA:
                 if rec.get("ok"):
@@ -971,6 +985,8 @@ with st.sidebar:
     mode = st.selectbox("モード", ["相場全体から最適ペアを自動抽出（推奨）", "単一ペア最適化（徹底）"], index=0)
     trade_axis = st.selectbox("時間軸（保有期間）", ["スイング（1週〜1ヶ月）", "中長期（1〜3ヶ月）"], index=0)
     style_name = st.selectbox("運用スタイル（見送りライン）", ["標準", "保守", "攻撃"], index=0)
+    priority = st.selectbox("優先度", ["バランス（推奨）", "勝率優先（見送り増）"], index=0)
+    st.session_state['priority_mode'] = priority
 
     # 時間軸プリセット（詳細設定で上書き可）
     # ※「ポジショントレード」はUI名ではなく“保有期間”の呼び方です。1ヶ月寄りなら「中長期」や interval=1wk を推奨。
@@ -1103,7 +1119,24 @@ with tabs[0]:
             plan = logic.get_ai_order_strategy(api_key=keys.get("OPENAI_API_KEY",""), context_data=ctx)
 
 
-            # ---- EV audit row (for 2-week verification) ----
+            
+            # --- Win-rate focus soft gate (display/decision layer) ---
+            # Does not change internal calculations; only tightens final permission when user selects 勝率優先.
+            try:
+                if str(st.session_state.get('priority_mode','')) == '勝率優先（見送り増）':
+                    p_win_min = 0.56   # tighten
+                    conf_min = 0.60
+                    p_win = float(plan.get("p_win_ev", 0.0) or 0.0)
+                    conf = float(plan.get("confidence", 0.0) or 0.0)
+                    if str(plan.get("decision","")) == "TRADE" and (p_win < p_win_min or conf < conf_min):
+                        plan["decision"] = "NO_TRADE"
+                        reasons = list(plan.get("veto_reasons", []) or [])
+                        reasons.append(f"勝率優先フィルタ: p_win={p_win:.2f} / conf={conf:.2f}")
+                        plan["veto_reasons"] = reasons
+                        plan["why"] = reasons[-1]
+            except Exception:
+                pass
+# ---- EV audit row (for 2-week verification) ----
             try:
                 overlay = plan.get("overlay_meta", {}) or {}
                 ev_raw = plan.get("expected_R_ev_raw", plan.get("expected_R_ev", 0.0))
