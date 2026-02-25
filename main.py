@@ -969,6 +969,22 @@ if do_wfa or do_quick:
             else:
                 st.error(f"RL学習失敗: {res}")
 st.divider()
+
+# --- ensure variables exist (avoid NameError) ---
+_ctx_for_rl = locals().get("ctx", None)
+if not isinstance(_ctx_for_rl, dict):
+    _ctx_for_rl = {}
+phase = str(locals().get("phase", None) or _ctx_for_rl.get("phase", "UNKNOWN"))
+strength = float(locals().get("strength", None) or _ctx_for_rl.get("trend_strength", 0.0) or 0.0)
+p_up = locals().get("p_up", None)
+p_dn = locals().get("p_dn", None)
+try:
+    if p_up is None:
+        p_up = float(_ctx_for_rl.get("p_up", float("nan")))
+    if p_dn is None:
+        p_dn = float(_ctx_for_rl.get("p_dn", float("nan")))
+except Exception:
+    p_up, p_dn = float("nan"), float("nan")
 ur = st.number_input("現在の含み損益（R）※損切幅=1R", value=0.0, step=0.1, format="%.2f")
 dd_in = st.number_input("含み損の最大（R）※マイナス（任意）", value=0.0, step=0.1, format="%.2f")
 reco = _rl_exit_reco(agent, phase, strength,
