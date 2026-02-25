@@ -2606,6 +2606,12 @@ def _render_risk_dashboard(plan: Dict[str, Any], feats: Dict[str, float], ext_me
 # UI
 # =========================
 st.set_page_config(page_title="FX EV Auto v4 Integrated", layout="centered", initial_sidebar_state="collapsed")
+
+# --- Global defaults to avoid NameError under Streamlit top-down execution ---
+if "pair_label" not in st.session_state:
+    st.session_state["pair_label"] = "USD/JPY"
+pair_label = st.session_state.get("pair_label", "USD/JPY")
+
 st.title("FX 自動AI判断ツール（EV最大化） v4 Integrated")
 
 with st.sidebar:
@@ -2971,6 +2977,7 @@ with tabs[0]:
 
     else:
         pair_label = _normalize_pair_label(st.text_input("通貨ペア（単一最適化）", value="USD/JPY"))
+        st.session_state["pair_label"] = pair_label
         symbol = _pair_label_to_symbol(pair_label)
 
         df, price_meta = fetch_price_history(pair_label, symbol, period=period, interval=interval, prefer_stooq=(str(interval)=="1d"))
