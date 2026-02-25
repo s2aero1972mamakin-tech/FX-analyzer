@@ -951,7 +951,8 @@ if do_wfa or do_quick:
             st.error(f"価格データ取得に失敗: {meta_rl}")
         else:
             ph_s, st_s = _compute_phase_strength_series(df_rl)
-            pu_s, pd_s = _compute_cont_p_series(df_rl, horizon=max(3, int(ctx.get('horizon_days',5))))
+            horizon_days = int(st.session_state.get('horizon_days', 5) or 5)
+            pu_s, pd_s = _compute_cont_p_series(df_rl, horizon=max(3, horizon_days))
             best_params = {"dd_penalty": 0.15, "time_penalty": 0.01, "atr_mult_stop": 1.5}
             if do_wfa:
                 wfa = _wfa_select_rl_coeffs(
