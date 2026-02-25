@@ -921,9 +921,9 @@ with cC:
 
 cT1, cT2 = st.columns([1,1])
 with cT1:
-    do_wfa = st.button("🧠 RLを自動WFA学習（推奨：係数も自動選定）", key=f"train_rl_wfa_{pair_label}")
+    do_wfa = st.button("🧠 RLを自動WFA学習（推奨：係数も自動選定）", key="train_rl_wfa")
 with cT2:
-    do_quick = st.button("🧠 RLを学習（手動係数・高速）", key=f"train_rl_quick_{pair_label}")
+    do_quick = st.button("🧠 RLを学習（手動係数・高速）", key="train_rl_quick")
 
 if do_wfa or do_quick:
     with st.spinner("RL学習中...（初回は少し時間がかかります）"):
