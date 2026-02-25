@@ -12,6 +12,20 @@ from datetime import datetime, timezone
 from typing import Dict, Any, Tuple, Optional, List
 
 import streamlit as st
+
+# --- Streamlit top-down guard: ensure pair_label exists before any UI blocks ---
+try:
+    if 'pair_label' not in st.session_state:
+        st.session_state['pair_label'] = 'USD/JPY'
+except Exception:
+    # session_state may not be ready in some edge cases; ignore
+    pass
+pair_label = None
+try:
+    pair_label = st.session_state.get('pair_label', 'USD/JPY')
+except Exception:
+    pair_label = 'USD/JPY'
+
 import requests
 import pandas as pd
 
@@ -927,6 +941,11 @@ with cT2:
 
 if do_wfa or do_quick:
     with st.spinner("RL学習中...（初回は少し時間がかかります）"):
+        # pair_label may not be defined yet in top-down execution; re-fetch safely
+        try:
+            pair_label = st.session_state.get('pair_label', 'USD/JPY')
+        except Exception:
+            pair_label = 'USD/JPY'
         df_rl, meta_rl = fetch_price_history(pair_label, _pair_label_to_symbol(pair_label), period="10y", interval="1d", prefer_stooq=True)
         if df_rl is None or df_rl.empty:
             st.error(f"価格データ取得に失敗: {meta_rl}")
@@ -2992,7 +3011,17 @@ with tabs[0]:
                 st.json({"price_meta": best.get("_price_meta", {}), "external_meta": best.get("_ext_meta", {})})
 
     else:
-        pair_label = _normalize_pair_label(st.text_input("通貨ペア（単一最適化）", value="USD/JPY"))
+        # 単一ペアはプルダウン（ユーザビリティ改善）
+        common_pairs = [
+            'USD/JPY','AUD/JPY','EUR/USD','EUR/JPY','GBP/JPY','GBP/USD','AUD/USD','USD/CHF','NZD/JPY','CAD/JPY',
+            'USD/CAD','EUR/GBP','EUR/AUD','AUD/NZD','CHF/JPY','NZD/USD','CAD/CHF','EUR/CHF','GBP/CHF','AUD/CHF',
+        ]
+        sel = st.selectbox('通貨ペア（単一最適化）', options=common_pairs + ['（カスタム入力）'], index=0)
+        if sel == '（カスタム入力）':
+            custom = st.text_input('カスタム通貨ペア（例: USD/JPY）', value=st.session_state.get('pair_label','USD/JPY'))
+            pair_label = _normalize_pair_label(custom)
+        else:
+            pair_label = _normalize_pair_label(sel)
         st.session_state["pair_label"] = pair_label
         symbol = _pair_label_to_symbol(pair_label)
 
