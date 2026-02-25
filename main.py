@@ -29,6 +29,316 @@ except Exception:
 import requests
 import pandas as pd
 
+# ===== RL core (WFA + Q-learning) definitions (must appear before any usage) =====
+def _phase_to_id(phase: str) -> int:
+    p = str(phase or "").upper()
+    if p.startswith("UP"):
+        return 1
+    if p.startswith("DOWN"):
+        return 2
+    if p.startswith("BREAK"):
+        return 3
+    if p.startswith("RANGE"):
+        return 4
+    return 0
+
+def _bin(x: float, edges: list[float]) -> int:
+    try:
+        v = float(x)
+    except Exception:
+        return 0
+    for i, e in enumerate(edges):
+        if v < e:
+            return i
+    return len(edges)
+
+class RLExitAgent:
+    """Tabular Q-learning exit agent (real RL).
+
+    - States are discretized tuples derived from (phase, trend_strength, edge, unrealized_R, drawdown_R).
+    - Actions: HOLD, TRAIL_TIGHT, EXIT, TAKE_PARTIAL (partial treated as EXIT with bonus factor in reward proxy).
+    - Learns from historical price paths using a lightweight simulated environment.
+    """
+
+    ACTIONS = ["HOLD", "TRAIL_TIGHT", "TAKE_PARTIAL", "EXIT"]
+
+    def __init__(self):
+        self.q: dict[str, list[float]] = {}  # state_key -> q-values per action index
+        # bins (tunable)
+        self.r_edges = [-0.5, -0.2, 0.0, 0.2, 0.5, 0.8, 1.2, 1.8, 2.5]
+        self.dd_edges = [-2.5, -1.8, -1.2, -0.8, -0.5, -0.2, 0.0]
+        self.str_edges = [0.15, 0.3, 0.5, 0.7]
+        self.edge_edges = [-0.2, -0.1, -0.03, 0.03, 0.1, 0.2]
+
+    def _state_key(self, phase: str, trend_strength: float, edge: float, unreal_R: float, dd_R: float) -> str:
+        pid = _phase_to_id(phase)
+        sb = _bin(trend_strength, self.str_edges)
+        eb = _bin(edge, self.edge_edges)
+        rb = _bin(unreal_R, self.r_edges)
+        db = _bin(dd_R, self.dd_edges)
+        return f"{pid}|{sb}|{eb}|{rb}|{db}"
+
+    def _get_q(self, key: str) -> list[float]:
+        if key not in self.q:
+            self.q[key] = [0.0 for _ in self.ACTIONS]
+        return self.q[key]
+
+    def act(self, phase: str, trend_strength: float, p_up: float, p_dn: float, unrealized_R: float, dd_R: float = 0.0) -> dict:
+        p_up = 0.5 if (p_up != p_up) else float(p_up)
+        p_dn = 0.5 if (p_dn != p_dn) else float(p_dn)
+        edge = float(p_up - p_dn)
+        key = self._state_key(phase, trend_strength, edge, float(unrealized_R), float(dd_R))
+        qv = self._get_q(key)
+        best_i = int(max(range(len(qv)), key=lambda i: qv[i]))
+        return {"action": self.ACTIONS[best_i], "q": {a: qv[i] for i, a in enumerate(self.ACTIONS)}, "edge": edge, "state": key}
+
+    def to_json(self) -> dict:
+        return {"q": self.q}
+
+    @classmethod
+    def from_json(cls, obj: dict) -> "RLExitAgent":
+        ag = cls()
+        q = obj.get("q", {}) if isinstance(obj, dict) else {}
+        if isinstance(q, dict):
+            # ensure lists
+            ag.q = {k: list(v) for k, v in q.items() if isinstance(v, (list, tuple)) and len(v) == len(ag.ACTIONS)}
+        return ag
+
+    def train_from_price(self,
+                         df: pd.DataFrame,
+                         phase_series: pd.Series,
+                         trend_strength_series: pd.Series,
+                         p_up_series: pd.Series,
+                         p_dn_series: pd.Series,
+                         episodes: int = 3000,
+                         max_horizon: int = 20,
+                         atr_mult_stop: float = 1.5,
+                         gamma: float = 0.97,
+                         alpha: float = 0.12,
+                         eps: float = 0.15,
+                         dd_penalty: float = 0.15,
+                         time_penalty: float = 0.01,
+                         seed: int = 7) -> dict:
+        """Real Q-learning training on a simple simulated trade-exit environment."""
+        if df is None or df.empty:
+            return {"ok": False, "error": "empty_df"}
+        d = df.copy()
+        d = _coerce_ohlc(d)
+        if d.empty or len(d) < 200:
+            return {"ok": False, "error": "not_enough_bars"}
+
+        c = d["Close"].astype(float)
+        atr = _atr(d, 14).astype(float).fillna(method="bfill").fillna(method="ffill")
+        n = len(d)
+        rng = np.random.default_rng(seed)
+
+        # align aux series
+        ph = phase_series.reindex(d.index).fillna("UNKNOWN").astype(str)
+        ts = trend_strength_series.reindex(d.index).fillna(0.0).astype(float)
+        pu = p_up_series.reindex(d.index).fillna(0.5).astype(float)
+        pdn = p_dn_series.reindex(d.index).fillna(0.5).astype(float)
+
+        # choose random entry points away from the end
+        valid_start = np.arange(50, n - (max_horizon + 2))
+        if len(valid_start) <= 0:
+            return {"ok": False, "error": "no_valid_start"}
+
+        total_steps = 0
+        for ep in range(int(episodes)):
+            t0 = int(rng.choice(valid_start))
+            entry = float(c.iloc[t0])
+            stop = entry - float(atr.iloc[t0]) * float(atr_mult_stop)  # long-only exit training proxy
+            risk = abs(entry - stop)
+            if risk <= 1e-9:
+                continue
+
+            # simulate forward
+            dd_R = 0.0
+            unreal_R = 0.0
+            done = False
+            t = t0
+            # initial state
+            edge0 = float(pu.iloc[t] - pdn.iloc[t])
+            s_key = self._state_key(ph.iloc[t], float(ts.iloc[t]), edge0, unreal_R, dd_R)
+
+            for step in range(int(max_horizon)):
+                t1 = t + 1
+                price = float(c.iloc[t1])
+                unreal_R = (price - entry) / risk
+                dd_R = min(dd_R, unreal_R)  # adverse excursion in R (for long proxy)
+
+                # epsilon-greedy
+                qv = self._get_q(s_key)
+                if rng.random() < eps:
+                    a_i = int(rng.integers(0, len(self.ACTIONS)))
+                else:
+                    a_i = int(max(range(len(qv)), key=lambda i: qv[i]))
+                action = self.ACTIONS[a_i]
+
+                # environment transition + reward
+                reward = 0.0
+                # trail tight: move stop up (reduce risk), but increases stopout probability (proxied)
+                if action == "TRAIL_TIGHT":
+                    # tighten by 25% of current risk, but cap to entry (no negative risk)
+                    new_stop = stop + 0.25 * (price - stop)
+                    new_stop = min(new_stop, entry - 1e-9)
+                    if new_stop < stop:
+                        stop = new_stop
+                        risk = abs(entry - stop)
+                        if risk <= 1e-9:
+                            risk = abs(entry - (entry - 1e-6))
+                            stop = entry - 1e-6
+                # exit / take partial ends episode
+                if action in ("EXIT", "TAKE_PARTIAL"):
+                    realized_R = unreal_R
+                    if action == "TAKE_PARTIAL":
+                        realized_R = realized_R * 0.75  # partial capture proxy (safer, less reward)
+                    reward = realized_R - dd_penalty * abs(min(0.0, dd_R)) - time_penalty * step
+                    done = True
+
+                # stopout
+                if not done and float(d["Low"].iloc[t1]) <= stop:
+                    realized_R = (stop - entry) / risk if risk > 1e-9 else -1.0
+                    reward = realized_R - dd_penalty * abs(min(0.0, dd_R)) - time_penalty * step
+                    done = True
+
+                # next state
+                edge1 = float(pu.iloc[t1] - pdn.iloc[t1])
+                s_next = self._state_key(ph.iloc[t1], float(ts.iloc[t1]), edge1, unreal_R, dd_R)
+
+                # Q update
+                q_next = self._get_q(s_next)
+                td_target = reward if done else (0.0 + gamma * max(q_next))
+                qv[a_i] = float(qv[a_i] + alpha * (td_target - qv[a_i]))
+
+                total_steps += 1
+                s_key = s_next
+                t = t1
+                if done:
+                    break
+
+        return {"ok": True, "episodes": int(episodes), "steps": int(total_steps), "states": int(len(self.q))}
+
+    def evaluate_policy(self,
+                        df: pd.DataFrame,
+                        phase_series: pd.Series,
+                        trend_strength_series: pd.Series,
+                        p_up_series: pd.Series,
+                        p_dn_series: pd.Series,
+                        episodes: int = 800,
+                        max_horizon: int = 20,
+                        atr_mult_stop: float = 1.5,
+                        dd_penalty: float = 0.15,
+                        time_penalty: float = 0.01,
+                        seed: int = 11) -> dict:
+        """Evaluate current Q-policy (greedy) on the same simulated environment used in training.
+        Returns summary stats in R units.
+        """
+        try:
+            if df is None or df.empty:
+                return {"ok": False, "error": "empty_df"}
+            d = df.copy()
+            if "Close" not in d.columns or "Low" not in d.columns:
+                return {"ok": False, "error": "missing_ohlc"}
+            c = pd.to_numeric(d["Close"], errors="coerce").fillna(method="ffill").fillna(method="bfill")
+            low = pd.to_numeric(d["Low"], errors="coerce").fillna(method="ffill").fillna(method="bfill")
+            atr = _atr(d, 14).fillna(method="ffill").fillna(method="bfill")
+            ph = phase_series.reindex(d.index).fillna("RANGE").astype(str)
+            ts = pd.to_numeric(trend_strength_series.reindex(d.index), errors="coerce").fillna(0.0)
+            pu = pd.to_numeric(p_up_series.reindex(d.index), errors="coerce").fillna(0.5)
+            pdn = pd.to_numeric(p_dn_series.reindex(d.index), errors="coerce").fillna(0.5)
+
+            rng = np.random.default_rng(int(seed))
+            valid_start = np.arange(1, max(2, len(d) - int(max_horizon) - 2))
+            if len(valid_start) < 10:
+                return {"ok": False, "error": "not_enough_bars"}
+            ep_R = []
+            ep_reward = []
+            win = 0
+            for _ in range(int(episodes)):
+                t0 = int(rng.choice(valid_start))
+                entry = float(c.iloc[t0])
+                stop = entry - float(atr.iloc[t0]) * float(atr_mult_stop)
+                risk = abs(entry - stop)
+                if risk <= 1e-9:
+                    continue
+                dd_R = 0.0
+                unreal_R = 0.0
+                t = t0
+                edge0 = float(pu.iloc[t] - pdn.iloc[t])
+                s_key = self._state_key(ph.iloc[t], float(ts.iloc[t]), edge0, unreal_R, dd_R)
+
+                realized_R = 0.0
+                reward = 0.0
+                done = False
+                for step in range(int(max_horizon)):
+                    t1 = t + 1
+                    price = float(c.iloc[t1])
+                    unreal_R = (price - entry) / risk
+                    dd_R = min(dd_R, unreal_R)
+
+                    qv = self._get_q(s_key)
+                    a_i = int(max(range(len(qv)), key=lambda i: qv[i]))
+                    action = self.ACTIONS[a_i]
+
+                    # trail
+                    if action == "TRAIL_TIGHT":
+                        new_stop = stop + 0.25 * (price - stop)
+                        new_stop = min(new_stop, entry - 1e-9)
+                        if new_stop < stop:
+                            stop = new_stop
+                            risk = abs(entry - stop)
+                            if risk <= 1e-9:
+                                risk = abs(entry - (entry - 1e-6))
+                                stop = entry - 1e-6
+
+                    if action in ("EXIT", "TAKE_PARTIAL"):
+                        realized_R = unreal_R
+                        if action == "TAKE_PARTIAL":
+                            realized_R = realized_R * 0.75
+                        reward = realized_R - float(dd_penalty) * abs(min(0.0, dd_R)) - float(time_penalty) * step
+                        done = True
+
+                    if not done and float(low.iloc[t1]) <= stop:
+                        realized_R = (stop - entry) / risk if risk > 1e-9 else -1.0
+                        reward = realized_R - float(dd_penalty) * abs(min(0.0, dd_R)) - float(time_penalty) * step
+                        done = True
+
+                    edge1 = float(pu.iloc[t1] - pdn.iloc[t1])
+                    s_next = self._state_key(ph.iloc[t1], float(ts.iloc[t1]), edge1, unreal_R, dd_R)
+
+                    s_key = s_next
+                    t = t1
+                    if done:
+                        break
+
+                ep_R.append(float(realized_R))
+                ep_reward.append(float(reward))
+                if realized_R > 0:
+                    win += 1
+
+            if not ep_R:
+                return {"ok": False, "error": "no_episodes"}
+            arrR = np.array(ep_R, dtype=float)
+            arrRew = np.array(ep_reward, dtype=float)
+            return {
+                "ok": True,
+                "episodes": int(len(arrR)),
+                "avg_R": float(arrR.mean()),
+                "win_rate": float((arrR > 0).mean()),
+                "pf": float(arrR[arrR > 0].sum() / (abs(arrR[arrR < 0].sum()) + 1e-9)),
+                "avg_reward": float(arrRew.mean()),
+                "p05_R": float(np.quantile(arrR, 0.05)),
+                "p95_R": float(np.quantile(arrR, 0.95)),
+            }
+        except Exception as e:
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+
+# ===== end RL core defs =====
+
+
 # ---- optional deps ----
 try:
     import yfinance as yf
@@ -1509,311 +1819,6 @@ def _similar_pattern_search(df: pd.DataFrame, window: int = 30, horizon: int = 5
     for sim, i, end_dt, fwdR in candidates[:topk]:
         rows.append({"similarity": sim, "pattern_end": str(end_dt), "fwd_R_atr": fwdR})
     return pd.DataFrame(rows)
-
-def _phase_to_id(phase: str) -> int:
-    p = str(phase or "").upper()
-    if p.startswith("UP"):
-        return 1
-    if p.startswith("DOWN"):
-        return 2
-    if p.startswith("BREAK"):
-        return 3
-    if p.startswith("RANGE"):
-        return 4
-    return 0
-
-def _bin(x: float, edges: list[float]) -> int:
-    try:
-        v = float(x)
-    except Exception:
-        return 0
-    for i, e in enumerate(edges):
-        if v < e:
-            return i
-    return len(edges)
-
-class RLExitAgent:
-    """Tabular Q-learning exit agent (real RL).
-
-    - States are discretized tuples derived from (phase, trend_strength, edge, unrealized_R, drawdown_R).
-    - Actions: HOLD, TRAIL_TIGHT, EXIT, TAKE_PARTIAL (partial treated as EXIT with bonus factor in reward proxy).
-    - Learns from historical price paths using a lightweight simulated environment.
-    """
-
-    ACTIONS = ["HOLD", "TRAIL_TIGHT", "TAKE_PARTIAL", "EXIT"]
-
-    def __init__(self):
-        self.q: dict[str, list[float]] = {}  # state_key -> q-values per action index
-        # bins (tunable)
-        self.r_edges = [-0.5, -0.2, 0.0, 0.2, 0.5, 0.8, 1.2, 1.8, 2.5]
-        self.dd_edges = [-2.5, -1.8, -1.2, -0.8, -0.5, -0.2, 0.0]
-        self.str_edges = [0.15, 0.3, 0.5, 0.7]
-        self.edge_edges = [-0.2, -0.1, -0.03, 0.03, 0.1, 0.2]
-
-    def _state_key(self, phase: str, trend_strength: float, edge: float, unreal_R: float, dd_R: float) -> str:
-        pid = _phase_to_id(phase)
-        sb = _bin(trend_strength, self.str_edges)
-        eb = _bin(edge, self.edge_edges)
-        rb = _bin(unreal_R, self.r_edges)
-        db = _bin(dd_R, self.dd_edges)
-        return f"{pid}|{sb}|{eb}|{rb}|{db}"
-
-    def _get_q(self, key: str) -> list[float]:
-        if key not in self.q:
-            self.q[key] = [0.0 for _ in self.ACTIONS]
-        return self.q[key]
-
-    def act(self, phase: str, trend_strength: float, p_up: float, p_dn: float, unrealized_R: float, dd_R: float = 0.0) -> dict:
-        p_up = 0.5 if (p_up != p_up) else float(p_up)
-        p_dn = 0.5 if (p_dn != p_dn) else float(p_dn)
-        edge = float(p_up - p_dn)
-        key = self._state_key(phase, trend_strength, edge, float(unrealized_R), float(dd_R))
-        qv = self._get_q(key)
-        best_i = int(max(range(len(qv)), key=lambda i: qv[i]))
-        return {"action": self.ACTIONS[best_i], "q": {a: qv[i] for i, a in enumerate(self.ACTIONS)}, "edge": edge, "state": key}
-
-    def to_json(self) -> dict:
-        return {"q": self.q}
-
-    @classmethod
-    def from_json(cls, obj: dict) -> "RLExitAgent":
-        ag = cls()
-        q = obj.get("q", {}) if isinstance(obj, dict) else {}
-        if isinstance(q, dict):
-            # ensure lists
-            ag.q = {k: list(v) for k, v in q.items() if isinstance(v, (list, tuple)) and len(v) == len(ag.ACTIONS)}
-        return ag
-
-    def train_from_price(self,
-                         df: pd.DataFrame,
-                         phase_series: pd.Series,
-                         trend_strength_series: pd.Series,
-                         p_up_series: pd.Series,
-                         p_dn_series: pd.Series,
-                         episodes: int = 3000,
-                         max_horizon: int = 20,
-                         atr_mult_stop: float = 1.5,
-                         gamma: float = 0.97,
-                         alpha: float = 0.12,
-                         eps: float = 0.15,
-                         dd_penalty: float = 0.15,
-                         time_penalty: float = 0.01,
-                         seed: int = 7) -> dict:
-        """Real Q-learning training on a simple simulated trade-exit environment."""
-        if df is None or df.empty:
-            return {"ok": False, "error": "empty_df"}
-        d = df.copy()
-        d = _coerce_ohlc(d)
-        if d.empty or len(d) < 200:
-            return {"ok": False, "error": "not_enough_bars"}
-
-        c = d["Close"].astype(float)
-        atr = _atr(d, 14).astype(float).fillna(method="bfill").fillna(method="ffill")
-        n = len(d)
-        rng = np.random.default_rng(seed)
-
-        # align aux series
-        ph = phase_series.reindex(d.index).fillna("UNKNOWN").astype(str)
-        ts = trend_strength_series.reindex(d.index).fillna(0.0).astype(float)
-        pu = p_up_series.reindex(d.index).fillna(0.5).astype(float)
-        pdn = p_dn_series.reindex(d.index).fillna(0.5).astype(float)
-
-        # choose random entry points away from the end
-        valid_start = np.arange(50, n - (max_horizon + 2))
-        if len(valid_start) <= 0:
-            return {"ok": False, "error": "no_valid_start"}
-
-        total_steps = 0
-        for ep in range(int(episodes)):
-            t0 = int(rng.choice(valid_start))
-            entry = float(c.iloc[t0])
-            stop = entry - float(atr.iloc[t0]) * float(atr_mult_stop)  # long-only exit training proxy
-            risk = abs(entry - stop)
-            if risk <= 1e-9:
-                continue
-
-            # simulate forward
-            dd_R = 0.0
-            unreal_R = 0.0
-            done = False
-            t = t0
-            # initial state
-            edge0 = float(pu.iloc[t] - pdn.iloc[t])
-            s_key = self._state_key(ph.iloc[t], float(ts.iloc[t]), edge0, unreal_R, dd_R)
-
-            for step in range(int(max_horizon)):
-                t1 = t + 1
-                price = float(c.iloc[t1])
-                unreal_R = (price - entry) / risk
-                dd_R = min(dd_R, unreal_R)  # adverse excursion in R (for long proxy)
-
-                # epsilon-greedy
-                qv = self._get_q(s_key)
-                if rng.random() < eps:
-                    a_i = int(rng.integers(0, len(self.ACTIONS)))
-                else:
-                    a_i = int(max(range(len(qv)), key=lambda i: qv[i]))
-                action = self.ACTIONS[a_i]
-
-                # environment transition + reward
-                reward = 0.0
-                # trail tight: move stop up (reduce risk), but increases stopout probability (proxied)
-                if action == "TRAIL_TIGHT":
-                    # tighten by 25% of current risk, but cap to entry (no negative risk)
-                    new_stop = stop + 0.25 * (price - stop)
-                    new_stop = min(new_stop, entry - 1e-9)
-                    if new_stop < stop:
-                        stop = new_stop
-                        risk = abs(entry - stop)
-                        if risk <= 1e-9:
-                            risk = abs(entry - (entry - 1e-6))
-                            stop = entry - 1e-6
-                # exit / take partial ends episode
-                if action in ("EXIT", "TAKE_PARTIAL"):
-                    realized_R = unreal_R
-                    if action == "TAKE_PARTIAL":
-                        realized_R = realized_R * 0.75  # partial capture proxy (safer, less reward)
-                    reward = realized_R - dd_penalty * abs(min(0.0, dd_R)) - time_penalty * step
-                    done = True
-
-                # stopout
-                if not done and float(d["Low"].iloc[t1]) <= stop:
-                    realized_R = (stop - entry) / risk if risk > 1e-9 else -1.0
-                    reward = realized_R - dd_penalty * abs(min(0.0, dd_R)) - time_penalty * step
-                    done = True
-
-                # next state
-                edge1 = float(pu.iloc[t1] - pdn.iloc[t1])
-                s_next = self._state_key(ph.iloc[t1], float(ts.iloc[t1]), edge1, unreal_R, dd_R)
-
-                # Q update
-                q_next = self._get_q(s_next)
-                td_target = reward if done else (0.0 + gamma * max(q_next))
-                qv[a_i] = float(qv[a_i] + alpha * (td_target - qv[a_i]))
-
-                total_steps += 1
-                s_key = s_next
-                t = t1
-                if done:
-                    break
-
-        return {"ok": True, "episodes": int(episodes), "steps": int(total_steps), "states": int(len(self.q))}
-
-    def evaluate_policy(self,
-                        df: pd.DataFrame,
-                        phase_series: pd.Series,
-                        trend_strength_series: pd.Series,
-                        p_up_series: pd.Series,
-                        p_dn_series: pd.Series,
-                        episodes: int = 800,
-                        max_horizon: int = 20,
-                        atr_mult_stop: float = 1.5,
-                        dd_penalty: float = 0.15,
-                        time_penalty: float = 0.01,
-                        seed: int = 11) -> dict:
-        """Evaluate current Q-policy (greedy) on the same simulated environment used in training.
-        Returns summary stats in R units.
-        """
-        try:
-            if df is None or df.empty:
-                return {"ok": False, "error": "empty_df"}
-            d = df.copy()
-            if "Close" not in d.columns or "Low" not in d.columns:
-                return {"ok": False, "error": "missing_ohlc"}
-            c = pd.to_numeric(d["Close"], errors="coerce").fillna(method="ffill").fillna(method="bfill")
-            low = pd.to_numeric(d["Low"], errors="coerce").fillna(method="ffill").fillna(method="bfill")
-            atr = _atr(d, 14).fillna(method="ffill").fillna(method="bfill")
-            ph = phase_series.reindex(d.index).fillna("RANGE").astype(str)
-            ts = pd.to_numeric(trend_strength_series.reindex(d.index), errors="coerce").fillna(0.0)
-            pu = pd.to_numeric(p_up_series.reindex(d.index), errors="coerce").fillna(0.5)
-            pdn = pd.to_numeric(p_dn_series.reindex(d.index), errors="coerce").fillna(0.5)
-
-            rng = np.random.default_rng(int(seed))
-            valid_start = np.arange(1, max(2, len(d) - int(max_horizon) - 2))
-            if len(valid_start) < 10:
-                return {"ok": False, "error": "not_enough_bars"}
-            ep_R = []
-            ep_reward = []
-            win = 0
-            for _ in range(int(episodes)):
-                t0 = int(rng.choice(valid_start))
-                entry = float(c.iloc[t0])
-                stop = entry - float(atr.iloc[t0]) * float(atr_mult_stop)
-                risk = abs(entry - stop)
-                if risk <= 1e-9:
-                    continue
-                dd_R = 0.0
-                unreal_R = 0.0
-                t = t0
-                edge0 = float(pu.iloc[t] - pdn.iloc[t])
-                s_key = self._state_key(ph.iloc[t], float(ts.iloc[t]), edge0, unreal_R, dd_R)
-
-                realized_R = 0.0
-                reward = 0.0
-                done = False
-                for step in range(int(max_horizon)):
-                    t1 = t + 1
-                    price = float(c.iloc[t1])
-                    unreal_R = (price - entry) / risk
-                    dd_R = min(dd_R, unreal_R)
-
-                    qv = self._get_q(s_key)
-                    a_i = int(max(range(len(qv)), key=lambda i: qv[i]))
-                    action = self.ACTIONS[a_i]
-
-                    # trail
-                    if action == "TRAIL_TIGHT":
-                        new_stop = stop + 0.25 * (price - stop)
-                        new_stop = min(new_stop, entry - 1e-9)
-                        if new_stop < stop:
-                            stop = new_stop
-                            risk = abs(entry - stop)
-                            if risk <= 1e-9:
-                                risk = abs(entry - (entry - 1e-6))
-                                stop = entry - 1e-6
-
-                    if action in ("EXIT", "TAKE_PARTIAL"):
-                        realized_R = unreal_R
-                        if action == "TAKE_PARTIAL":
-                            realized_R = realized_R * 0.75
-                        reward = realized_R - float(dd_penalty) * abs(min(0.0, dd_R)) - float(time_penalty) * step
-                        done = True
-
-                    if not done and float(low.iloc[t1]) <= stop:
-                        realized_R = (stop - entry) / risk if risk > 1e-9 else -1.0
-                        reward = realized_R - float(dd_penalty) * abs(min(0.0, dd_R)) - float(time_penalty) * step
-                        done = True
-
-                    edge1 = float(pu.iloc[t1] - pdn.iloc[t1])
-                    s_next = self._state_key(ph.iloc[t1], float(ts.iloc[t1]), edge1, unreal_R, dd_R)
-
-                    s_key = s_next
-                    t = t1
-                    if done:
-                        break
-
-                ep_R.append(float(realized_R))
-                ep_reward.append(float(reward))
-                if realized_R > 0:
-                    win += 1
-
-            if not ep_R:
-                return {"ok": False, "error": "no_episodes"}
-            arrR = np.array(ep_R, dtype=float)
-            arrRew = np.array(ep_reward, dtype=float)
-            return {
-                "ok": True,
-                "episodes": int(len(arrR)),
-                "avg_R": float(arrR.mean()),
-                "win_rate": float((arrR > 0).mean()),
-                "pf": float(arrR[arrR > 0].sum() / (abs(arrR[arrR < 0].sum()) + 1e-9)),
-                "avg_reward": float(arrRew.mean()),
-                "p05_R": float(np.quantile(arrR, 0.05)),
-                "p95_R": float(np.quantile(arrR, 0.95)),
-            }
-        except Exception as e:
-            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
-
 
 def _load_rl_agent(path: str) -> Optional[RLExitAgent]:
     try:
