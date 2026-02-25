@@ -1,3 +1,4 @@
+
 # logic.py (v4 integrated, backward-compatible with v3 UI)
 from __future__ import annotations
 
@@ -427,6 +428,28 @@ def get_ai_order_strategy(api_key: str, context_data: Dict[str, Any], **kwargs) 
         # swing-normal mode: keep threshold mostly stable (avoid killing entries)
         dynamic_threshold = base_threshold * (1.0 + 0.20*macro)
         dynamic_threshold = float(_clamp(dynamic_threshold, base_threshold, 0.20))
+    # --- Phase-aware threshold + momentum boost + breakout gate (safe defaults) ---
+    # These features are only active if the caller provides the relevant ctx keys.
+    phase = str(ctx.get("phase_label") or ctx.get("phase") or "").upper().strip()
+    trend_strength = _clamp(_safe_float(ctx.get("trend_strength"), 0.0), 0.0, 1.0)
+    momentum_score = _clamp(_safe_float(ctx.get("momentum_score"), 0.0), -1.0, 1.0)
+    # continuation probabilities (0..1) if available
+    cont_p_up = _clamp(_safe_float(ctx.get("cont_p_up"), 0.0), 0.0, 1.0)
+    cont_p_dn = _clamp(_safe_float(ctx.get("cont_p_dn"), 0.0), 0.0, 1.0)
+    hh_hl_ok = bool(ctx.get("hh_hl_ok", False))
+    breakout_ok = bool(ctx.get("breakout_ok", False))
+
+    # Phase multiplier: in strong trend/breakout phases, relax threshold a bit to reduce "missed big trend".
+    # In choppy/range phases, keep as-is or slightly tighten.
+    phase_mul = 1.0
+    if phase in {"UP_TREND", "DOWN_TREND"}:
+        phase_mul = 1.0 - 0.25 * trend_strength  # up to -25%
+    elif phase in {"BREAKOUT_UP", "BREAKOUT_DOWN", "BREAKOUT"}:
+        phase_mul = 1.0 - 0.35 * max(trend_strength, 0.4)  # up to ~-35%
+    elif phase in {"RANGE", "CHOP"}:
+        phase_mul = 1.0 + 0.10  # +10% tighter in range
+    dynamic_threshold = float(_clamp(dynamic_threshold * phase_mul, 0.02, 0.30))
+
     veto_reasons: List[str] = []
 
     # Governor & Black Swan guard
@@ -441,9 +464,23 @@ def get_ai_order_strategy(api_key: str, context_data: Dict[str, Any], **kwargs) 
     # Build order candidate
     # Build order candidate from RAW market-state (avoid 'risk_off' dominating side selection)
     order = _build_order(ctx, probs0, ev_for_gate)
+    # Momentum boost (capped): add small positive edge when momentum aligns with side hint.
+    side_hint = "BUY" if probs0.get("trend_up", 0.0) >= probs0.get("trend_down", 0.0) else "SELL"
+    mom_boost = 0.0
+    if side_hint == "BUY" and momentum_score > 0:
+        mom_boost = min(0.06, 0.05 * abs(momentum_score) * (0.5 + 0.5 * trend_strength))
+    elif side_hint == "SELL" and momentum_score < 0:
+        mom_boost = min(0.06, 0.05 * abs(momentum_score) * (0.5 + 0.5 * trend_strength))
+    ev_for_gate = float(ev_for_gate + mom_boost)
+
+    # Breakout gate: if structure breakout signals are strong, allow TRADE candidate even when EV is slightly below threshold.
+    breakout_pass = False
+    if (breakout_ok or hh_hl_ok) and (max(cont_p_up, cont_p_dn) >= 0.62) and (trend_strength >= 0.45) and (macro <= 0.75):
+        breakout_pass = True
+
 
     # EV gate
-    if ev_for_gate < dynamic_threshold:
+    if (ev_for_gate < dynamic_threshold) and (not breakout_pass):
         veto_reasons.append(f"EV不足({'adj' if use_adj_gate else 'raw'}): {ev_for_gate:+.3f} < 動的閾値 {dynamic_threshold:.3f}")
 
     # Final decision
@@ -453,7 +490,7 @@ def get_ai_order_strategy(api_key: str, context_data: Dict[str, Any], **kwargs) 
 
     confidence = float(_clamp(abs(ev_for_gate) / max(dynamic_threshold, 1e-9), 0.0, 1.0))
 
-    why = ' / '.join(veto_reasons) if veto_reasons else f"EV通過: {ev_for_gate:+.3f} ≥ {dynamic_threshold:.3f}"
+    why = ' / '.join(veto_reasons) if veto_reasons else (f"BREAKOUT通過" if breakout_pass and ev_for_gate < dynamic_threshold else f"EV通過: {ev_for_gate:+.3f} ≥ {dynamic_threshold:.3f}")
 
     out: Dict[str, Any] = {
         "decision": decision,
