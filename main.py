@@ -37,6 +37,371 @@ except Exception:
     class YFRateLimitError(Exception):
         pass
 
+
+
+# =========================
+# Early definitions (avoid NameError on Streamlit top-to-bottom execution)
+# =========================
+def _normalize_pair_label(s: str) -> str:
+    s = (s or "").strip().upper().replace(" ", "")
+    s = s.replace("-", "/")
+    if "/" not in s and len(s) == 6:
+        s = s[:3] + "/" + s[3:]
+    return s
+
+
+def _pair_label_to_symbol(pair_label: str) -> str:
+    pl = _normalize_pair_label(pair_label)
+    mp = getattr(logic, "PAIR_MAP", None)
+    if isinstance(mp, dict) and pl in mp:
+        return mp[pl]
+    fallback = {
+        "USD/JPY": "JPY=X",
+        "EUR/USD": "EURUSD=X",
+        "GBP/USD": "GBPUSD=X",
+        "AUD/USD": "AUDUSD=X",
+        "EUR/JPY": "EURJPY=X",
+        "GBP/JPY": "GBPJPY=X",
+        "AUD/JPY": "AUDJPY=X",
+    }
+    return fallback.get(pl, "JPY=X")
+
+
+def _pair_label_to_stooq_symbol(pair_label: str) -> Optional[str]:
+    pl = _normalize_pair_label(pair_label)
+    mapping = {
+        "USD/JPY": "usdjpy",
+        "EUR/USD": "eurusd",
+        "GBP/USD": "gbpusd",
+        "AUD/USD": "audusd",
+        "EUR/JPY": "eurjpy",
+        "GBP/JPY": "gbpjpy",
+        "AUD/JPY": "audjpy",
+    }
+    return mapping.get(pl)
+
+
+def _coerce_ohlc(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    d = df.copy()
+    if isinstance(d.columns, pd.MultiIndex):
+        d.columns = [c[0] for c in d.columns]
+    need = ["Open", "High", "Low", "Close"]
+    for c in need:
+        if c not in d.columns:
+            return pd.DataFrame()
+    d = d[need].dropna()
+    return d
+
+
+# =========================
+# AI Trend Engine (phase classification, continuation probability, similar pattern search, RL-like exit manager)
+# =========================
+import numpy as np
+
+try:
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.pipeline import Pipeline
+except Exception:
+    LogisticRegression = None
+    StandardScaler = None
+    Pipeline = None
+
+
+def _fetch_from_stooq(pair_label: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    meta: Dict[str, Any] = {"source": "stooq", "ok": False, "error": None, "interval_used": "1d"}
+    sym = _pair_label_to_stooq_symbol(pair_label)
+    if not sym:
+        meta["error"] = "unsupported_pair_for_stooq"
+        return pd.DataFrame(), meta
+    url = f"https://stooq.com/q/d/l/?s={sym}&i=d"
+    try:
+        d = pd.read_csv(url)
+        if "Date" not in d.columns:
+            meta["error"] = "bad_csv"
+            return pd.DataFrame(), meta
+        d["Date"] = pd.to_datetime(d["Date"])
+        d = d.set_index("Date").sort_index()
+        d = _coerce_ohlc(d)
+        if d.empty:
+            meta["error"] = "empty_after_parse"
+            return pd.DataFrame(), meta
+        meta["ok"] = True
+        return d, meta
+    except Exception as e:
+        meta["error"] = f"{type(e).__name__}:{e}"
+        return pd.DataFrame(), meta
+
+@st.cache_data(ttl=60 * 60)  # 1 hour
+
+def fetch_price_history(pair_label: str, symbol: str, period: str, interval: str, prefer_stooq: bool = False) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    Robust price fetch:
+      - prefer stooq for daily (reduces yfinance rate-limit on Streamlit Cloud)
+      - else try yfinance, then fallback to stooq daily
+    """
+    meta: Dict[str, Any] = {"source": "yfinance", "ok": False, "error": None, "fallback": None, "interval_used": interval}
+
+    # Prefer stooq for daily / multi-scan
+    if prefer_stooq or interval == "1d":
+        df_s, m_s = _fetch_from_stooq(pair_label)
+        if not df_s.empty and m_s.get("ok"):
+            meta.update({"source": "stooq", "ok": True, "fallback": None, "interval_used": "1d"})
+            return df_s, meta
+        meta["fallback"] = m_s
+
+    if yf is not None:
+        last_err = None
+        for attempt in range(2):
+            try:
+                df = yf.Ticker(symbol).history(period=period, interval=interval)
+                df = _coerce_ohlc(df)
+                if df.empty:
+                    last_err = "empty_df"
+                    raise RuntimeError("empty_df")
+                meta["ok"] = True
+                return df, meta
+            except YFRateLimitError:
+                last_err = "YFRateLimitError"
+                break
+            except Exception as e:
+                last_err = f"{type(e).__name__}:{e}"
+                time.sleep(0.6 * (attempt + 1))
+        meta["error"] = last_err
+    else:
+        meta["error"] = "yfinance_not_installed"
+
+    # fallback stooq
+    df2, m2 = _fetch_from_stooq(pair_label)
+    meta["fallback"] = m2
+    if not df2.empty and m2.get("ok"):
+        meta["source"] = "stooq"
+        meta["ok"] = True
+        meta["interval_used"] = "1d"
+        return df2, meta
+
+    return pd.DataFrame(), meta
+
+@st.cache_data(ttl=60 * 20)
+
+def _true_range(df: pd.DataFrame) -> pd.Series:
+    high = df["High"]
+    low = df["Low"]
+    close = df["Close"]
+    prev_close = close.shift(1)
+    tr = pd.concat([(high-low).abs(), (high-prev_close).abs(), (low-prev_close).abs()], axis=1).max(axis=1)
+    return tr
+
+
+def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    tr = _true_range(df)
+    return tr.ewm(alpha=1/period, adjust=False).mean()
+
+
+def _adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high = df["High"]
+    low = df["Low"]
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    tr = _true_range(df)
+    atr = tr.ewm(alpha=1/period, adjust=False).mean()
+    plus_di = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=1/period, adjust=False).mean() / atr.replace(0, np.nan)
+    minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=1/period, adjust=False).mean() / atr.replace(0, np.nan)
+    dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)).fillna(0)
+    adx = dx.ewm(alpha=1/period, adjust=False).mean()
+    return adx.fillna(0)
+
+
+def _compute_phase_strength_series(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
+    """Vectorized phase + strength per bar (no ML, deterministic).
+
+    Phase rules (approx):
+      - UP: ema20>ema50 and adx high
+      - DOWN: ema20<ema50 and adx high
+      - RANGE: adx low
+      - TRANSITION: otherwise
+    Strength: normalized ADX (0..1) blended with ema slope.
+    """
+    d = _coerce_ohlc(df.copy())
+    if d.empty:
+        return pd.Series(dtype=str), pd.Series(dtype=float)
+    c = d["Close"].astype(float)
+    ema20 = c.ewm(span=20, adjust=False).mean()
+    ema50 = c.ewm(span=50, adjust=False).mean()
+    adx = _adx(d, 14).astype(float)
+    adx_n = (adx / 40.0).clip(0.0, 1.0).fillna(0.0)
+    slope = (ema20 - ema20.shift(5)) / (d["ATR14"].astype(float).replace(0, np.nan) if "ATR14" in d.columns else (c.rolling(14).std() + 1e-9))
+    slope = slope.fillna(0.0).clip(-2.0, 2.0)
+    slope_n = (slope.abs() / 2.0).clip(0.0, 1.0)
+    strength = (0.65 * adx_n + 0.35 * slope_n).clip(0.0, 1.0)
+
+    phase = pd.Series(index=d.index, dtype=str)
+    is_range = adx.fillna(0.0) < 16.0
+    is_up = (ema20 > ema50) & (~is_range)
+    is_dn = (ema20 < ema50) & (~is_range)
+    phase[is_range] = "RANGE"
+    phase[is_up] = "UP_TREND"
+    phase[is_dn] = "DOWN_TREND"
+    phase[phase.isna()] = "TRANSITION"
+    return phase, strength
+
+
+def _compute_cont_p_series(df: pd.DataFrame, horizon: int = 5) -> Tuple[pd.Series, pd.Series]:
+    """Cheap continuation probability proxy series based on momentum & volatility.
+    This is used only as a feature for RL training; the 'official' continuation model remains separate.
+    """
+    d = _coerce_ohlc(df.copy())
+    if d.empty:
+        return pd.Series(dtype=float), pd.Series(dtype=float)
+    c = d["Close"].astype(float)
+    r = c.pct_change().fillna(0.0)
+    mom = (c - c.shift(horizon)) / (c.rolling(14).std() + 1e-9)
+    mom = mom.fillna(0.0).clip(-3.0, 3.0)
+    # sigmoid to (0..1)
+    p_up = 1.0 / (1.0 + np.exp(-1.2 * mom))
+    p_dn = 1.0 - p_up
+    return pd.Series(p_up, index=d.index), pd.Series(p_dn, index=d.index)
+
+
+def _rl_exit_reco(agent: Optional[RLExitAgent], phase: str, trend_strength: float, p_up: float, p_dn: float, unrealized_R: float, dd_R: float = 0.0) -> Dict[str, Any]:
+    if agent is None:
+        return {"action": "HOLD", "note": "RL model not trained yet", "q": {}, "edge": float(p_up - p_dn), "state": ""}
+    return agent.act(phase, trend_strength, p_up, p_dn, unrealized_R, dd_R)
+
+
+def _load_rl_agent(path: str) -> Optional[RLExitAgent]:
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                obj = json.load(f)
+            return RLExitAgent.from_json(obj)
+    except Exception:
+        return None
+    return None
+
+
+def _save_rl_agent(path: str, agent: RLExitAgent) -> bool:
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(agent.to_json(), f, ensure_ascii=False)
+        return True
+    except Exception:
+        return False
+
+
+
+def _wfa_select_rl_coeffs(df: pd.DataFrame,
+                          phase_series: pd.Series,
+                          trend_strength_series: pd.Series,
+                          p_up_series: pd.Series,
+                          p_dn_series: pd.Series,
+                          grid: Optional[list[dict]] = None,
+                          splits: int = 3,
+                          train_episodes: int = 2200,
+                          eval_episodes: int = 800,
+                          max_horizon: int = 20,
+                          seed: int = 13) -> dict:
+    """Walk-Forward Analysis (WFA) to pick RL reward coefficients.
+    Returns best params and fold stats. Keeps it lightweight for Streamlit Cloud.
+    """
+    try:
+        if df is None or df.empty or len(df) < 600:
+            return {"ok": False, "error": "not_enough_data"}
+        if grid is None:
+            grid = []
+            for dd in [0.05, 0.10, 0.15, 0.25, 0.35]:
+                for tp in [0.0, 0.005, 0.01, 0.02]:
+                    for atrm in [1.2, 1.5, 1.8]:
+                        grid.append({"dd_penalty": dd, "time_penalty": tp, "atr_mult_stop": atrm})
+        # build fold indices (expanding window)
+        n = len(df)
+        fold = max(120, n // (splits + 2))
+        # train ends at: fold*(i+2), test next fold
+        folds = []
+        for i in range(splits):
+            tr_end = fold * (i + 2)
+            te_end = min(n, tr_end + fold)
+            if te_end - tr_end < 60 or tr_end < 200:
+                continue
+            folds.append((0, tr_end, tr_end, te_end))
+        if not folds:
+            # fallback single split 70/30
+            tr_end = int(n * 0.7)
+            folds = [(0, tr_end, tr_end, n)]
+
+        best = None
+        all_rows = []
+        for params in grid:
+            fold_scores = []
+            for (tr0, tr1, te0, te1) in folds:
+                df_tr = df.iloc[tr0:tr1].copy()
+                df_te = df.iloc[te0:te1].copy()
+                ph_tr = phase_series.iloc[tr0:tr1]
+                ts_tr = trend_strength_series.iloc[tr0:tr1]
+                pu_tr = p_up_series.iloc[tr0:tr1]
+                pd_tr = p_dn_series.iloc[tr0:tr1]
+
+                ph_te = phase_series.iloc[te0:te1]
+                ts_te = trend_strength_series.iloc[te0:te1]
+                pu_te = p_up_series.iloc[te0:te1]
+                pd_te = p_dn_series.iloc[te0:te1]
+
+                ag = RLExitAgent()
+                r = ag.train_from_price(
+                    df_tr, ph_tr, ts_tr, pu_tr, pd_tr,
+                    episodes=int(train_episodes),
+                    max_horizon=int(max_horizon),
+                    atr_mult_stop=float(params["atr_mult_stop"]),
+                    dd_penalty=float(params["dd_penalty"]),
+                    time_penalty=float(params["time_penalty"]),
+                    seed=int(seed + 17),
+                )
+                if not r.get("ok"):
+                    continue
+                ev = ag.evaluate_policy(
+                    df_te, ph_te, ts_te, pu_te, pd_te,
+                    episodes=int(eval_episodes),
+                    max_horizon=int(max_horizon),
+                    atr_mult_stop=float(params["atr_mult_stop"]),
+                    dd_penalty=float(params["dd_penalty"]),
+                    time_penalty=float(params["time_penalty"]),
+                    seed=int(seed + 19),
+                )
+                if not ev.get("ok"):
+                    continue
+                fold_scores.append(float(ev["avg_reward"]))
+            if not fold_scores:
+                continue
+            score = float(np.mean(fold_scores))
+            row = {"score": score, **params}
+            all_rows.append(row)
+            if (best is None) or (score > best["score"]):
+                best = row
+
+        if best is None:
+            return {"ok": False, "error": "wfa_failed", "tried": int(len(grid))}
+        df_rank = pd.DataFrame(all_rows).sort_values("score", ascending=False).head(12)
+        return {"ok": True, "best": best, "top": df_rank.to_dict(orient="records"), "folds": folds, "tried": int(len(grid))}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+
+def _dominant_state(state_probs: Dict[str, Any]) -> str:
+    if not isinstance(state_probs, dict) or not state_probs:
+        return "—"
+    try:
+        return max(state_probs.items(), key=lambda kv: float(kv[1]))[0]
+    except Exception:
+        return "—"
+
+
+
 # =========================
 # Utilities
 # =========================
