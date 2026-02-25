@@ -361,6 +361,257 @@ def _compute_trade_metrics(df_trades: pd.DataFrame) -> Dict[str, Any]:
         "sum_R": float(r.sum()),
     }
 
+
+def _apply_trend_assist(plan_ui: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """Add AI engine fields + optional EV bonus for strong trend continuation."""
+    out = dict(plan_ui or {})
+    phase = str(ctx.get("phase","UNKNOWN"))
+    strength = float(ctx.get("trend_strength", 0.0) or 0.0)
+    p_up = float(ctx.get("p_cont_up", float("nan")))
+    p_dn = float(ctx.get("p_cont_dn", float("nan")))
+    out["phase"] = phase
+    out["trend_strength"] = strength
+    out["p_cont_up"] = p_up
+    out["p_cont_dn"] = p_dn
+    # bonus: only when continuation edge is clear
+    edge = 0.0
+    if (p_up == p_up) and (p_dn == p_dn):
+        edge = p_up - p_dn
+    bonus = 0.0
+    if strength >= 0.55 and edge >= 0.12:
+        # up-trend bonus helps avoid missing clean trends; capped for safety
+        bonus = float(min(0.06, 0.06 * strength * min(1.0, edge/0.25)))
+    out["trend_bonus_R"] = bonus
+    # optional: use in display / gate
+    use_assist = bool(st.session_state.get("trend_assist_enable", True))
+    if use_assist:
+        try:
+            base_ev = float(out.get("expected_R_ev") or 0.0)
+            out["expected_R_ev_with_trend"] = base_ev + bonus
+            # If the only reason was 'EV < threshold', allow TRADE when trend bonus bridges the gap (still keeps other vetoes)
+            try:
+                if str(out.get("decision","")) == "NO_TRADE":
+                    thr = float(out.get("dynamic_threshold") or 0.0)
+                    evw = float(out.get("expected_R_ev_with_trend") or 0.0)
+                    veto = list(out.get("veto_reasons") or [])
+                    ev_only = (len(veto)==0) or all(("EV" in str(v) or "期待値" in str(v)) for v in veto)
+                    if ev_only and evw >= thr and strength >= 0.55 and edge >= 0.12:
+                        out["decision"] = "TRADE"
+                        out.setdefault("veto_reasons", [])
+                        out["trend_assist_promoted"] = True
+            except Exception:
+                pass
+
+        except Exception:
+            out["expected_R_ev_with_trend"] = out.get("expected_R_ev")
+    else:
+        out["expected_R_ev_with_trend"] = out.get("expected_R_ev")
+    return out
+
+
+def _estimate_target_zones(df: Optional[pd.DataFrame]) -> Dict[str, Any]:
+    """Estimate upside/downside target zones from recent structure.
+    Not a prediction; provides probabilistic reference zones.
+    """
+    try:
+        if df is None or (hasattr(df, "empty") and df.empty) or len(df) < 80:
+            return {"ok": False}
+        d = df.copy()
+        for col in ["High", "Low", "Close"]:
+            if col not in d.columns:
+                return {"ok": False}
+        c = pd.to_numeric(d["Close"], errors="coerce").fillna(method="ffill").fillna(method="bfill")
+        h = pd.to_numeric(d["High"], errors="coerce").fillna(method="ffill").fillna(method="bfill")
+        l = pd.to_numeric(d["Low"], errors="coerce").fillna(method="ffill").fillna(method="bfill")
+        last = float(c.iloc[-1])
+        atr14 = _atr(d, 14).fillna(method="ffill").fillna(method="bfill")
+        atr = float(atr14.iloc[-1])
+        if not (atr > 0):
+            return {"ok": False}
+        # recent structure: highest high in last 20 bars
+        look = 20
+        recent_high = float(h.iloc[-look:].max())
+        recent_low = float(l.iloc[-look:].min())
+        # find prior swing low within last 80 bars before the recent_high (basic)
+        win = 80
+        idx_high = int(h.iloc[-win:].idxmax()) if hasattr(h.iloc[-win:], "idxmax") else None
+        # idx_high may be label; convert to position
+        try:
+            pos_high = int(np.argmax(h.iloc[-win:].to_numpy())) + (len(h) - win)
+        except Exception:
+            pos_high = len(h) - look
+        pos_low = int(np.argmin(l.iloc[max(0, pos_high-60):pos_high].to_numpy())) + max(0, pos_high-60)
+        swing_low = float(l.iloc[pos_low])
+        swing_high = float(h.iloc[pos_high])
+
+        # fib extensions upward from swing_low->swing_high
+        move = max(1e-9, swing_high - swing_low)
+        fib127 = swing_low + 1.272 * move
+        fib161 = swing_low + 1.618 * move
+
+        # ATR ladder from last
+        up1 = last + 1.0 * atr
+        up2 = last + 2.0 * atr
+        dn1 = last - 1.0 * atr
+        dn2 = last - 2.0 * atr
+
+        return {
+            "ok": True,
+            "last": last,
+            "atr": atr,
+            "recent_high": recent_high,
+            "recent_low": recent_low,
+            "swing_low": swing_low,
+            "swing_high": swing_high,
+            "targets_up": [
+                {"name": "ATR+1", "price": up1},
+                {"name": "ATR+2", "price": up2},
+                {"name": "FIB 1.272", "price": fib127},
+                {"name": "FIB 1.618", "price": fib161},
+            ],
+            "targets_dn": [
+                {"name": "ATR-1", "price": dn1},
+                {"name": "ATR-2", "price": dn2},
+                {"name": "recent_low", "price": recent_low},
+            ],
+        }
+    except Exception:
+        return {"ok": False}
+
+
+def _render_ai_engine_panel(ctx: Dict[str, Any], plan_ui: Dict[str, Any]):
+    st.markdown("### 🤖 AIエンジン（フェーズ分類 / 継続確率 / 類似パターン / 利確管理）")
+    with st.expander("AI診断（トレンド・継続・パターン・利確）", expanded=False):
+        phase = str(ctx.get("phase","UNKNOWN"))
+        strength = float(ctx.get("trend_strength", 0.0) or 0.0)
+        p_up = ctx.get("p_cont_up", float("nan"))
+        p_dn = ctx.get("p_cont_dn", float("nan"))
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("フェーズ", phase)
+        c2.metric("トレンド強度", f"{strength:.2f}")
+        c3.metric("上昇継続確率", ("—" if p_up != p_up else f"{float(p_up)*100:.0f}%"))
+        c4.metric("下落継続確率", ("—" if p_dn != p_dn else f"{float(p_dn)*100:.0f}%"))
+        st.caption("※継続確率は、直近10年（取得できる範囲）のOHLCから簡易学習したロジスティック回帰モデル（統計推定）です。")
+
+        # Target zones (not a prediction)
+        df_ref = ctx.get("_df") or ctx.get("df") or ctx.get("_price_df") or ctx.get("_df_price") or ctx.get("_df_hist")
+        tz = _estimate_target_zones(df_ref if isinstance(df_ref, pd.DataFrame) else None)
+        if tz.get("ok"):
+            st.markdown("#### 参考ターゲットゾーン（天井“予知”ではなく、構造・ATRに基づく目安）")
+            t_up = pd.DataFrame(tz["targets_up"])
+            t_dn = pd.DataFrame(tz["targets_dn"])
+            try:
+                t_up["price"] = pd.to_numeric(t_up["price"], errors="coerce").round(3)
+                t_dn["price"] = pd.to_numeric(t_dn["price"], errors="coerce").round(3)
+            except Exception:
+                pass
+            cc1, cc2, cc3 = st.columns([1,1,2])
+            cc1.metric("現在値", f"{tz['last']:.3f}")
+            cc2.metric("ATR(14)", f"{tz['atr']:.3f}")
+            cc3.metric("直近高値/安値(20本)", f"{tz['recent_high']:.3f} / {tz['recent_low']:.3f}")
+            ctu, ctd = st.columns(2)
+            with ctu:
+                st.write("上方向（候補）")
+                st.dataframe(t_up, use_container_width=True, hide_index=True)
+            with ctd:
+                st.write("下方向（候補）")
+                st.dataframe(t_dn, use_container_width=True, hide_index=True)
+
+        # Similar patterns
+        patt = ctx.get("_similar_patterns_df")
+        if isinstance(patt, pd.DataFrame) and not patt.empty:
+            st.markdown("#### 類似パターン（直近30本と似た局面）")
+            st.dataframe(patt, use_container_width=True)
+            try:
+                avg = float(pd.to_numeric(patt["fwd_R_atr"], errors="coerce").mean())
+                st.caption(f"類似局面の平均（{int(ctx.get('horizon_days',5))}日先）: {avg:+.2f} ATR-R")
+            except Exception:
+                pass
+
+
+# True RL exit agent (Q-learning) — trains from history and persists model
+st.markdown("#### 強化学習（RL）利確管理：学習済みポリシー")
+st.caption("これは **学習するRL** です（Q-learning）。ボタンで学習→モデル保存→以後は学習済みポリシーで提案します。")
+
+rl_dir = "logs"
+os.makedirs(rl_dir, exist_ok=True)
+rl_path = os.path.join(rl_dir, f"rl_exit_{pair_label.replace('/','')}_1d.json")
+
+# load agent (best-effort)
+agent = _load_rl_agent(rl_path)
+
+cA, cB, cC = st.columns([1,1,2])
+with cA:
+    episodes = st.number_input("学習エピソード数（多いほど精度↑/時間↑）", min_value=200, max_value=20000, value=3000, step=200)
+with cB:
+    max_h = st.number_input("最大保有（学習）日数", min_value=5, max_value=60, value=20, step=1)
+with cC:
+    st.write("**モデル状態**")
+    st.code("trained" if (agent is not None and len(getattr(agent,'q',{}))>0) else "not trained", language="text")
+
+
+cT1, cT2 = st.columns([1,1])
+with cT1:
+    do_wfa = st.button("🧠 RLを自動WFA学習（推奨：係数も自動選定）", key=f"train_rl_wfa_{pair_label}")
+with cT2:
+    do_quick = st.button("🧠 RLを学習（手動係数・高速）", key=f"train_rl_quick_{pair_label}")
+
+if do_wfa or do_quick:
+    with st.spinner("RL学習中...（初回は少し時間がかかります）"):
+        df_rl, meta_rl = fetch_price_history(pair_label, _pair_label_to_symbol(pair_label), period="10y", interval="1d", prefer_stooq=True)
+        if df_rl is None or df_rl.empty:
+            st.error(f"価格データ取得に失敗: {meta_rl}")
+        else:
+            ph_s, st_s = _compute_phase_strength_series(df_rl)
+            pu_s, pd_s = _compute_cont_p_series(df_rl, horizon=max(3, int(ctx.get('horizon_days',5))))
+            best_params = {"dd_penalty": 0.15, "time_penalty": 0.01, "atr_mult_stop": 1.5}
+            if do_wfa:
+                wfa = _wfa_select_rl_coeffs(
+                    df_rl, ph_s, st_s, pu_s, pd_s,
+                    splits=3,
+                    train_episodes=max(800, int(episodes * 0.6)),
+                    eval_episodes=800,
+                    max_horizon=int(max_h),
+                )
+                if not wfa.get("ok"):
+                    st.warning(f"WFAが失敗したため、既定係数で学習します: {wfa}")
+                else:
+                    best_params = dict(wfa["best"])
+                    st.success(f"WFA選定係数: dd_penalty={best_params['dd_penalty']}, time_penalty={best_params['time_penalty']}, atr_mult_stop={best_params['atr_mult_stop']}（score={best_params['score']:+.4f}）")
+                    try:
+                        st.dataframe(pd.DataFrame(wfa.get("top", [])), use_container_width=True)
+                    except Exception:
+                        pass
+
+            ag = RLExitAgent()
+            res = ag.train_from_price(
+                df_rl, ph_s, st_s, pu_s, pd_s,
+                episodes=int(episodes),
+                max_horizon=int(max_h),
+                atr_mult_stop=float(best_params.get("atr_mult_stop", 1.5)),
+                dd_penalty=float(best_params.get("dd_penalty", 0.15)),
+                time_penalty=float(best_params.get("time_penalty", 0.01)),
+            )
+            if res.get("ok"):
+                _save_rl_agent(rl_path, ag)
+                st.success(f"RL学習完了: {res}")
+                agent = ag
+                st.session_state[f"_rl_best_params_{pair_label}"] = best_params
+            else:
+                st.error(f"RL学習失敗: {res}")
+st.divider()
+ur = st.number_input("現在の含み損益（R）※損切幅=1R", value=0.0, step=0.1, format="%.2f")
+dd_in = st.number_input("含み損の最大（R）※マイナス（任意）", value=0.0, step=0.1, format="%.2f")
+reco = _rl_exit_reco(agent, phase, strength,
+                     float(p_up) if p_up==p_up else float('nan'),
+                     float(p_dn) if p_dn==p_dn else float('nan'),
+                     float(ur), float(dd_in))
+st.write(f"推奨アクション: **{reco.get('action','HOLD')}**  （edge={reco.get('edge',0.0):+.2f} / state={reco.get('state','')}）")
+if reco.get("note"):
+    st.info(reco.get("note"))
+st.json(reco.get("q", {}))
+
+
 def _render_logging_panel(pair_label: str, plan_ui: Dict[str, Any], ctx: Dict[str, Any], feats: Dict[str, Any],
                           price_meta: Dict[str, Any], ext_meta: Dict[str, Any]):
     """UI: save signal + record trade outcome. Keeps everything optional and non-blocking."""
@@ -655,6 +906,680 @@ def _coerce_ohlc(df: pd.DataFrame) -> pd.DataFrame:
     d = d[need].dropna()
     return d
 
+
+# =========================
+# AI Trend Engine (phase classification, continuation probability, similar pattern search, RL-like exit manager)
+# =========================
+import numpy as np
+
+try:
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.pipeline import Pipeline
+except Exception:
+    LogisticRegression = None
+    StandardScaler = None
+    Pipeline = None
+
+def _ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
+
+def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    delta = close.diff()
+    up = delta.clip(lower=0)
+    down = (-delta).clip(lower=0)
+    ma_up = up.ewm(alpha=1/period, adjust=False).mean()
+    ma_down = down.ewm(alpha=1/period, adjust=False).mean()
+    rs = ma_up / (ma_down.replace(0, np.nan))
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(50)
+
+def _true_range(df: pd.DataFrame) -> pd.Series:
+    high = df["High"]
+    low = df["Low"]
+    close = df["Close"]
+    prev_close = close.shift(1)
+    tr = pd.concat([(high-low).abs(), (high-prev_close).abs(), (low-prev_close).abs()], axis=1).max(axis=1)
+    return tr
+
+def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    tr = _true_range(df)
+    return tr.ewm(alpha=1/period, adjust=False).mean()
+
+def _adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high = df["High"]
+    low = df["Low"]
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    tr = _true_range(df)
+    atr = tr.ewm(alpha=1/period, adjust=False).mean()
+    plus_di = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=1/period, adjust=False).mean() / atr.replace(0, np.nan)
+    minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=1/period, adjust=False).mean() / atr.replace(0, np.nan)
+    dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)).fillna(0)
+    adx = dx.ewm(alpha=1/period, adjust=False).mean()
+    return adx.fillna(0)
+
+def _phase_classify(df: pd.DataFrame) -> Dict[str, Any]:
+    """Return phase label + trend strength (0-1-ish)."""
+    if df is None or df.empty or len(df) < 60:
+        return {"phase": "UNKNOWN", "trend_strength": 0.0, "adx": float("nan")}
+    d = df.copy()
+    c = d["Close"]
+    ema20 = _ema(c, 20)
+    ema50 = _ema(c, 50)
+    ema200 = _ema(c, 200) if len(c) >= 220 else _ema(c, 100)
+    adx14 = _adx(d, 14)
+    slope20 = (ema20 - ema20.shift(5)) / (5 * _atr(d, 14).replace(0, np.nan))
+    slope = float(slope20.iloc[-1]) if not np.isnan(slope20.iloc[-1]) else 0.0
+    adx_v = float(adx14.iloc[-1])
+    # strength: combine ADX and slope magnitude
+    strength = float(min(1.0, (max(0.0, adx_v - 10) / 30.0) * min(1.0, abs(slope))))
+    up = (ema20.iloc[-1] > ema50.iloc[-1]) and (ema50.iloc[-1] > ema200.iloc[-1]) and (slope > 0.15)
+    dn = (ema20.iloc[-1] < ema50.iloc[-1]) and (ema50.iloc[-1] < ema200.iloc[-1]) and (slope < -0.15)
+    # range if weak trend
+    if adx_v < 15 and abs(slope) < 0.10:
+        phase = "RANGE"
+        strength = float(min(0.4, strength))
+    elif up and adx_v >= 18:
+        phase = "UP_TREND"
+    elif dn and adx_v >= 18:
+        phase = "DOWN_TREND"
+    else:
+        # breakout-ish: 20d high/low break with adx rising
+        hh20 = c.rolling(20).max()
+        ll20 = c.rolling(20).min()
+        if c.iloc[-1] >= hh20.iloc[-2] and adx_v >= float(adx14.iloc[-6]):
+            phase = "BREAKOUT_UP"
+            strength = max(strength, 0.55)
+        elif c.iloc[-1] <= ll20.iloc[-2] and adx_v >= float(adx14.iloc[-6]):
+            phase = "BREAKOUT_DOWN"
+            strength = max(strength, 0.55)
+        else:
+            phase = "TRANSITION"
+    return {"phase": phase, "trend_strength": strength, "adx": adx_v, "slope20_atr": slope}
+
+def _make_continuation_dataset(df: pd.DataFrame, horizon: int = 5, k_atr: float = 0.6) -> Tuple[pd.DataFrame, pd.Series, pd.Series]:
+    """Build features X and labels y_up / y_dn for continuation within horizon days."""
+    d = df.copy()
+    c = d["Close"]
+    atr14 = _atr(d, 14)
+    adx14 = _adx(d, 14)
+    rsi14 = _rsi(c, 14)
+    ema20 = _ema(c, 20)
+    ema50 = _ema(c, 50)
+    ret1 = c.pct_change(1)
+    ret3 = c.pct_change(3)
+    ret5 = c.pct_change(5)
+    atrp = (atr14 / c).replace([np.inf, -np.inf], np.nan)
+    emar = (ema20 / ema50 - 1.0).replace([np.inf, -np.inf], np.nan)
+    # forward move in ATR units
+    fwd = c.shift(-horizon) - c
+    move_atr = (fwd / atr14.replace(0, np.nan))
+    y_up = (move_atr >= k_atr).astype(int)
+    y_dn = (move_atr <= -k_atr).astype(int)
+    X = pd.DataFrame({
+        "ret1": ret1, "ret3": ret3, "ret5": ret5,
+        "atrp": atrp,
+        "adx": adx14/50.0,
+        "rsi": (rsi14-50.0)/50.0,
+        "emar": emar,
+    }).dropna()
+    y_up = y_up.loc[X.index]
+    y_dn = y_dn.loc[X.index]
+    # drop last horizon where labels unknown
+    X = X.iloc[:-horizon] if len(X) > horizon else X.iloc[:0]
+    y_up = y_up.iloc[:-horizon] if len(y_up) > horizon else y_up.iloc[:0]
+    y_dn = y_dn.iloc[:-horizon] if len(y_dn) > horizon else y_dn.iloc[:0]
+    return X, y_up, y_dn
+
+@st.cache_data(show_spinner=False, ttl=60*60)
+def _fit_continuation_models(pair_label: str, interval: str, df: pd.DataFrame, horizon: int = 5) -> Dict[str, Any]:
+    """Fit per-pair logistic models (up/down). Cached."""
+    if LogisticRegression is None or df is None or df.empty or len(df) < 400:
+        return {"ok": False}
+    X, y_up, y_dn = _make_continuation_dataset(df, horizon=horizon)
+    if X.empty or y_up.nunique() < 2 or y_dn.nunique() < 2:
+        return {"ok": False}
+    model_up = Pipeline([("scaler", StandardScaler()), ("lr", LogisticRegression(max_iter=200, class_weight="balanced"))])
+    model_dn = Pipeline([("scaler", StandardScaler()), ("lr", LogisticRegression(max_iter=200, class_weight="balanced"))])
+    model_up.fit(X, y_up)
+    model_dn.fit(X, y_dn)
+    return {"ok": True, "model_up": model_up, "model_dn": model_dn, "feature_cols": list(X.columns)}
+
+def _predict_continuation(pair_label: str, interval: str, df: pd.DataFrame, horizon: int = 5) -> Dict[str, Any]:
+    if df is None or df.empty:
+        return {"p_up": float("nan"), "p_dn": float("nan"), "ok": False}
+    fitted = _fit_continuation_models(pair_label, interval, df, horizon=horizon)
+    if not fitted.get("ok"):
+        return {"p_up": float("nan"), "p_dn": float("nan"), "ok": False}
+    cols = fitted["feature_cols"]
+    X_latest, _, _ = _make_continuation_dataset(df, horizon=horizon)
+    if X_latest.empty:
+        # build latest row manually
+        X_latest = _make_continuation_dataset(df, horizon=1)[0]
+    if X_latest.empty:
+        return {"p_up": float("nan"), "p_dn": float("nan"), "ok": False}
+    row = X_latest[cols].iloc[[-1]]
+    p_up = float(fitted["model_up"].predict_proba(row)[0,1])
+    p_dn = float(fitted["model_dn"].predict_proba(row)[0,1])
+    return {"p_up": p_up, "p_dn": p_dn, "ok": True}
+
+def _similar_pattern_search(df: pd.DataFrame, window: int = 30, horizon: int = 5, topk: int = 5) -> pd.DataFrame:
+    """Find similar windows using simple normalized indicator sequence distance."""
+    if df is None or df.empty or len(df) < window + horizon + 100:
+        return pd.DataFrame()
+    d = df.copy()
+    c = d["Close"]
+    atr14 = _atr(d, 14)
+    rsi14 = _rsi(c, 14)
+    adx14 = _adx(d, 14)
+    # features per bar
+    feat = pd.DataFrame({
+        "ret": c.pct_change().fillna(0.0),
+        "rsi": (rsi14-50)/50.0,
+        "adx": (adx14/50.0).clip(0,2),
+        "atrp": (atr14/c).fillna(method="bfill").fillna(0.0),
+    }).fillna(0.0)
+    # build last window vector
+    last = feat.iloc[-window:].to_numpy().reshape(-1)
+    last = (last - last.mean()) / (last.std() + 1e-9)
+    candidates = []
+    # exclude overlap near end
+    max_i = len(feat) - window - horizon - 5
+    for i in range(60, max_i):
+        seg = feat.iloc[i:i+window].to_numpy().reshape(-1)
+        seg = (seg - seg.mean()) / (seg.std() + 1e-9)
+        # cosine distance
+        num = float(np.dot(last, seg))
+        den = float((np.linalg.norm(last)+1e-9)*(np.linalg.norm(seg)+1e-9))
+        sim = num/den
+        fwd_ret = float((c.iloc[i+window+horizon-1] - c.iloc[i+window-1]) / (atr14.iloc[i+window-1] + 1e-9))
+        candidates.append((sim, i, d.index[i+window-1], fwd_ret))
+    if not candidates:
+        return pd.DataFrame()
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    rows=[]
+    for sim, i, end_dt, fwdR in candidates[:topk]:
+        rows.append({"similarity": sim, "pattern_end": str(end_dt), "fwd_R_atr": fwdR})
+    return pd.DataFrame(rows)
+
+def _phase_to_id(phase: str) -> int:
+    p = str(phase or "").upper()
+    if p.startswith("UP"):
+        return 1
+    if p.startswith("DOWN"):
+        return 2
+    if p.startswith("BREAK"):
+        return 3
+    if p.startswith("RANGE"):
+        return 4
+    return 0
+
+def _bin(x: float, edges: list[float]) -> int:
+    try:
+        v = float(x)
+    except Exception:
+        return 0
+    for i, e in enumerate(edges):
+        if v < e:
+            return i
+    return len(edges)
+
+class RLExitAgent:
+    """Tabular Q-learning exit agent (real RL).
+
+    - States are discretized tuples derived from (phase, trend_strength, edge, unrealized_R, drawdown_R).
+    - Actions: HOLD, TRAIL_TIGHT, EXIT, TAKE_PARTIAL (partial treated as EXIT with bonus factor in reward proxy).
+    - Learns from historical price paths using a lightweight simulated environment.
+    """
+
+    ACTIONS = ["HOLD", "TRAIL_TIGHT", "TAKE_PARTIAL", "EXIT"]
+
+    def __init__(self):
+        self.q: dict[str, list[float]] = {}  # state_key -> q-values per action index
+        # bins (tunable)
+        self.r_edges = [-0.5, -0.2, 0.0, 0.2, 0.5, 0.8, 1.2, 1.8, 2.5]
+        self.dd_edges = [-2.5, -1.8, -1.2, -0.8, -0.5, -0.2, 0.0]
+        self.str_edges = [0.15, 0.3, 0.5, 0.7]
+        self.edge_edges = [-0.2, -0.1, -0.03, 0.03, 0.1, 0.2]
+
+    def _state_key(self, phase: str, trend_strength: float, edge: float, unreal_R: float, dd_R: float) -> str:
+        pid = _phase_to_id(phase)
+        sb = _bin(trend_strength, self.str_edges)
+        eb = _bin(edge, self.edge_edges)
+        rb = _bin(unreal_R, self.r_edges)
+        db = _bin(dd_R, self.dd_edges)
+        return f"{pid}|{sb}|{eb}|{rb}|{db}"
+
+    def _get_q(self, key: str) -> list[float]:
+        if key not in self.q:
+            self.q[key] = [0.0 for _ in self.ACTIONS]
+        return self.q[key]
+
+    def act(self, phase: str, trend_strength: float, p_up: float, p_dn: float, unrealized_R: float, dd_R: float = 0.0) -> dict:
+        p_up = 0.5 if (p_up != p_up) else float(p_up)
+        p_dn = 0.5 if (p_dn != p_dn) else float(p_dn)
+        edge = float(p_up - p_dn)
+        key = self._state_key(phase, trend_strength, edge, float(unrealized_R), float(dd_R))
+        qv = self._get_q(key)
+        best_i = int(max(range(len(qv)), key=lambda i: qv[i]))
+        return {"action": self.ACTIONS[best_i], "q": {a: qv[i] for i, a in enumerate(self.ACTIONS)}, "edge": edge, "state": key}
+
+    def to_json(self) -> dict:
+        return {"q": self.q}
+
+    @classmethod
+    def from_json(cls, obj: dict) -> "RLExitAgent":
+        ag = cls()
+        q = obj.get("q", {}) if isinstance(obj, dict) else {}
+        if isinstance(q, dict):
+            # ensure lists
+            ag.q = {k: list(v) for k, v in q.items() if isinstance(v, (list, tuple)) and len(v) == len(ag.ACTIONS)}
+        return ag
+
+    def train_from_price(self,
+                         df: pd.DataFrame,
+                         phase_series: pd.Series,
+                         trend_strength_series: pd.Series,
+                         p_up_series: pd.Series,
+                         p_dn_series: pd.Series,
+                         episodes: int = 3000,
+                         max_horizon: int = 20,
+                         atr_mult_stop: float = 1.5,
+                         gamma: float = 0.97,
+                         alpha: float = 0.12,
+                         eps: float = 0.15,
+                         dd_penalty: float = 0.15,
+                         time_penalty: float = 0.01,
+                         seed: int = 7) -> dict:
+        """Real Q-learning training on a simple simulated trade-exit environment."""
+        if df is None or df.empty:
+            return {"ok": False, "error": "empty_df"}
+        d = df.copy()
+        d = _coerce_ohlc(d)
+        if d.empty or len(d) < 200:
+            return {"ok": False, "error": "not_enough_bars"}
+
+        c = d["Close"].astype(float)
+        atr = _atr(d, 14).astype(float).fillna(method="bfill").fillna(method="ffill")
+        n = len(d)
+        rng = np.random.default_rng(seed)
+
+        # align aux series
+        ph = phase_series.reindex(d.index).fillna("UNKNOWN").astype(str)
+        ts = trend_strength_series.reindex(d.index).fillna(0.0).astype(float)
+        pu = p_up_series.reindex(d.index).fillna(0.5).astype(float)
+        pdn = p_dn_series.reindex(d.index).fillna(0.5).astype(float)
+
+        # choose random entry points away from the end
+        valid_start = np.arange(50, n - (max_horizon + 2))
+        if len(valid_start) <= 0:
+            return {"ok": False, "error": "no_valid_start"}
+
+        total_steps = 0
+        for ep in range(int(episodes)):
+            t0 = int(rng.choice(valid_start))
+            entry = float(c.iloc[t0])
+            stop = entry - float(atr.iloc[t0]) * float(atr_mult_stop)  # long-only exit training proxy
+            risk = abs(entry - stop)
+            if risk <= 1e-9:
+                continue
+
+            # simulate forward
+            dd_R = 0.0
+            unreal_R = 0.0
+            done = False
+            t = t0
+            # initial state
+            edge0 = float(pu.iloc[t] - pdn.iloc[t])
+            s_key = self._state_key(ph.iloc[t], float(ts.iloc[t]), edge0, unreal_R, dd_R)
+
+            for step in range(int(max_horizon)):
+                t1 = t + 1
+                price = float(c.iloc[t1])
+                unreal_R = (price - entry) / risk
+                dd_R = min(dd_R, unreal_R)  # adverse excursion in R (for long proxy)
+
+                # epsilon-greedy
+                qv = self._get_q(s_key)
+                if rng.random() < eps:
+                    a_i = int(rng.integers(0, len(self.ACTIONS)))
+                else:
+                    a_i = int(max(range(len(qv)), key=lambda i: qv[i]))
+                action = self.ACTIONS[a_i]
+
+                # environment transition + reward
+                reward = 0.0
+                # trail tight: move stop up (reduce risk), but increases stopout probability (proxied)
+                if action == "TRAIL_TIGHT":
+                    # tighten by 25% of current risk, but cap to entry (no negative risk)
+                    new_stop = stop + 0.25 * (price - stop)
+                    new_stop = min(new_stop, entry - 1e-9)
+                    if new_stop < stop:
+                        stop = new_stop
+                        risk = abs(entry - stop)
+                        if risk <= 1e-9:
+                            risk = abs(entry - (entry - 1e-6))
+                            stop = entry - 1e-6
+                # exit / take partial ends episode
+                if action in ("EXIT", "TAKE_PARTIAL"):
+                    realized_R = unreal_R
+                    if action == "TAKE_PARTIAL":
+                        realized_R = realized_R * 0.75  # partial capture proxy (safer, less reward)
+                    reward = realized_R - dd_penalty * abs(min(0.0, dd_R)) - time_penalty * step
+                    done = True
+
+                # stopout
+                if not done and float(d["Low"].iloc[t1]) <= stop:
+                    realized_R = (stop - entry) / risk if risk > 1e-9 else -1.0
+                    reward = realized_R - dd_penalty * abs(min(0.0, dd_R)) - time_penalty * step
+                    done = True
+
+                # next state
+                edge1 = float(pu.iloc[t1] - pdn.iloc[t1])
+                s_next = self._state_key(ph.iloc[t1], float(ts.iloc[t1]), edge1, unreal_R, dd_R)
+
+                # Q update
+                q_next = self._get_q(s_next)
+                td_target = reward if done else (0.0 + gamma * max(q_next))
+                qv[a_i] = float(qv[a_i] + alpha * (td_target - qv[a_i]))
+
+                total_steps += 1
+                s_key = s_next
+                t = t1
+                if done:
+                    break
+
+        return {"ok": True, "episodes": int(episodes), "steps": int(total_steps), "states": int(len(self.q))}
+
+    def evaluate_policy(self,
+                        df: pd.DataFrame,
+                        phase_series: pd.Series,
+                        trend_strength_series: pd.Series,
+                        p_up_series: pd.Series,
+                        p_dn_series: pd.Series,
+                        episodes: int = 800,
+                        max_horizon: int = 20,
+                        atr_mult_stop: float = 1.5,
+                        dd_penalty: float = 0.15,
+                        time_penalty: float = 0.01,
+                        seed: int = 11) -> dict:
+        """Evaluate current Q-policy (greedy) on the same simulated environment used in training.
+        Returns summary stats in R units.
+        """
+        try:
+            if df is None or df.empty:
+                return {"ok": False, "error": "empty_df"}
+            d = df.copy()
+            if "Close" not in d.columns or "Low" not in d.columns:
+                return {"ok": False, "error": "missing_ohlc"}
+            c = pd.to_numeric(d["Close"], errors="coerce").fillna(method="ffill").fillna(method="bfill")
+            low = pd.to_numeric(d["Low"], errors="coerce").fillna(method="ffill").fillna(method="bfill")
+            atr = _atr(d, 14).fillna(method="ffill").fillna(method="bfill")
+            ph = phase_series.reindex(d.index).fillna("RANGE").astype(str)
+            ts = pd.to_numeric(trend_strength_series.reindex(d.index), errors="coerce").fillna(0.0)
+            pu = pd.to_numeric(p_up_series.reindex(d.index), errors="coerce").fillna(0.5)
+            pdn = pd.to_numeric(p_dn_series.reindex(d.index), errors="coerce").fillna(0.5)
+
+            rng = np.random.default_rng(int(seed))
+            valid_start = np.arange(1, max(2, len(d) - int(max_horizon) - 2))
+            if len(valid_start) < 10:
+                return {"ok": False, "error": "not_enough_bars"}
+            ep_R = []
+            ep_reward = []
+            win = 0
+            for _ in range(int(episodes)):
+                t0 = int(rng.choice(valid_start))
+                entry = float(c.iloc[t0])
+                stop = entry - float(atr.iloc[t0]) * float(atr_mult_stop)
+                risk = abs(entry - stop)
+                if risk <= 1e-9:
+                    continue
+                dd_R = 0.0
+                unreal_R = 0.0
+                t = t0
+                edge0 = float(pu.iloc[t] - pdn.iloc[t])
+                s_key = self._state_key(ph.iloc[t], float(ts.iloc[t]), edge0, unreal_R, dd_R)
+
+                realized_R = 0.0
+                reward = 0.0
+                done = False
+                for step in range(int(max_horizon)):
+                    t1 = t + 1
+                    price = float(c.iloc[t1])
+                    unreal_R = (price - entry) / risk
+                    dd_R = min(dd_R, unreal_R)
+
+                    qv = self._get_q(s_key)
+                    a_i = int(max(range(len(qv)), key=lambda i: qv[i]))
+                    action = self.ACTIONS[a_i]
+
+                    # trail
+                    if action == "TRAIL_TIGHT":
+                        new_stop = stop + 0.25 * (price - stop)
+                        new_stop = min(new_stop, entry - 1e-9)
+                        if new_stop < stop:
+                            stop = new_stop
+                            risk = abs(entry - stop)
+                            if risk <= 1e-9:
+                                risk = abs(entry - (entry - 1e-6))
+                                stop = entry - 1e-6
+
+                    if action in ("EXIT", "TAKE_PARTIAL"):
+                        realized_R = unreal_R
+                        if action == "TAKE_PARTIAL":
+                            realized_R = realized_R * 0.75
+                        reward = realized_R - float(dd_penalty) * abs(min(0.0, dd_R)) - float(time_penalty) * step
+                        done = True
+
+                    if not done and float(low.iloc[t1]) <= stop:
+                        realized_R = (stop - entry) / risk if risk > 1e-9 else -1.0
+                        reward = realized_R - float(dd_penalty) * abs(min(0.0, dd_R)) - float(time_penalty) * step
+                        done = True
+
+                    edge1 = float(pu.iloc[t1] - pdn.iloc[t1])
+                    s_next = self._state_key(ph.iloc[t1], float(ts.iloc[t1]), edge1, unreal_R, dd_R)
+
+                    s_key = s_next
+                    t = t1
+                    if done:
+                        break
+
+                ep_R.append(float(realized_R))
+                ep_reward.append(float(reward))
+                if realized_R > 0:
+                    win += 1
+
+            if not ep_R:
+                return {"ok": False, "error": "no_episodes"}
+            arrR = np.array(ep_R, dtype=float)
+            arrRew = np.array(ep_reward, dtype=float)
+            return {
+                "ok": True,
+                "episodes": int(len(arrR)),
+                "avg_R": float(arrR.mean()),
+                "win_rate": float((arrR > 0).mean()),
+                "pf": float(arrR[arrR > 0].sum() / (abs(arrR[arrR < 0].sum()) + 1e-9)),
+                "avg_reward": float(arrRew.mean()),
+                "p05_R": float(np.quantile(arrR, 0.05)),
+                "p95_R": float(np.quantile(arrR, 0.95)),
+            }
+        except Exception as e:
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def _load_rl_agent(path: str) -> Optional[RLExitAgent]:
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                obj = json.load(f)
+            return RLExitAgent.from_json(obj)
+    except Exception:
+        return None
+    return None
+
+def _save_rl_agent(path: str, agent: RLExitAgent) -> bool:
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(agent.to_json(), f, ensure_ascii=False)
+        return True
+    except Exception:
+        return False
+
+
+def _wfa_select_rl_coeffs(df: pd.DataFrame,
+                          phase_series: pd.Series,
+                          trend_strength_series: pd.Series,
+                          p_up_series: pd.Series,
+                          p_dn_series: pd.Series,
+                          grid: Optional[list[dict]] = None,
+                          splits: int = 3,
+                          train_episodes: int = 2200,
+                          eval_episodes: int = 800,
+                          max_horizon: int = 20,
+                          seed: int = 13) -> dict:
+    """Walk-Forward Analysis (WFA) to pick RL reward coefficients.
+    Returns best params and fold stats. Keeps it lightweight for Streamlit Cloud.
+    """
+    try:
+        if df is None or df.empty or len(df) < 600:
+            return {"ok": False, "error": "not_enough_data"}
+        if grid is None:
+            grid = []
+            for dd in [0.05, 0.10, 0.15, 0.25, 0.35]:
+                for tp in [0.0, 0.005, 0.01, 0.02]:
+                    for atrm in [1.2, 1.5, 1.8]:
+                        grid.append({"dd_penalty": dd, "time_penalty": tp, "atr_mult_stop": atrm})
+        # build fold indices (expanding window)
+        n = len(df)
+        fold = max(120, n // (splits + 2))
+        # train ends at: fold*(i+2), test next fold
+        folds = []
+        for i in range(splits):
+            tr_end = fold * (i + 2)
+            te_end = min(n, tr_end + fold)
+            if te_end - tr_end < 60 or tr_end < 200:
+                continue
+            folds.append((0, tr_end, tr_end, te_end))
+        if not folds:
+            # fallback single split 70/30
+            tr_end = int(n * 0.7)
+            folds = [(0, tr_end, tr_end, n)]
+
+        best = None
+        all_rows = []
+        for params in grid:
+            fold_scores = []
+            for (tr0, tr1, te0, te1) in folds:
+                df_tr = df.iloc[tr0:tr1].copy()
+                df_te = df.iloc[te0:te1].copy()
+                ph_tr = phase_series.iloc[tr0:tr1]
+                ts_tr = trend_strength_series.iloc[tr0:tr1]
+                pu_tr = p_up_series.iloc[tr0:tr1]
+                pd_tr = p_dn_series.iloc[tr0:tr1]
+
+                ph_te = phase_series.iloc[te0:te1]
+                ts_te = trend_strength_series.iloc[te0:te1]
+                pu_te = p_up_series.iloc[te0:te1]
+                pd_te = p_dn_series.iloc[te0:te1]
+
+                ag = RLExitAgent()
+                r = ag.train_from_price(
+                    df_tr, ph_tr, ts_tr, pu_tr, pd_tr,
+                    episodes=int(train_episodes),
+                    max_horizon=int(max_horizon),
+                    atr_mult_stop=float(params["atr_mult_stop"]),
+                    dd_penalty=float(params["dd_penalty"]),
+                    time_penalty=float(params["time_penalty"]),
+                    seed=int(seed + 17),
+                )
+                if not r.get("ok"):
+                    continue
+                ev = ag.evaluate_policy(
+                    df_te, ph_te, ts_te, pu_te, pd_te,
+                    episodes=int(eval_episodes),
+                    max_horizon=int(max_horizon),
+                    atr_mult_stop=float(params["atr_mult_stop"]),
+                    dd_penalty=float(params["dd_penalty"]),
+                    time_penalty=float(params["time_penalty"]),
+                    seed=int(seed + 19),
+                )
+                if not ev.get("ok"):
+                    continue
+                fold_scores.append(float(ev["avg_reward"]))
+            if not fold_scores:
+                continue
+            score = float(np.mean(fold_scores))
+            row = {"score": score, **params}
+            all_rows.append(row)
+            if (best is None) or (score > best["score"]):
+                best = row
+
+        if best is None:
+            return {"ok": False, "error": "wfa_failed", "tried": int(len(grid))}
+        df_rank = pd.DataFrame(all_rows).sort_values("score", ascending=False).head(12)
+        return {"ok": True, "best": best, "top": df_rank.to_dict(orient="records"), "folds": folds, "tried": int(len(grid))}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def _rl_exit_reco(agent: Optional[RLExitAgent], phase: str, trend_strength: float, p_up: float, p_dn: float, unrealized_R: float, dd_R: float = 0.0) -> Dict[str, Any]:
+    if agent is None:
+        return {"action": "HOLD", "note": "RL model not trained yet", "q": {}, "edge": float(p_up - p_dn), "state": ""}
+    return agent.act(phase, trend_strength, p_up, p_dn, unrealized_R, dd_R)
+
+def _compute_phase_strength_series(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
+    """Vectorized phase + strength per bar (no ML, deterministic).
+
+    Phase rules (approx):
+      - UP: ema20>ema50 and adx high
+      - DOWN: ema20<ema50 and adx high
+      - RANGE: adx low
+      - TRANSITION: otherwise
+    Strength: normalized ADX (0..1) blended with ema slope.
+    """
+    d = _coerce_ohlc(df.copy())
+    if d.empty:
+        return pd.Series(dtype=str), pd.Series(dtype=float)
+    c = d["Close"].astype(float)
+    ema20 = c.ewm(span=20, adjust=False).mean()
+    ema50 = c.ewm(span=50, adjust=False).mean()
+    adx = _adx(d, 14).astype(float)
+    adx_n = (adx / 40.0).clip(0.0, 1.0).fillna(0.0)
+    slope = (ema20 - ema20.shift(5)) / (d["ATR14"].astype(float).replace(0, np.nan) if "ATR14" in d.columns else (c.rolling(14).std() + 1e-9))
+    slope = slope.fillna(0.0).clip(-2.0, 2.0)
+    slope_n = (slope.abs() / 2.0).clip(0.0, 1.0)
+    strength = (0.65 * adx_n + 0.35 * slope_n).clip(0.0, 1.0)
+
+    phase = pd.Series(index=d.index, dtype=str)
+    is_range = adx.fillna(0.0) < 16.0
+    is_up = (ema20 > ema50) & (~is_range)
+    is_dn = (ema20 < ema50) & (~is_range)
+    phase[is_range] = "RANGE"
+    phase[is_up] = "UP_TREND"
+    phase[is_dn] = "DOWN_TREND"
+    phase[phase.isna()] = "TRANSITION"
+    return phase, strength
+
+def _compute_cont_p_series(df: pd.DataFrame, horizon: int = 5) -> Tuple[pd.Series, pd.Series]:
+    """Cheap continuation probability proxy series based on momentum & volatility.
+    This is used only as a feature for RL training; the 'official' continuation model remains separate.
+    """
+    d = _coerce_ohlc(df.copy())
+    if d.empty:
+        return pd.Series(dtype=float), pd.Series(dtype=float)
+    c = d["Close"].astype(float)
+    r = c.pct_change().fillna(0.0)
+    mom = (c - c.shift(horizon)) / (c.rolling(14).std() + 1e-9)
+    mom = mom.fillna(0.0).clip(-3.0, 3.0)
+    # sigmoid to (0..1)
+    p_up = 1.0 / (1.0 + np.exp(-1.2 * mom))
+    p_dn = 1.0 - p_up
+    return pd.Series(p_up, index=d.index), pd.Series(p_dn, index=d.index)
+
 def _fetch_from_stooq(pair_label: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     meta: Dict[str, Any] = {"source": "stooq", "ok": False, "error": None, "interval_used": "1d"}
     sym = _pair_label_to_stooq_symbol(pair_label)
@@ -928,6 +1853,23 @@ def _build_ctx(pair_label: str, df: pd.DataFrame, feats: Dict[str, float], horiz
     ctx: Dict[str, Any] = {}
     ctx.update(indicators)
     ctx.update(feats)
+    # --- AI Trend Engine features (phase / continuation / similar patterns) ---
+    try:
+        phase_info = _phase_classify(df)
+        cont = _predict_continuation(pair_label, "1d", df, horizon=max(3, int(horizon_days)))
+        patt = _similar_pattern_search(df, window=30, horizon=max(3, int(horizon_days)), topk=5)
+        ctx["phase"] = phase_info.get("phase", "UNKNOWN")
+        ctx["trend_strength"] = float(phase_info.get("trend_strength", 0.0) or 0.0)
+        ctx["adx14"] = float(phase_info.get("adx", float("nan")))
+        ctx["p_cont_up"] = float(cont.get("p_up", float("nan")))
+        ctx["p_cont_dn"] = float(cont.get("p_dn", float("nan")))
+        # stash patterns for UI
+        ctx["_similar_patterns_df"] = patt
+    except Exception:
+        ctx["phase"] = "UNKNOWN"
+        ctx["trend_strength"] = 0.0
+        ctx["p_cont_up"] = float("nan")
+        ctx["p_cont_dn"] = float("nan")
     ctx["pair_label"] = pair_label
     ctx["pair_symbol"] = _pair_label_to_symbol(pair_label)
     ctx["price"] = float(df["Close"].iloc[-1])
@@ -1295,7 +2237,7 @@ def _render_risk_dashboard(plan: Dict[str, Any], feats: Dict[str, float], ext_me
 # UI
 # =========================
 st.set_page_config(page_title="FX EV Auto v4 Integrated", layout="centered", initial_sidebar_state="collapsed")
-st.title("FX 自動AI判断ツール")
+st.title("FX 自動AI判断ツール（EV最大化） v4 Integrated")
 
 with st.sidebar:
     st.header("運用操作（見る順）")
@@ -1305,6 +2247,7 @@ with st.sidebar:
     trade_axis = st.selectbox("時間軸（保有期間）", ["スイング（1週〜1ヶ月）", "中長期（1〜3ヶ月）"], index=0)
     style_name = st.selectbox("運用スタイル（見送りライン）", ["標準", "保守", "攻撃"], index=0)
     priority = st.selectbox("優先度", ["バランス（推奨）", "勝率優先（見送り増）"], index=0)
+    st.session_state["trend_assist_enable"] = st.checkbox("🤖 トレンド捕獲アシスト（実験）", value=True, help="強いトレンド局面では期待値に小さな加点を入れて、取り逃しを減らします。")
     st.session_state['priority_mode'] = priority
 
     # 時間軸プリセット（詳細設定で上書き可）
@@ -1595,6 +2538,7 @@ with tabs[0]:
         best = ranked[0]
         plan = best["_plan"]
         plan_ui_best = best.get("_plan_ui", plan)
+        plan_ui_best = _apply_trend_assist(plan_ui_best, best.get("_ctx", {}))
         feats = best["_feats"]
         price = float(best["_ctx"].get("price", 0.0))
 
@@ -1603,6 +2547,8 @@ with tabs[0]:
 
         # Risk dashboard (new)
         _render_risk_dashboard(plan_ui_best, feats, ext_meta=best.get("_ext_meta", {}))
+
+        _render_ai_engine_panel(best.get("_ctx", {}), plan_ui_best)
 
         # Logging (optional)
         _render_logging_panel(best["pair"], plan_ui_best, best.get("_ctx", {}), feats, best.get("_price_meta", {}), best.get("_ext_meta", {}))
@@ -1730,9 +2676,13 @@ with tabs[0]:
         except Exception:
             plan_ui = plan
 
+        plan_ui = _apply_trend_assist(plan_ui, ctx)
+
         price = float(ctx.get("price", 0.0))
         _render_top_trade_panel(pair_label, plan_ui, price)
         _render_risk_dashboard(plan_ui, feats, ext_meta=ext_meta)
+
+        _render_ai_engine_panel(ctx, plan_ui)
 
         _render_logging_panel(pair_label, plan_ui, ctx, feats, price_meta, ext_meta)
 
@@ -2002,4 +2952,3 @@ with st.expander("🔧 Webhook診断（送信テスト/失敗理由の表示）"
         st.caption("直近の送信結果（デバッグ）")
         st.json(st.session_state["last_webhook_result"])
 # --- /Webhook Diagnostics ---
-
