@@ -1,4 +1,5 @@
 
+
 # logic_fixed28_trend_entry_engine_compat.py
 # Drop-in replacement for logic.py
 # - Adds self-contained: HH/HL detection, breakout strength, continuation probability, phase-aware EV thresholding,
@@ -247,148 +248,283 @@ def get_ai_order_strategy(
     **kwargs,
 ) -> Dict[str, Any]:
     """
-    Returns dict compatible with existing main.py:
-      {
-        "decision": "TRADE"/"NO_TRADE",
-        "direction": "LONG"/"SHORT",
-        "entry": ..., "sl": ..., "tp": ...,
-        "ev_raw": ..., "ev_adj": ...,
-        "dynamic_threshold": ...,
-        "confidence": ...,
-        "why": ..., "veto": [...],
-        "_ctx": {...}
-      }
+    main.py 互換の“完全版”エントリー判定（ctx依存を排除し、内部で必要な特徴量を計算します）。
+
+    ✅ 互換性:
+    - main.py が期待する key を全て返します（expected_R_ev / p_win_ev / veto_reasons / state_probs / ev_contribs など）
+    - 旧key（entry/sl/tp, ev_raw/ev_adj, veto）も残します
+
+    ✅ この関数が必ず使う入力:
+    - 価格DF: price_df または kwargs(df/price_history/price_data) または context_data 内の (_df/df/price_df/price_history)
+    - pair: pair または kwargs(pair_label/symbol/pair)
+
+    価格DFが無い（or 60本未満）の場合は NO_TRADE で "データ不足" を返します。
     """
-    df = price_df.copy() if price_df is not None else None
-    if df is None or len(df) < 60:
+
+    # -----------------------------------------------------------------
+    # 1) 引数の吸収（互換）
+    # -----------------------------------------------------------------
+    if not pair:
+        pair = (kwargs.get("pair_label") or kwargs.get("symbol") or kwargs.get("pair") or "") or ""
+
+    if ext_features is None:
+        ext_features = kwargs.get("ext") or kwargs.get("external_features") or kwargs.get("ext_meta") or None
+
+    if context_data is None:
+        context_data = kwargs.get("ctx") or kwargs.get("context") or kwargs.get("_ctx") or None
+
+    ctx_in = context_data or {}
+    ext = ext_features or {}
+
+    df = price_df
+    if df is None:
+        df = kwargs.get("df") or kwargs.get("price_history") or kwargs.get("price_data")
+
+    # さらに、ctx内にdfを仕込んでいる場合（main側で ctx['_df']=df.tail(...) など）
+    if df is None and isinstance(ctx_in, dict):
+        df = ctx_in.get("_df") or ctx_in.get("df") or ctx_in.get("price_df") or ctx_in.get("price_history")
+
+    # DataFrame 化
+    if df is not None and not isinstance(df, pd.DataFrame):
+        try:
+            df = pd.DataFrame(df)
+        except Exception:
+            df = None
+
+    # OHLC列名の正規化（lowercase等を吸収）
+    if isinstance(df, pd.DataFrame) and len(df.columns) > 0:
+        cols = {c.lower(): c for c in df.columns}
+        rename = {}
+        for need in ["open", "high", "low", "close", "volume"]:
+            if need in cols and cols[need] != need.capitalize():
+                rename[cols[need]] = need.capitalize()
+        if rename:
+            df = df.rename(columns=rename)
+        # たまに "Adj Close" のみ等があるので Close を補完
+        if "Close" not in df.columns and "Adj Close" in df.columns:
+            df["Close"] = df["Adj Close"]
+
+    # 必須列チェック
+    need_cols = {"High", "Low", "Close"}
+    if df is None or (not isinstance(df, pd.DataFrame)) or len(df) < 60 or (not need_cols.issubset(set(df.columns))):
+        debug_cols = []
+        try:
+            debug_cols = list(df.columns) if isinstance(df, pd.DataFrame) else []
+        except Exception:
+            debug_cols = []
         return {
             "decision": "NO_TRADE",
             "direction": "LONG",
-            "entry": 0.0, "sl": 0.0, "tp": 0.0,
+            "side": "BUY",
+            "order_type": "—",
+            "entry_type": "—",
+            "entry": 0.0,
+            "entry_price": 0.0,
+            "sl": 0.0, "stop_loss": 0.0,
+            "tp": 0.0, "take_profit": 0.0,
+            "trail_sl": 0.0,
+            "extend_factor": 1.0,
             "ev_raw": 0.0, "ev_adj": 0.0,
-            "dynamic_threshold": 0.10,
+            "expected_R_ev_raw": 0.0,
+            "expected_R_ev_adj": 0.0,
+            "expected_R_ev": 0.0,
+            "dynamic_threshold": float(_clamp(_safe_float(ctx_in.get("min_expected_R", 0.10), 0.10), 0.03, 0.30)),
+            "gate_mode": "NO_DATA",
             "confidence": 0.0,
+            "p_win": 0.0,
+            "p_win_ev": 0.0,
             "why": "データ不足",
-            "veto": ["データ不足（最低60本必要）"],
-            "_ctx": {},
+            "veto": ["データ不足（最低60本必要 / High・Low・Close必須）"],
+            "veto_reasons": ["データ不足（最低60本必要 / High・Low・Close必須）"],
+            "state_probs": {"trend_up": 0.0, "trend_down": 0.0, "range": 0.0, "risk_off": 0.0},
+            "ev_contribs": {"trend_up": 0.0, "trend_down": 0.0, "range": 0.0, "risk_off": 0.0},
+            "_ctx": {"pair": pair, "len": int(len(df)) if isinstance(df, pd.DataFrame) else 0, "cols": debug_cols},
         }
 
-    ctx_in = context_data or {}
-    # Accept alternate caller arg names (backward/forward compatibility)
-    if price_df is None:
-        price_df = kwargs.get('df') or kwargs.get('price_history') or kwargs.get('price_data')
-    if not pair:
-        pair = kwargs.get('pair_label') or kwargs.get('symbol') or kwargs.get('pair') or ''
-    if ext_features is None:
-        ext_features = kwargs.get('ext') or kwargs.get('external_features') or kwargs.get('ext_meta')
-    if context_data is None:
-        context_data = kwargs.get('ctx') or kwargs.get('context') or kwargs.get('_ctx')
-    ext = ext_features or {}
+    # 念のためコピー
+    df = df.copy()
 
     close = df["Close"].astype(float)
     last = float(close.iloc[-1])
 
-    # Compute phase, strength, momentum and continuation probabilities internally
+    # -----------------------------------------------------------------
+    # 2) 内部特徴量（ctx依存排除）
+    # -----------------------------------------------------------------
     phase, strength, mom = _phase_label(df)
-    p_up, p_dn = _continuation_prob(df, horizon=int(_safe_float(ctx_in.get("horizon_days", 5), 5)))
+    horizon = int(_safe_float(ctx_in.get("horizon_days", 5), 5))
+    p_up, p_dn = _continuation_prob(df, horizon=max(3, horizon))
 
     breakout_ok, breakout_strength = _breakout_strength(df, 20)
     hhhl_ok = _hh_hl_ok(df, 30)
 
-    # Direction: prefer with momentum/phase
+    # -----------------------------------------------------------------
+    # 3) 方向選択（トレンドを取り逃がさない）
+    # -----------------------------------------------------------------
     direction = "LONG" if mom >= 0 else "SHORT"
     if prefer_long_only:
         direction = "LONG"
-    # Hard block: in strong uptrend/breakout, do not short (reduces "uptrend but short EV negative" issue)
-    if phase in ("UP_TREND", "BREAKOUT_UP") and strength >= 0.35:
+    # 強い上昇局面は “ショート禁止”
+    if phase in ("UP_TREND", "BREAKOUT_UP", "TRANSITION_UP") and strength >= 0.33:
         direction = "LONG"
+    if phase in ("DOWN_TREND", "BREAKOUT_DOWN", "TRANSITION_DOWN") and strength >= 0.33:
+        direction = "SHORT"
 
-    # Basic risk model: SL at 1.2*ATR behind recent swing, TP = 2.0*ATR in trend, else 1.5*ATR
+    side = "BUY" if direction == "LONG" else "SELL"
+
+    # -----------------------------------------------------------------
+    # 4) リスクモデル（SL/TP）: ATRベース
+    # -----------------------------------------------------------------
     atr14 = float(_atr(df, 14).iloc[-1])
     atr14 = max(atr14, 1e-6)
+
     lookback = 20
     recent_low = float(df["Low"].astype(float).tail(lookback).min())
     recent_high = float(df["High"].astype(float).tail(lookback).max())
 
     if direction == "LONG":
         sl = min(last - 1.2 * atr14, recent_low - 0.15 * atr14)
-        tp_base = last + (2.2 * atr14 if phase.startswith("UP") or phase.startswith("BREAKOUT") else 1.6 * atr14)
+        tp = last + (2.2 * atr14 if phase in ("UP_TREND", "BREAKOUT_UP") else 1.6 * atr14)
     else:
         sl = max(last + 1.2 * atr14, recent_high + 0.15 * atr14)
-        tp_base = last - (2.2 * atr14 if phase.startswith("DOWN") or phase.startswith("BREAKOUT") else 1.6 * atr14)
+        tp = last - (2.2 * atr14 if phase in ("DOWN_TREND", "BREAKOUT_DOWN") else 1.6 * atr14)
 
-    entry = last  # market entry assumption (main can convert to limit if desired)
-    tp = tp_base
+    entry = last
 
-    # Compute R-multiples
     risk = abs(entry - sl)
     reward = abs(tp - entry)
     if risk <= 1e-9:
         risk = atr14
     rr = reward / risk
 
-    # Win probability proxy: combine continuation prob and strength
+    # -----------------------------------------------------------------
+    # 5) 勝率 proxy: 継続確率 × 強度（0.2..0.8にクリップ）
+    # -----------------------------------------------------------------
+    cont_best = max(p_up, p_dn)
     if direction == "LONG":
-        p_win = 0.45 + 0.40 * _clamp((p_up - 0.5) * 2.0, -1.0, 1.0) + 0.10 * (strength - 0.5)
+        p_win = 0.46 + 0.42 * _clamp((p_up - 0.5) * 2.0, -1.0, 1.0) + 0.10 * (strength - 0.5)
     else:
-        p_win = 0.45 + 0.40 * _clamp((p_dn - 0.5) * 2.0, -1.0, 1.0) + 0.10 * (strength - 0.5)
+        p_win = 0.46 + 0.42 * _clamp((p_dn - 0.5) * 2.0, -1.0, 1.0) + 0.10 * (strength - 0.5)
     p_win = _clamp(p_win, 0.20, 0.80)
 
-    # EV in R: EV = p*RR - (1-p)*1
+    # EV (R): EV = p*RR - (1-p)*1
     ev_raw = p_win * rr - (1.0 - p_win) * 1.0
 
-    # External risk penalty (0..1). If not present, assume moderate-low.
-    macro_risk = _clamp(_safe_float(ext.get("macro_risk_score", ext.get("risk_off", 0.35)), 0.35), 0.0, 1.0)
-    risk_penalty = 0.15 + 0.55 * macro_risk  # 0.15..0.70
-    ev_adj = ev_raw - 0.20 * risk_penalty  # moderate penalty
+    # -----------------------------------------------------------------
+    # 6) 外部リスク（global_risk/war等）を macro_risk に畳み込み
+    # -----------------------------------------------------------------
+    # ext_features は main 側の feats を想定（global_risk_index / war_probability 等）
+    gr = _safe_float(ext.get("global_risk_index", ext.get("global_risk", ext.get("risk_off", 0.35))), 0.35)
+    war = _safe_float(ext.get("war_probability", ext.get("war", 0.0)), 0.0)
+    macro_risk = _safe_float(ext.get("macro_risk_score", None), float("nan"))
+    if not (isinstance(macro_risk, (int, float)) and math.isfinite(float(macro_risk))):
+        macro_risk = _clamp(0.70 * gr + 0.30 * war, 0.0, 1.0)
+    else:
+        macro_risk = _clamp(float(macro_risk), 0.0, 1.0)
 
-    # Dynamic threshold base
-    base_thr = _clamp(_safe_float(ctx_in.get("dynamic_threshold_base", 0.08), 0.08), 0.03, 0.20)
+    # リスク調整 EV（表示用）
+    risk_penalty = 0.12 + 0.55 * macro_risk   # 0.12..0.67
+    ev_adj = ev_raw - 0.20 * risk_penalty
 
-    # Phase-based threshold adjustment (your requested item #1)
+    # -----------------------------------------------------------------
+    # 7) 動的閾値（フェーズ別） + リスク時に少し上げる
+    # -----------------------------------------------------------------
+    base_thr = _safe_float(ctx_in.get("dynamic_threshold_base", None), float("nan"))
+    if not (isinstance(base_thr, (int, float)) and math.isfinite(float(base_thr))):
+        base_thr = _safe_float(ctx_in.get("min_expected_R", 0.08), 0.08)
+    base_thr = _clamp(float(base_thr), 0.03, 0.25)
+
     thr_mult = 1.0
     if phase in ("UP_TREND", "DOWN_TREND", "TRANSITION_UP", "TRANSITION_DOWN"):
-        thr_mult -= 0.15 * strength  # loosen in trends
+        thr_mult -= 0.18 * strength
     if phase.startswith("BREAKOUT"):
-        thr_mult -= 0.25 * max(strength, breakout_strength)  # more loosen in breakout
+        thr_mult -= 0.25 * max(strength, breakout_strength)
     if phase == "RANGE":
-        thr_mult += 0.10  # tighten in range
-    dynamic_threshold = _clamp(base_thr * thr_mult, 0.02, 0.25)
+        thr_mult += 0.10
 
-    # Momentum bonus capped (your requested item #2)
+    dynamic_threshold = base_thr * thr_mult
+    # リスク時は閾値を上げる（ただし上げ過ぎない）
+    dynamic_threshold = dynamic_threshold + 0.04 * macro_risk
+    dynamic_threshold = _clamp(dynamic_threshold, 0.02, 0.30)
+
+    # -----------------------------------------------------------------
+    # 8) モメンタム加点（上限 +0.06R）
+    # -----------------------------------------------------------------
     mom_bonus = 0.0
     if direction == "LONG" and mom > 0:
         mom_bonus = 0.06 * _clamp(strength, 0.0, 1.0) * _clamp(p_up, 0.0, 1.0)
     if direction == "SHORT" and mom < 0:
         mom_bonus = 0.06 * _clamp(strength, 0.0, 1.0) * _clamp(p_dn, 0.0, 1.0)
     mom_bonus = _clamp(mom_bonus, 0.0, 0.06)
-    ev_eff = ev_raw + mom_bonus  # use raw gate with bonus (conservative)
 
-    # Breakout gate (your requested item #3)
-    cont_best = max(p_up, p_dn)
-    breakout_pass = bool((breakout_ok or hhhl_ok) and (cont_best >= 0.62) and (max(strength, breakout_strength) >= 0.45) and (macro_risk <= 0.75))
+    ev_gate = ev_raw + mom_bonus  # gateに使うEV（従来要望の "raw+mom"）
 
-    # Confidence (0..1)
-    confidence = _clamp(0.35 + 0.35 * strength + 0.20 * (cont_best - 0.5) + 0.10 * (rr - 1.0), 0.0, 1.0)
+    # -----------------------------------------------------------------
+    # 9) ブレイク別ゲート（救済）：HH/HL または breakout + 継続確率 + 強度
+    # -----------------------------------------------------------------
+    breakout_pass = bool((breakout_ok or hhhl_ok) and (cont_best >= 0.58) and (max(strength, breakout_strength) >= 0.38) and (macro_risk <= 0.82))
+
+    # -----------------------------------------------------------------
+    # 10) 信頼度（0..1）
+    # -----------------------------------------------------------------
+    confidence = _clamp(0.32 + 0.38 * strength + 0.20 * (cont_best - 0.5) + 0.10 * (rr - 1.0), 0.0, 1.0)
 
     veto: List[str] = []
     why = ""
+    gate_mode = "raw+mom"
 
-    # Primary gate: EV_eff vs threshold OR breakout_pass (allow slight EV miss)
-    if ev_eff >= dynamic_threshold:
+    if ev_gate >= dynamic_threshold:
         decision = "TRADE"
-        why = f"EV通過(raw+mom): {ev_eff:+.3f} ≥ 動的閾値 {dynamic_threshold:.3f}"
-    elif breakout_pass and (ev_eff >= dynamic_threshold - 0.03):
+        why = f"EV通過(raw+mom): {ev_gate:+.3f} ≥ 動的閾値 {dynamic_threshold:.3f}"
+    elif breakout_pass and (ev_gate >= dynamic_threshold - 0.04):
         decision = "TRADE"
-        why = f"BREAKOUT通過: EV {ev_eff:+.3f} / 閾値 {dynamic_threshold:.3f}（緩和適用）"
+        gate_mode = "breakout_rescue"
+        why = f"BREAKOUT通過: EV {ev_gate:+.3f} / 閾値 {dynamic_threshold:.3f}（救済）"
     else:
         decision = "NO_TRADE"
-        veto.append(f"EV不足(raw+mom): {ev_eff:+.3f} < 動的閾値 {dynamic_threshold:.3f}")
-        # Keep older phrasing too, so existing UI matches:
+        veto.append(f"EV不足(raw+mom): {ev_gate:+.3f} < 動的閾値 {dynamic_threshold:.3f}")
         veto.insert(0, f"EV不足(raw): {ev_raw:+.3f} < 動的閾値 {dynamic_threshold:.3f}")
         why = veto[0]
 
-    # Attach ctx for UI and debugging (always populated; avoids "ctx missing" silent failure)
+    # -----------------------------------------------------------------
+    # 11) 状態確率 / EV内訳（UI用）
+    # -----------------------------------------------------------------
+    # score -> normalize
+    s_up = max(0.0, p_up * (0.55 + 0.75 * strength) + max(0.0, mom) * 0.10)
+    s_dn = max(0.0, p_dn * (0.55 + 0.75 * strength) + max(0.0, -mom) * 0.10)
+    s_range = max(0.0, (1.0 - strength) * 0.95 + 0.05)
+    s_risk = max(0.0, macro_risk * 1.15 + (1.0 - cont_best) * 0.10)
+
+    tot = s_up + s_dn + s_range + s_risk
+    if tot <= 1e-12:
+        state_probs = {"trend_up": 0.25, "trend_down": 0.25, "range": 0.25, "risk_off": 0.25}
+    else:
+        state_probs = {
+            "trend_up": float(s_up / tot),
+            "trend_down": float(s_dn / tot),
+            "range": float(s_range / tot),
+            "risk_off": float(s_risk / tot),
+        }
+
+    # 状態別R（粗い近似。目的は“未計算に見えない”UIと、EVの説明可能性）
+    if direction == "LONG":
+        r_up = max(0.2, rr * 0.85)
+        r_dn = -1.0
+    else:
+        r_dn = max(0.2, rr * 0.85)
+        r_up = -1.0
+    r_range = (0.12 * rr - 0.35)
+    r_riskoff = -0.75
+
+    ev_contribs = {
+        "trend_up": float(state_probs["trend_up"] * r_up),
+        "trend_down": float(state_probs["trend_down"] * r_dn),
+        "range": float(state_probs["range"] * r_range),
+        "risk_off": float(state_probs["risk_off"] * r_riskoff),
+    }
+
+    # -----------------------------------------------------------------
+    # 12) ctx（デバッグ/可視化用）
+    # -----------------------------------------------------------------
     ctx_out = {
         "pair": pair,
         "phase_label": phase,
@@ -408,21 +544,58 @@ def get_ai_order_strategy(
         "dynamic_threshold_mult": float(thr_mult),
         "breakout_pass": bool(breakout_pass),
         "cont_best": float(cont_best),
+        "len": int(len(df)),
     }
 
-    return {
+    # Trail SL: エントリーから0.5R戻し（見せ方用）
+    trail_sl = sl
+    try:
+        dist_sl = abs(entry - sl)
+        if dist_sl > 0:
+            trail_sl = entry - 0.5*dist_sl if direction == "LONG" else (entry + 0.5*dist_sl)
+    except Exception:
+        trail_sl = sl
+
+    # 返却（main互換キーを全て用意）
+    plan = {
         "decision": decision,
         "direction": direction,
+        "side": side,
+        "order_type": "MARKET",
+        "entry_type": "MARKET_NOW",
+
         "entry": float(entry),
+        "entry_price": float(entry),
         "sl": float(sl),
+        "stop_loss": float(sl),
         "tp": float(tp),
+        "take_profit": float(tp),
+
+        "trail_sl": float(trail_sl),
+        "extend_factor": 1.0,
+
         "ev_raw": float(ev_raw),
         "ev_adj": float(ev_adj),
+
+        "expected_R_ev_raw": float(ev_raw),
+        "expected_R_ev_adj": float(ev_adj),
+        "expected_R_ev": float(ev_gate),
+
         "dynamic_threshold": float(dynamic_threshold),
+        "gate_mode": gate_mode,
+
         "confidence": float(confidence),
+        "p_win": float(p_win),
+        "p_win_ev": float(p_win),
+
         "why": why,
-        "veto": veto,
+        "veto": list(veto),
+        "veto_reasons": list(veto),
+
+        "state_probs": state_probs,
+        "ev_contribs": ev_contribs,
+
         "_ctx": ctx_out,
     }
-
+    return plan
 # End of file
