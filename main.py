@@ -1514,6 +1514,54 @@ def _lot_multiplier(global_risk_index: Any, alpha: Any, floor: float = 0.2, ceil
 
 
 
+
+def _apply_swing_lot_guards(lot_mult: float, plan: Any) -> float:
+    """Apply mandatory swing risk shrink to lot multiplier (display-only)."""
+    try:
+        x = float(lot_mult)
+    except Exception:
+        x = 1.0
+
+    ctx = {}
+    try:
+        if isinstance(plan, dict):
+            ctx = plan.get("_ctx", {}) if isinstance(plan.get("_ctx", {}), dict) else {}
+    except Exception:
+        ctx = {}
+
+    # Event density shrink (mandatory)
+    try:
+        ef = float(ctx.get("event_risk_factor") or 0.0)
+        ef = max(0.0, min(1.0, ef))
+        x *= max(0.20, 1.0 - 0.60 * ef)
+    except Exception:
+        pass
+
+    # Thu/Fri week-cross rule (mandatory)
+    try:
+        wc = float(ctx.get("weekcross_risk") or 0.0)
+        if wc > 0.0:
+            x *= 0.75
+    except Exception:
+        pass
+
+    # Weekend gap risk
+    try:
+        wknd = float(ctx.get("weekend_risk") or 0.0)
+        if wknd > 0.0:
+            x *= 0.60
+    except Exception:
+        pass
+
+    # clamp
+    if x < 0.20:
+        x = 0.20
+    if x > 1.00:
+        x = 1.00
+    return float(x)
+
+
+
 def _jp_side(side: str) -> str:
     s = str(side or "").upper()
     if s in ("BUY", "LONG"):
@@ -1524,11 +1572,19 @@ def _jp_side(side: str) -> str:
 
 def _jp_order_kind(kind: str) -> str:
     k = str(kind or "").upper()
-    if k in ("MARKET", "MKT", "MARKET_NOW", "NOW"):
+
+    # finer-grain entry types (internal codes)
+    if k in ("LIMIT_PULLBACK",):
+        return "指値（押し目/戻り）"
+    if k in ("STOP_BREAKOUT", "STOP_BREAKDOWN"):
+        return "逆指値（ブレイク）"
+
+    # generic kinds
+    if k in ("MARKET", "MKT", "MARKET_NOW", "NOW") or k.startswith("MARKET"):
         return "成行"
-    if k in ("LIMIT", "LMT"):
+    if k in ("LIMIT", "LMT") or k.startswith("LIMIT"):
         return "指値"
-    if k in ("STOP", "STP", "STOP_MARKET"):
+    if k in ("STOP", "STP", "STOP_MARKET") or k.startswith("STOP"):
         return "逆指値"
     return "—"
 
@@ -2870,17 +2926,45 @@ with st.sidebar:
         st.markdown("---")
         st.markdown("##### 📅 経済指標/イベント リスクガード")
         st.session_state["event_guard_enable"] = st.checkbox(
-            "経済指標の近接をリスクに反映（推奨）",
+            "経済指標の近接をリスクに反映（必須）",
             value=True,
+            disabled=True,
             help="無料の経済指標カレンダー（週次JSON）から、直近の高/中インパクト指標を取得して閾値・見送りに反映します。"
         )
+        st.caption("※スイング運用の安全装置として、イベントガード／レンジ時プレブロック／成行禁止（高インパクト近接）／イベント密度によるロット縮退／木金ルールは常時有効です。")
         st.session_state["event_block_high_impact_window"] = st.checkbox(
-            "高インパクト指標の前後は強制見送り（±60分）",
+            "高インパクト指標の前後は強制見送り（±60分・必須）",
             value=True,
+            disabled=True,
             help="発表前後はスプレッド拡大/ギャップ/急変が起きやすいため、運用上の安全弁として推奨。"
         )
         st.session_state["event_window_minutes"] = st.slider("高インパクト窓（分）", 15, 180, 60, 5)
-        st.session_state["event_horizon_hours"] = st.slider("先読み時間（h）", 24, 168, 72, 6, help="この時間範囲のイベントだけを評価します。")
+        st.session_state["event_horizon_hours"] = st.slider("先読み時間（h）", 24, 168, 168, 6, help="この時間範囲のイベントだけを評価します。")
+        # --- Swing (1週〜1か月) 向けの調整 ---
+        # 数時間のイベントは「デイトレ判定」ではなく、"エントリー直後の実行リスク(滑り/急変/初期SL触れ)" を抑えるためのものです。
+        # スイング運用では、影響を「数時間」ではなく「1〜2日スケール」でも加味するのが現実的なので、減衰スケールを用意します。
+        st.session_state["event_hours_scale"] = st.slider(
+            "スイング用：イベント影響の減衰スケール（h）",
+            4, 72, 24, 2,
+            help="24hなら『数時間』だけでなく1〜2日スケールでもイベントリスクを加味します。小さいほどデイトレ寄り、大きいほどスイング寄り。"
+        )
+        st.session_state["event_threshold_add"] = st.slider(
+            "イベントによる動的閾値の上乗せ（最大R）",
+            0.0, 0.30, 0.12, 0.01,
+            help="イベント密度が高いほど見送りが増えます。スイングは0.10〜0.18が目安。"
+        )
+        st.session_state["event_preblock_range_enable"] = st.checkbox(
+            "レンジ優勢かつ高インパクトが近いときは見送り（必須）",
+            value=True,
+            disabled=True,
+            help="RANGE局面は指標でレンジ抜け→急反転が起きやすいため、根拠が弱い場合は発表後に再判定します。"
+        )
+        st.session_state["event_preblock_hours"] = st.slider(
+            "上記見送りの判定時間（h）",
+            0, 48, 24, 1,
+            help="スイング運用でも『エントリー直後の急変』は致命傷になり得るため、24h程度を推奨。"
+        )
+
         st.session_state["event_impacts"] = st.multiselect(
             "対象インパクト",
             ["High", "Medium", "Low", "Holiday"],
@@ -2889,6 +2973,12 @@ with st.sidebar:
         )
         with st.expander("（上級）イベントソース設定", expanded=False):
             st.session_state["event_timezone"] = st.text_input("表示タイムゾーン", value="Asia/Tokyo")
+            st.session_state["event_norm"] = st.slider(
+                "（上級）イベントリスク正規化係数（大きいほど効きが弱い）",
+                1.0, 8.0, 3.0, 0.25,
+                help="イベントスコアを0..1に正規化する係数です。値を上げるとイベントによる見送りが減ります。"
+            )
+
             st.session_state["event_calendar_url"] = st.text_input(
                 "カレンダーURL（JSON）",
                 value="https://nfs.faireconomy.media/ff_calendar_thisweek.json",
@@ -2996,6 +3086,12 @@ with tabs[0]:
                     "event_impacts": list(st.session_state.get("event_impacts", ["High","Medium"]) or ["High","Medium"]),
                     "event_timezone": str(st.session_state.get("event_timezone","Asia/Tokyo") or "Asia/Tokyo"),
                     "event_calendar_url": str(st.session_state.get("event_calendar_url","https://nfs.faireconomy.media/ff_calendar_thisweek.json") or "https://nfs.faireconomy.media/ff_calendar_thisweek.json"),
+                    "event_hours_scale": float(st.session_state.get("event_hours_scale", 24.0) or 24.0),
+                    "event_norm": float(st.session_state.get("event_norm", 3.0) or 3.0),
+                    "event_threshold_add": float(st.session_state.get("event_threshold_add", 0.12) or 0.12),
+                    "event_preblock_range_enable": bool(st.session_state.get("event_preblock_range_enable", True)),
+                    "event_preblock_hours": float(st.session_state.get("event_preblock_hours", 24.0) or 24.0),
+
                 })
             except Exception:
                 pass
@@ -3113,7 +3209,7 @@ with tabs[0]:
 
             plan = dict(plan or {})
 
-            plan["_lot_multiplier_reco"] = float(lot_mult)
+            plan["_lot_multiplier_reco"] = float(_apply_swing_lot_guards(lot_mult, plan))
 
             plan_ui = plan
             try:
@@ -3254,6 +3350,12 @@ with tabs[0]:
                 "event_impacts": list(st.session_state.get("event_impacts", ["High","Medium"]) or ["High","Medium"]),
                 "event_timezone": str(st.session_state.get("event_timezone","Asia/Tokyo") or "Asia/Tokyo"),
                 "event_calendar_url": str(st.session_state.get("event_calendar_url","https://nfs.faireconomy.media/ff_calendar_thisweek.json") or "https://nfs.faireconomy.media/ff_calendar_thisweek.json"),
+                    "event_hours_scale": float(st.session_state.get("event_hours_scale", 24.0) or 24.0),
+                    "event_norm": float(st.session_state.get("event_norm", 3.0) or 3.0),
+                    "event_threshold_add": float(st.session_state.get("event_threshold_add", 0.12) or 0.12),
+                    "event_preblock_range_enable": bool(st.session_state.get("event_preblock_range_enable", True)),
+                    "event_preblock_hours": float(st.session_state.get("event_preblock_hours", 24.0) or 24.0),
+
             })
         except Exception:
             pass
@@ -3305,7 +3407,7 @@ with tabs[0]:
 
         plan = dict(plan or {})
 
-        plan["_lot_multiplier_reco"] = float(lot_mult)
+        plan["_lot_multiplier_reco"] = float(_apply_swing_lot_guards(lot_mult, plan))
 
         plan_ui = plan
         try:
