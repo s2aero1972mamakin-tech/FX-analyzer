@@ -1332,6 +1332,135 @@ if reco.get("note"):
 st.json(reco.get("q", {}))
 
 
+
+
+def _render_hold_manage_panel(pair_label: str, ctx_in: Dict[str, Any], plan_ui: Dict[str, Any], feats: Dict[str, Any], keys: Dict[str, str]):
+    """保有中のイベント接近対応（縮退/一部利確/建値移動/新規追加禁止）を表示。
+    - 実際の建玉をアプリが自動で把握することはできないので、運用者が「保有開始/解除」を押して管理します。
+    - ルール自体は logic.py 側に統合済み（swing_hold_v1）。
+    """
+    try:
+        st.markdown("### 📌 保有ポジション管理（イベント接近時の対応）")
+        st.caption("保有中だけ使います。**イベント接近・週末/週跨ぎ**では、\n- 追加建て禁止\n- 建玉縮退\n- 一部利確\n- 建値（BE）へストップ移動\nを自動で推奨します（発注はしません）。")
+
+        # ctx_in に _df が入っている前提（_build_ctx で付与）
+        df_ref = _first_non_none(ctx_in, ("_df", "df", "_price_df", "_df_price", "_df_hist"))
+        if not isinstance(df_ref, pd.DataFrame) or df_ref.empty:
+            st.info("価格データが無いので保有管理は表示できません。")
+            return
+
+        # Session state storage
+        pos_key = "open_position"
+        pos = st.session_state.get(pos_key, None)
+        if not isinstance(pos, dict):
+            pos = None
+
+        # Current plan snapshot (for register)
+        side_plan = str(plan_ui.get("side") or ("BUY" if str(plan_ui.get("direction")) == "LONG" else "SELL"))
+        entry_plan = float(plan_ui.get("entry") or plan_ui.get("entry_price") or ctx_in.get("price") or 0.0)
+        sl_plan = float(plan_ui.get("sl") or plan_ui.get("stop_loss") or 0.0)
+        tp_plan = float(plan_ui.get("tp") or plan_ui.get("take_profit") or 0.0)
+
+        c1, c2, c3 = st.columns([1,1,2])
+        with c1:
+            if st.button("📌 このプランで保有開始として登録", key=f"pos_register_{pair_label}"):
+                st.session_state[pos_key] = {
+                    "pair": str(pair_label),
+                    "side": str(side_plan).upper(),
+                    "entry": float(entry_plan),
+                    "sl": float(sl_plan),
+                    "tp": float(tp_plan),
+                    "opened_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                }
+                st.success("保有ポジションとして登録しました（このアプリは発注しません）。")
+                st.rerun()
+        with c2:
+            if st.button("🧹 保有解除", key=f"pos_clear_{pair_label}"):
+                if pos_key in st.session_state:
+                    st.session_state.pop(pos_key, None)
+                st.success("保有ポジションを解除しました。")
+                st.rerun()
+        with c3:
+            st.caption("※実際にポジションを持った時だけ『保有開始』を押してください。解除を忘れると管理提案が残ります。")
+
+        # Only show when position exists and matches pair
+        pos = st.session_state.get(pos_key, None)
+        if not isinstance(pos, dict) or str(pos.get("pair")) != str(pair_label):
+            st.info("このペアの保有ポジションが未登録です。保有中なら『保有開始として登録』を押してください。") 
+            return
+
+        # Current price (auto + override)
+        try:
+            px_auto = float(df_ref["Close"].astype(float).iloc[-1])
+        except Exception:
+            px_auto = float(ctx_in.get("price") or entry_plan or 0.0)
+        step = 0.001 if "/JPY" not in str(pair_label) else 0.001  # 最低限（UI崩れ防止）
+        px_now = st.number_input("現在値（自動入力。必要なら修正）", value=float(px_auto), step=float(step), format="%.6f")
+        pos2 = dict(pos)
+        pos2["current_price"] = float(px_now)
+        pos2["open"] = True
+
+        # Call logic again for holding management recommendation (manage_only)
+        ctx2 = dict(ctx_in or {})
+        ctx2["position"] = pos2
+        ctx2["position_open"] = True
+        ctx2["manage_only"] = True
+
+        try:
+            plan2 = logic.get_ai_order_strategy(price_df=df_ref, pair=pair_label, context_data=ctx2, ext_features=feats, api_key=keys.get("OPENAI_API_KEY", ""))
+            hold = plan2.get("hold_manage", {}) or {}
+        except Exception as e:
+            st.error(f"保有管理の計算でエラー: {e}")
+            return
+
+        if not isinstance(hold, dict) or not hold:
+            st.info("保有管理の推奨はありません（position 情報不足、またはガード条件に該当なし）。")
+            return
+
+        # Summary
+        side_jp = "買い" if str(hold.get("side")).upper() == "BUY" else "売り"
+        ur = float(hold.get("unrealized_R") or 0.0)
+        nh = hold.get("event_next_high_hours", None)
+
+        cc1, cc2, cc3, cc4 = st.columns(4)
+        cc1.metric("保有", f"{side_jp}")
+        cc2.metric("含み損益（R）", f"{ur:+.2f}")
+        cc3.metric("追加建て", "禁止" if bool(hold.get("no_add")) else "許可")
+        cc4.metric("次の高インパクト", ("—" if nh is None else f"{float(nh):.1f}h"))
+
+        # Recommended actions
+        st.markdown("#### 推奨アクション（発注は運用者が実行）")
+        actions = hold.get("actions", []) or []
+        notes = hold.get("notes", []) or []
+
+        # Convert into human-readable recommendations
+        rec_lines = []
+        if bool(hold.get("no_add")):
+            rec_lines.append("- ✅ **新規追加は禁止**（イベント/週末/週跨ぎガード）")
+        mult = float(hold.get("reduce_size_mult") or 1.0)
+        if mult < 0.999:
+            rec_lines.append(f"- ✅ **建玉縮退**：推奨サイズ係数 ×{mult:.2f}（例：半分利確/縮小）")
+        pt = float(hold.get("partial_tp_ratio") or 0.0)
+        if pt > 0.0:
+            rec_lines.append(f"- ✅ **一部利確**：{pt*100:.0f}% を目安")
+        if bool(hold.get("move_sl_to_be")) and hold.get("new_sl_reco") is not None:
+            rec_lines.append(f"- ✅ **建値移動/防御**：SL を {float(hold.get('new_sl_reco')):.3f} 付近へ（BE）")
+        if not rec_lines:
+            rec_lines.append("- （特別な推奨はありません）")
+
+        st.markdown("\n".join(rec_lines))
+
+        if notes:
+            with st.expander("根拠（メモ）", expanded=False):
+                for n in notes:
+                    st.write("- " + str(n))
+
+    except Exception:
+        # Never break the main screen because of this optional panel
+        return
+
+
+
 def _render_logging_panel(pair_label: str, plan_ui: Dict[str, Any], ctx: Dict[str, Any], feats: Dict[str, Any],
                           price_meta: Dict[str, Any], ext_meta: Dict[str, Any]):
     """UI: save signal + record trade outcome. Keeps everything optional and non-blocking."""
@@ -3266,6 +3395,10 @@ with tabs[0]:
         _render_risk_dashboard(plan_ui_best, feats, ext_meta=best.get("_ext_meta", {}))
 
         _render_ai_engine_panel(best.get("_ctx", {}), plan_ui_best)
+
+        # Holding management (event/weekend approach)
+        _render_hold_manage_panel(best["pair"], best.get("_ctx", {}), plan_ui_best, feats, keys)
+
 
         # Logging (optional)
         _render_logging_panel(best["pair"], plan_ui_best, best.get("_ctx", {}), feats, best.get("_price_meta", {}), best.get("_ext_meta", {}))
