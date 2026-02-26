@@ -2746,7 +2746,7 @@ with st.sidebar:
     trade_axis = st.selectbox("時間軸（保有期間）", ["スイング（1週〜1ヶ月）", "中長期（1〜3ヶ月）"], index=0)
     style_name = st.selectbox("運用スタイル（見送りライン）", ["標準", "保守", "攻撃"], index=0)
     priority = st.selectbox("優先度", ["バランス（推奨）", "勝率優先（見送り増）"], index=0)
-    st.session_state["trend_assist_enable"] = st.checkbox("🤖 トレンド捕獲アシスト（実験）", value=True, help="強いトレンド局面では期待値に小さな加点を入れて、取り逃しを減らします。")
+    st.session_state["trend_assist_enable"] = st.checkbox("🤖 トレンド捕獲アシスト（実験）", value=False, help="強いトレンド局面では期待値に小さな加点を入れて、取り逃しを減らします。")
     st.session_state['priority_mode'] = priority
 
     # 時間軸プリセット（詳細設定で上書き可）
