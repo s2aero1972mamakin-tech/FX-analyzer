@@ -302,6 +302,193 @@ def _safe_float(x, default=0.0) -> float:
     except Exception:
         return default
 
+
+
+def _compute_unrealized_R(side: str, entry: float, sl: float, price: float) -> float:
+    """Unrealized PnL in R units (R = initial stop distance). Positive is profit."""
+    try:
+        side = str(side or "").upper()
+        entry = float(entry)
+        sl = float(sl)
+        price = float(price)
+        risk = abs(entry - sl)
+        if risk <= 1e-9:
+            return 0.0
+        if side == "SELL":
+            return (entry - price) / risk
+        return (price - entry) / risk
+    except Exception:
+        return 0.0
+
+
+def _hold_manage_reco(
+    pair: str,
+    df: pd.DataFrame,
+    ctx_in: Dict[str, Any],
+    plan_like: Dict[str, Any],
+    ev_meta: Dict[str, Any],
+    weekend_risk: float,
+    weekcross_risk: float,
+) -> Dict[str, Any]:
+    """Position-holding management rules for swing (event/weekend approach).
+    Returns recommendation dict; empty dict if no position info.
+    """
+    try:
+        pos = ctx_in.get("position") or ctx_in.get("pos") or {}
+        if not isinstance(pos, dict):
+            pos = {}
+        pos_open = bool(ctx_in.get("position_open", False) or pos.get("open") or pos.get("is_open") or (len(pos) > 0))
+        if not pos_open:
+            return {}
+        # Get position params (fallback to plan)
+        side = str(pos.get("side") or pos.get("pos_side") or plan_like.get("side") or "").upper()
+        if side not in ("BUY", "SELL"):
+            side = str(plan_like.get("side") or "BUY").upper()
+        entry = float(pos.get("entry") or pos.get("entry_price") or pos.get("pos_entry") or plan_like.get("entry") or plan_like.get("entry_price") or 0.0)
+        sl = float(pos.get("sl") or pos.get("stop_loss") or pos.get("pos_sl") or plan_like.get("sl") or plan_like.get("stop_loss") or 0.0)
+        tp = float(pos.get("tp") or pos.get("take_profit") or pos.get("pos_tp") or plan_like.get("tp") or plan_like.get("take_profit") or 0.0)
+
+        # Current price (user can override; else latest close)
+        price = None
+        for k in ("current_price", "price", "last_price", "mark_price"):
+            if k in pos and pos.get(k) is not None:
+                price = pos.get(k)
+                break
+        if price is None:
+            price = ctx_in.get("pos_current_price", None)
+        if price is None:
+            try:
+                price = float(df["Close"].astype(float).iloc[-1]) if isinstance(df, pd.DataFrame) and (not df.empty) else float(entry)
+            except Exception:
+                price = float(entry)
+        price = float(price)
+
+        unrealized_R = pos.get("unrealized_R", None)
+        if unrealized_R is None:
+            unrealized_R = _compute_unrealized_R(side, entry, sl, price)
+        else:
+            unrealized_R = float(unrealized_R)
+
+        dd_R = float(pos.get("dd_R") or pos.get("max_dd_R") or pos.get("drawdown_R") or 0.0)
+
+        nh = ev_meta.get("next_high_hours", None)
+        try:
+            nh_f = (float(nh) if nh is not None else None)
+        except Exception:
+            nh_f = None
+
+        event_factor = float(ev_meta.get("factor", 0.0) or 0.0)
+        window_high = bool(ev_meta.get("window_high", False))
+
+        # ---- Mandatory swing holding rules (not optional) ----
+        # Base thresholds (hours)
+        no_add_h = float(ctx_in.get("hold_no_add_hours", 48.0) or 48.0)
+        reduce_h = float(ctx_in.get("hold_reduce_hours", 18.0) or 18.0)
+        be_h = float(ctx_in.get("hold_breakeven_hours", 12.0) or 12.0)
+        partial_h = float(ctx_in.get("hold_partial_tp_hours", 18.0) or 18.0)
+
+        # Guardrails
+        no_add_h = max(6.0, min(168.0, no_add_h))
+        reduce_h = max(3.0, min(72.0, reduce_h))
+        be_h = max(1.0, min(48.0, be_h))
+        partial_h = max(1.0, min(72.0, partial_h))
+
+        notes: List[str] = []
+        actions: List[str] = []
+
+        no_add = False
+        if (nh_f is not None) and (nh_f <= no_add_h):
+            no_add = True
+            notes.append(f"高インパクト指標が{nh_f:.1f}時間以内 → 追加建て禁止（スイングでも実行リスク回避）")
+        if float(weekend_risk or 0.0) > 0.0:
+            no_add = True
+            notes.append("週末ギャップリスク → 追加建て禁止")
+        if float(weekcross_risk or 0.0) > 0.0:
+            no_add = True
+            notes.append("週跨ぎ（木金）リスク → 追加建て禁止")
+
+        # Size shrink recommendation (0.2..1.0)
+        reduce_mult = 1.0
+        if (nh_f is not None) and (nh_f <= reduce_h):
+            # base shrink by event factor
+            reduce_mult = min(reduce_mult, float(_clamp(1.0 - 0.60 * event_factor, 0.20, 1.00)))
+            if unrealized_R >= 0.20:
+                reduce_mult = min(reduce_mult, 0.50)
+                actions.append("REDUCE_SIZE")
+                notes.append("イベント接近＆含み益あり → 建玉の一部縮退（例：半分）を推奨")
+            else:
+                reduce_mult = min(reduce_mult, 0.70)
+                actions.append("REDUCE_SIZE")
+                notes.append("イベント接近 → 建玉縮退を推奨（リスク低減）")
+
+        if float(weekend_risk or 0.0) > 0.0:
+            reduce_mult = min(reduce_mult, 0.60)
+            if "REDUCE_SIZE" not in actions:
+                actions.append("REDUCE_SIZE")
+            notes.append("週末前 → 建玉縮退を推奨（ギャップ対策）")
+
+        # Partial take profit (0..1)
+        partial_tp = 0.0
+        if (nh_f is not None) and (nh_f <= partial_h) and (unrealized_R >= 0.60):
+            partial_tp = max(partial_tp, 0.50)
+            actions.append("PARTIAL_TP")
+            notes.append("含み益0.6R以上＆イベント近接 → 半分利確を推奨")
+        if window_high and (unrealized_R >= 0.30):
+            partial_tp = max(partial_tp, 0.50)
+            if "PARTIAL_TP" not in actions:
+                actions.append("PARTIAL_TP")
+            notes.append("高インパクト窓内 → 半分利確を推奨（スリッページ/乱高下対策）")
+
+        # Move SL to breakeven / tighten
+        move_be = False
+        new_sl = None
+        if (nh_f is not None) and (nh_f <= be_h) and (unrealized_R >= 0.15):
+            move_be = True
+            new_sl = float(entry)
+            actions.append("MOVE_SL_TO_BE")
+            notes.append("イベント接近 → ストップを建値（BE）へ移動を推奨（勝ちを負けにしない）")
+        if float(weekend_risk or 0.0) > 0.0 and (unrealized_R >= 0.15):
+            move_be = True
+            if new_sl is None:
+                new_sl = float(entry)
+            if "MOVE_SL_TO_BE" not in actions:
+                actions.append("MOVE_SL_TO_BE")
+            notes.append("週末前 → 建値/浅い利確で防御を推奨")
+
+        # Round new SL to pip
+        try:
+            if new_sl is not None:
+                new_sl = _round_to_pip(float(new_sl), pair)
+        except Exception:
+            pass
+
+        # Compose
+        out = {
+            "version": "swing_hold_v1",
+            "pair": str(pair),
+            "side": side,
+            "entry": float(entry),
+            "sl": float(sl),
+            "tp": float(tp),
+            "current_price": float(price),
+            "unrealized_R": float(unrealized_R),
+            "dd_R": float(dd_R),
+            "event_next_high_hours": nh_f,
+            "event_window_high": bool(window_high),
+            "event_risk_factor": float(event_factor),
+            "weekend_risk": float(weekend_risk or 0.0),
+            "weekcross_risk": float(weekcross_risk or 0.0),
+            "no_add": bool(no_add),
+            "reduce_size_mult": float(_clamp(reduce_mult, 0.20, 1.00)),
+            "partial_tp_ratio": float(_clamp(partial_tp, 0.0, 1.0)),
+            "move_sl_to_be": bool(move_be),
+            "new_sl_reco": (float(new_sl) if new_sl is not None else None),
+            "actions": list(dict.fromkeys(actions)),  # unique preserve order
+            "notes": notes,
+        }
+        return out
+    except Exception:
+        return {}
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
@@ -806,6 +993,21 @@ def get_ai_order_strategy(
     why = ""
     gate_mode = "raw+mom"
 
+    # -----------------------------------------------------------------
+    # 10.5) phase_label（表示用ラベル）
+    # -----------------------------------------------------------------
+    # 以前の版では phase_label を参照する箇所があるのに未定義で NameError となっていました。
+    # ここでは内部推定した phase を、UI/ガードで扱いやすいラベルへ正規化します。
+    if str(phase) == "RANGE":
+        phase_label = "RANGE"
+    elif str(phase) in ("UP_TREND", "BREAKOUT_UP", "TRANSITION_UP"):
+        phase_label = "UP_TREND"
+    elif str(phase) in ("DOWN_TREND", "BREAKOUT_DOWN", "TRANSITION_DOWN"):
+        phase_label = "DOWN_TREND"
+    else:
+        phase_label = str(phase)
+
+
     # 高インパクト指標の“直前直後”は、スリッページ/ギャップの不確実性が高いので強制見送り（任意）
     if event_guard_enable and event_block_window and bool(ev_meta.get("window_high", False)):
         decision = "NO_TRADE"
@@ -1026,6 +1228,27 @@ def get_ai_order_strategy(
     except Exception:
         pass
 
+
+    # -----------------------------------------------------------------
+    # 12.7) 保有中のイベント接近対応（縮退/一部利確/建値移動/追加禁止）
+    #   - スイング運用の必須ガード。OFF不可（ルールとして常時有効）
+    #   - position 情報が無い場合は何も返さない（= 推奨なし）
+    # -----------------------------------------------------------------
+    hold_manage = _hold_manage_reco(
+        pair=str(pair),
+        df=df,
+        ctx_in=ctx_in,
+        plan_like={"side": side, "entry": entry, "sl": sl, "tp": tp},
+        ev_meta=(ev_meta or {}),
+        weekend_risk=float(weekend_risk or 0.0),
+        weekcross_risk=float(weekcross_risk or 0.0),
+    )
+    if isinstance(hold_manage, dict) and hold_manage:
+        try:
+            ctx_out["hold_manage"] = hold_manage
+        except Exception:
+            pass
+
 # Trail SL: エントリーから0.5R戻し（見せ方用）
     trail_sl = sl
     try:
@@ -1074,6 +1297,7 @@ def get_ai_order_strategy(
         "state_probs": state_probs,
         "ev_contribs": ev_contribs,
 
+        "hold_manage": (hold_manage if isinstance(hold_manage, dict) else {}),
         "_ctx": ctx_out,
     }
     return plan
