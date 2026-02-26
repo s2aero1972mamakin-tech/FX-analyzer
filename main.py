@@ -1184,7 +1184,12 @@ def _render_ai_engine_panel(ctx: Dict[str, Any], plan_ui: Dict[str, Any]):
         st.caption("※継続確率は、直近10年（取得できる範囲）のOHLCから簡易学習したロジスティック回帰モデル（統計推定）です。")
 
         # Target zones (not a prediction)
-        df_ref = ctx.get("_df") or ctx.get("df") or ctx.get("_price_df") or ctx.get("_df_price") or ctx.get("_df_hist")
+        df_ref = None
+        for _k in ("_df", "df", "_price_df", "_df_price", "_df_hist"):
+            _v = ctx.get(_k)
+            if _v is not None:
+                df_ref = _v
+                break
         tz = _estimate_target_zones(df_ref if isinstance(df_ref, pd.DataFrame) else None)
         if tz.get("ok"):
             st.markdown("#### 参考ターゲットゾーン（天井“予知”ではなく、構造・ATRに基づく目安）")
