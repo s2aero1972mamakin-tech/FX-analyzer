@@ -57,6 +57,18 @@ def _pair_to_ccys(pair: str) -> Tuple[str, str]:
         return (s[:3], s[3:6])
     return ("", "")
 
+
+def _pip_size(pair: str) -> float:
+    s = (pair or "").upper()
+    # Heuristic: JPY pairs use 0.01, others 0.0001
+    return 0.01 if "JPY" in s else 0.0001
+
+def _round_to_pip(x: float, pair: str) -> float:
+    try:
+        p = _pip_size(pair)
+        return float(round(float(x) / p) * p)
+    except Exception:
+        return float(x)
 def _fetch_ff_calendar(url: str, timeout: int = 12, ttl_sec: int = 1800) -> Tuple[Optional[List[dict]], str]:
     """
     Fetch weekly economic calendar JSON with very small cache to avoid rate limits.
@@ -130,6 +142,8 @@ def _compute_event_risk(
     *,
     now_tz: str = "Asia/Tokyo",
     horizon_hours: int = 72,
+    hours_scale: float = 24.0,
+    norm: float = 3.0,
     impacts: Optional[List[str]] = None,
     high_window_minutes: int = 60,
     url: str = _FF_CAL_URL_DEFAULT,
@@ -219,7 +233,9 @@ def _compute_event_risk(
     for ev in upcoming:
         impact = ev["impact"]
         hrs = float(ev["hours"])
-        score += float(w.get(impact, 0.4)) / (1.0 + max(0.0, hrs))
+        # swing-aware: score decays over 'hours_scale' (default=24h). Smaller scale => more intraday.
+        denom = 1.0 + (max(0.0, hrs) / max(1e-6, float(hours_scale)))
+        score += float(w.get(impact, 0.4)) / denom
         if impact == "High":
             if next_high is None:
                 next_high = hrs
@@ -228,7 +244,7 @@ def _compute_event_risk(
                 window_high = True
 
     # normalize to factor 0..1 (heuristic)
-    factor = _clamp(score / 1.25, 0.0, 1.0)
+    factor = _clamp(score / max(1e-6, float(norm)), 0.0, 1.0)
 
     # trim upcoming list for UI
     upcoming_ui = []
@@ -681,9 +697,13 @@ def get_ai_order_strategy(
     # -----------------------------------------------------------------
     # 重要: 以前の版では macro_risk のみで、"指標の近接"（発表まで何時間か）を
     # 閾値や見送りに反映していませんでした。ここで明示的に加えます。
-    event_guard_enable = bool(ctx_in.get("event_guard_enable", True))
-    event_block_window = bool(ctx_in.get("event_block_high_impact_window", True))
-    event_horizon_hours = int(_safe_float(ctx_in.get("event_horizon_hours", 72), 72))
+    # --- Mandatory swing event guard (always ON; not user-optional) ---
+    # The system must protect swing entries from execution-risk spikes around macro events.
+    # Operators can tune numeric parameters, but cannot disable these guards.
+    event_guard_enable = True
+    event_block_window = True
+    # Swing horizon: at least 1 week of events (this-week feed, cached); clamp later.
+    event_horizon_hours = int(_safe_float(ctx_in.get("event_horizon_hours", 168), 168))
     event_window_minutes = int(_safe_float(ctx_in.get("event_window_minutes", 60), 60))
     event_impacts = ctx_in.get("event_impacts", None)
     if not isinstance(event_impacts, list) or not event_impacts:
@@ -698,6 +718,8 @@ def get_ai_order_strategy(
                 pair,
                 now_tz=str(ctx_in.get("event_timezone", "Asia/Tokyo") or "Asia/Tokyo"),
                 horizon_hours=event_horizon_hours,
+                hours_scale=float(ctx_in.get("event_hours_scale", 24.0) or 24.0),
+                norm=float(ctx_in.get("event_norm", 3.0) or 3.0),
                 impacts=[str(x) for x in event_impacts],
                 high_window_minutes=event_window_minutes,
                 url=event_calendar_url,
@@ -707,6 +729,17 @@ def get_ai_order_strategy(
                        "window_high": False, "next_high_hours": None, "upcoming": []}
 
     weekend_risk = float(_compute_weekend_risk(now_tz=str(ctx_in.get("event_timezone", "Asia/Tokyo") or "Asia/Tokyo")))
+
+    # Thu/Fri are special for swing entries (weekend gap approaches + event clusters).
+    try:
+        _tz = ZoneInfo(str(ctx_in.get("event_timezone", "Asia/Tokyo") or "Asia/Tokyo"))
+        _now_local = datetime.now(tz=_tz)
+        _wd = int(_now_local.weekday())  # Mon=0..Sun=6
+        weekcross_risk = 1.0 if _wd in (3, 4) else 0.0  # Thu/Fri
+        weekcross_weekday = _wd
+    except Exception:
+        weekcross_risk = 0.0
+        weekcross_weekday = None
 # リスク調整 EV（表示用）
     risk_penalty = 0.12 + 0.55 * macro_risk   # 0.12..0.67
     ev_adj = ev_raw - 0.20 * risk_penalty
@@ -734,7 +767,14 @@ def get_ai_order_strategy(
 
     # イベント/週末リスクも閾値に反映（主ゲートが raw+mom の場合でも抑止できるように）
     try:
-        dynamic_threshold = dynamic_threshold + 0.06 * float(ev_meta.get("factor", 0.0) or 0.0) + 0.03 * float(weekend_risk or 0.0)
+        event_thr_add = float(ctx_in.get("event_threshold_add", 0.18) or 0.18)
+        # Swing運用ではイベントリスクは必須。小さくし過ぎるとガードにならないため下限を設けます。
+        event_thr_add = max(0.12, min(0.30, float(event_thr_add)))
+        weekend_thr_add = float(ctx_in.get("weekend_threshold_add", 0.03) or 0.03)
+        weekend_thr_add = max(0.0, min(0.20, float(weekend_thr_add)))
+        weekcross_thr_add = float(ctx_in.get("weekcross_threshold_add", 0.03) or 0.03)
+        weekcross_thr_add = max(0.0, min(0.20, float(weekcross_thr_add)))
+        dynamic_threshold = dynamic_threshold + event_thr_add * float(ev_meta.get("factor", 0.0) or 0.0) + weekend_thr_add * float(weekend_risk or 0.0) + weekcross_thr_add * float(weekcross_risk or 0.0)
     except Exception:
         pass
     dynamic_threshold = _clamp(dynamic_threshold, 0.02, 0.30)
@@ -773,18 +813,34 @@ def get_ai_order_strategy(
         reason = f"高インパクト指標の前後（±{event_window_minutes}分）のため見送り"
         veto.append(reason)
         why = reason
-    elif ev_gate >= dynamic_threshold:
-        decision = "TRADE"
-        why = f"EV通過(raw+mom): {ev_gate:+.3f} ≥ 動的閾値 {dynamic_threshold:.3f}"
-    elif breakout_pass and (ev_gate >= dynamic_threshold - 0.04):
-        decision = "TRADE"
-        gate_mode = "breakout_rescue"
-        why = f"BREAKOUT通過: EV {ev_gate:+.3f} / 閾値 {dynamic_threshold:.3f}（救済）"
-    else:
-        decision = "NO_TRADE"
-        veto.append(f"EV不足(raw+mom): {ev_gate:+.3f} < 動的閾値 {dynamic_threshold:.3f}")
-        veto.insert(0, f"EV不足(raw): {ev_raw:+.3f} < 動的閾値 {dynamic_threshold:.3f}")
-        why = veto[0]
+    elif event_guard_enable and str(phase_label) == "RANGE" and (not breakout_pass):
+        nh = ev_meta.get("next_high_hours", None)
+        pre_h = float(ctx_in.get("event_preblock_hours", 24.0) or 24.0)
+        pre_h = max(6.0, min(72.0, float(pre_h)))  # guardrail: keep meaningful for swing
+        if (nh is not None) and (float(nh) <= pre_h):
+            decision = "NO_TRADE"
+            gate_mode = "event_preblock"
+            reason = f"高インパクト指標まで{float(nh):.1f}h、レンジ優勢かつブレイク根拠なしのため見送り（発表後に再判定）"
+            veto.append(reason)
+            why = reason
+        else:
+            # fallback to EV gate if no preblock
+            pass
+    if not why:
+        # EV gate
+        if ev_gate >= dynamic_threshold:
+            decision = "TRADE"
+            why = f"EV通過(raw+mom): {ev_gate:+.3f} ≥ 動的閾値 {dynamic_threshold:.3f}"
+        elif breakout_pass and (ev_gate >= dynamic_threshold - 0.04):
+            decision = "TRADE"
+            gate_mode = "breakout_rescue"
+            why = f"BREAKOUT通過: EV {ev_gate:+.3f} / 閾値 {dynamic_threshold:.3f}（救済）"
+        else:
+            decision = "NO_TRADE"
+            veto.append(f"EV不足(raw+mom): {ev_gate:+.3f} < 動的閾値 {dynamic_threshold:.3f}")
+            veto.insert(0, f"EV不足(raw): {ev_raw:+.3f} < 動的閾値 {dynamic_threshold:.3f}")
+
+
 
     # -----------------------------------------------------------------
     # 11) 状態確率 / EV内訳（UI用）
@@ -856,7 +912,121 @@ def get_ai_order_strategy(
         "len": int(len(df)),
     }
 
-    # Trail SL: エントリーから0.5R戻し（見せ方用）
+    
+    # -----------------------------------------------------------------
+    # 11) Mandatory swing execution guards
+    #   A) High-impact が近い場合は「成行」を禁止（スイングでも実行リスクは致命傷になり得る）
+    #      -> 指値（pullback） or 逆指値（breakout）を提案し、SL/TP距離は維持
+    #   B) イベント密度が高いほど、推奨ロット係数を縮退させる（UI側で反映）
+    #   C) 週跨ぎ（木/金）は別ルール：閾値上乗せ & 成行禁止時間を拡張
+    # -----------------------------------------------------------------
+    order_type = "MARKET"
+    entry_type = "MARKET_NOW"
+    exec_guard_notes: List[str] = []
+    event_market_ban_active = False
+    event_market_ban_hours = float(ctx_in.get("event_market_ban_hours", 12.0) or 12.0)
+    if float(weekcross_risk or 0.0) > 0.0:
+        event_market_ban_hours = max(event_market_ban_hours, float(ctx_in.get("weekcross_market_ban_hours", 18.0) or 18.0))
+
+    try:
+        nh = ev_meta.get("next_high_hours", None)
+        if (nh is not None) and (float(nh) <= float(event_market_ban_hours)):
+            # High-impact is close enough to ban MARKET entry
+            event_market_ban_active = True
+    except Exception:
+        pass
+
+    if decision == "TRADE" and event_market_ban_active:
+        try:
+            nh = float(ev_meta.get("next_high_hours") or 0.0)
+        except Exception:
+            nh = None
+
+        # Determine ATR-based offset for pending order suggestion
+        try:
+            pip = _pip_size(pair)
+            atr_for_entry = max(float(atr14), float(pip) * 10.0)
+        except Exception:
+            pip = 0.01
+            atr_for_entry = float(atr14)
+
+        # Suggest order type by phase
+        if str(phase_label) == "RANGE" and (not breakout_pass):
+            # pullback limit (mean-reversion friendly)
+            if direction == "LONG":
+                new_entry = entry - 0.25 * atr_for_entry
+                order_type = "LIMIT"
+                entry_type = "LIMIT_PULLBACK"
+                msg = f"高インパクト指標まで{nh:.1f}hのため成行禁止 → 押し目指値を提案"
+            else:
+                new_entry = entry + 0.25 * atr_for_entry
+                order_type = "LIMIT"
+                entry_type = "LIMIT_PULLBACK"
+                msg = f"高インパクト指標まで{nh:.1f}hのため成行禁止 → 戻り売り指値を提案"
+        else:
+            # breakout stop (trend continuation)
+            if direction == "LONG":
+                new_entry = entry + 0.10 * atr_for_entry
+                order_type = "STOP"
+                entry_type = "STOP_BREAKOUT"
+                msg = f"高インパクト指標まで{nh:.1f}hのため成行禁止 → 上抜け逆指値を提案"
+            else:
+                new_entry = entry - 0.10 * atr_for_entry
+                order_type = "STOP"
+                entry_type = "STOP_BREAKOUT"
+                msg = f"高インパクト指標まで{nh:.1f}hのため成行禁止 → 下抜け逆指値を提案"
+
+        # Keep SL/TP distance by shifting around entry delta
+        try:
+            new_entry = _round_to_pip(float(new_entry), pair)
+            delta = float(new_entry) - float(entry)
+            entry = float(new_entry)
+            sl = _round_to_pip(float(sl) + delta, pair)
+            tp = _round_to_pip(float(tp) + delta, pair)
+        except Exception:
+            pass
+
+        exec_guard_notes.append(msg)
+        # Make the reason transparent (do not block by itself)
+        if why:
+            why = why + " / " + msg
+        else:
+            why = msg
+
+    # expose mandatory-guard signals for UI / logging
+    try:
+        ctx_out["weekcross_risk"] = float(weekcross_risk or 0.0)
+        ctx_out["weekcross_weekday"] = (int(weekcross_weekday) if weekcross_weekday is not None else None)
+        ctx_out["event_market_ban_active"] = bool(event_market_ban_active)
+        ctx_out["event_market_ban_hours"] = float(event_market_ban_hours)
+        ctx_out["exec_guard_notes"] = list(exec_guard_notes)
+        ctx_out["order_type_reco"] = str(order_type)
+        ctx_out["entry_type_reco"] = str(entry_type)
+        ef = float(ctx_out.get("event_risk_factor", 0.0) or 0.0)
+        ctx_out["lot_shrink_event_factor"] = float(_clamp(1.0 - 0.60 * ef, 0.20, 1.00))
+        ctx_out["lot_shrink_weekcross_factor"] = (0.75 if float(weekcross_risk or 0.0) > 0.0 else 1.0)
+        ctx_out["lot_shrink_weekend_factor"] = (0.60 if float(weekend_risk or 0.0) > 0.0 else 1.0)
+    except Exception:
+        pass
+
+
+    # always expose swing-guard signals (even if market ban not active)
+    try:
+        ctx_out.setdefault("weekcross_risk", float(weekcross_risk or 0.0))
+        ctx_out.setdefault("weekcross_weekday", (int(weekcross_weekday) if weekcross_weekday is not None else None))
+        ctx_out.setdefault("event_market_ban_active", bool(event_market_ban_active))
+        ctx_out.setdefault("event_market_ban_hours", float(event_market_ban_hours))
+        ctx_out.setdefault("exec_guard_notes", list(exec_guard_notes))
+        ctx_out.setdefault("order_type_reco", str(order_type))
+        ctx_out.setdefault("entry_type_reco", str(entry_type))
+        ef = float(ctx_out.get("event_risk_factor", 0.0) or 0.0)
+        ctx_out.setdefault("lot_shrink_event_factor", float(_clamp(1.0 - 0.60 * ef, 0.20, 1.00)))
+        ctx_out.setdefault("lot_shrink_weekcross_factor", (0.75 if float(weekcross_risk or 0.0) > 0.0 else 1.0))
+        ctx_out.setdefault("lot_shrink_weekend_factor", (0.60 if float(weekend_risk or 0.0) > 0.0 else 1.0))
+    except Exception:
+        pass
+
+# Trail SL: エントリーから0.5R戻し（見せ方用）
     trail_sl = sl
     try:
         dist_sl = abs(entry - sl)
@@ -870,8 +1040,8 @@ def get_ai_order_strategy(
         "decision": decision,
         "direction": direction,
         "side": side,
-        "order_type": "MARKET",
-        "entry_type": "MARKET_NOW",
+        "order_type": str(order_type),
+        "entry_type": str(entry_type),
 
         "entry": float(entry),
         "entry_price": float(entry),
