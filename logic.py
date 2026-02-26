@@ -1,5 +1,5 @@
 
-# logic_fixed27_trend_entry_engine.py
+# logic_fixed28_trend_entry_engine_compat.py
 # Drop-in replacement for logic.py
 # - Adds self-contained: HH/HL detection, breakout strength, continuation probability, phase-aware EV thresholding,
 #   momentum bonus (capped), and breakout gate.
@@ -237,12 +237,14 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
     }
 
 def get_ai_order_strategy(
-    price_df: pd.DataFrame,
+    price_df: pd.DataFrame = None,
     pair: str = "",
     budget_yen: int = 0,
     context_data: Optional[Dict[str, Any]] = None,
     ext_features: Optional[Dict[str, Any]] = None,
     prefer_long_only: bool = False,
+    api_key: str = "",
+    **kwargs,
 ) -> Dict[str, Any]:
     """
     Returns dict compatible with existing main.py:
@@ -272,6 +274,15 @@ def get_ai_order_strategy(
         }
 
     ctx_in = context_data or {}
+    # Accept alternate caller arg names (backward/forward compatibility)
+    if price_df is None:
+        price_df = kwargs.get('df') or kwargs.get('price_history') or kwargs.get('price_data')
+    if not pair:
+        pair = kwargs.get('pair_label') or kwargs.get('symbol') or kwargs.get('pair') or ''
+    if ext_features is None:
+        ext_features = kwargs.get('ext') or kwargs.get('external_features') or kwargs.get('ext_meta')
+    if context_data is None:
+        context_data = kwargs.get('ctx') or kwargs.get('context') or kwargs.get('_ctx')
     ext = ext_features or {}
 
     close = df["Close"].astype(float)
