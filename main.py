@@ -1184,12 +1184,7 @@ def _render_ai_engine_panel(ctx: Dict[str, Any], plan_ui: Dict[str, Any]):
         st.caption("※継続確率は、直近10年（取得できる範囲）のOHLCから簡易学習したロジスティック回帰モデル（統計推定）です。")
 
         # Target zones (not a prediction)
-        df_ref = None
-        for _k in ("_df", "df", "_price_df", "_df_price", "_df_hist"):
-            _v = ctx.get(_k)
-            if _v is not None:
-                df_ref = _v
-                break
+        df_ref = _first_non_none(ctx, ("_df","df","_price_df","_df_price","_df_hist"))
         tz = _estimate_target_zones(df_ref if isinstance(df_ref, pd.DataFrame) else None)
         if tz.get("ok"):
             st.markdown("#### 参考ターゲットゾーン（天井“予知”ではなく、構造・ATRに基づく目安）")
@@ -1512,6 +1507,63 @@ def _lot_multiplier(global_risk_index: Any, alpha: Any, floor: float = 0.2, ceil
     if x > ceil:
         x = ceil
     return float(x)
+
+
+
+def _jp_side(side: str) -> str:
+    s = str(side or "").upper()
+    if s in ("BUY", "LONG"):
+        return "買い"
+    if s in ("SELL", "SHORT"):
+        return "売り"
+    return "—"
+
+def _jp_order_kind(kind: str) -> str:
+    k = str(kind or "").upper()
+    if k in ("MARKET", "MKT", "MARKET_NOW", "NOW"):
+        return "成行"
+    if k in ("LIMIT", "LMT"):
+        return "指値"
+    if k in ("STOP", "STP", "STOP_MARKET"):
+        return "逆指値"
+    return "—"
+
+def _infer_entry_order_kind(direction: str, entry: float, current_price: float, tol_ratio: float = 0.00015) -> str:
+    """entry と current の位置関係から、発注種別（成行/指値/逆指値）を推定する。
+    tol_ratio は“ほぼ同値”を成行扱いにする許容比率（例: 0.00015=0.015%）。
+    """
+    try:
+        e = float(entry)
+        c = float(current_price)
+        if c <= 0:
+            return "MARKET"
+        if abs(e - c) / c <= tol_ratio:
+            return "MARKET"
+        d = str(direction or "").upper()
+        if d == "LONG":
+            return "LIMIT" if e < c else "STOP"
+        if d == "SHORT":
+            return "LIMIT" if e > c else "STOP"
+        return "MARKET"
+    except Exception:
+        return "MARKET"
+
+def _jp_order_scheme(has_entry: bool, has_tp: bool, has_sl: bool) -> str:
+    # 一般的な店頭FXの発注方式表記に合わせる
+    if has_entry and has_tp and has_sl:
+        return "IFDOCO"
+    if has_entry and (has_tp or has_sl):
+        return "IFD"
+    if (not has_entry) and has_tp and has_sl:
+        return "OCO"
+    return "—"
+
+def _first_non_none(d: dict, keys: tuple[str, ...]):
+    for k in keys:
+        v = d.get(k)
+        if v is not None:
+            return v
+    return None
 
 def _fmt_price(x: Any, decimals: int = 3) -> str:
     """Format price for UI: max `decimals` places, trim trailing zeros. Internal calc stays full precision."""
@@ -2357,20 +2409,40 @@ def _render_top_trade_panel(pair_label: str, plan: Dict[str, Any], current_price
         "推奨ロット係数は“連続補正”で、急に半減などはしません。"
     )
 
+
     if decision != "NO_TRADE":
-        side = plan.get("side", "—")
-        order_type = plan.get("order_type", "—")
-        entry_type = plan.get("entry_type", "") or "—"
+        # ---- 表示は運用者向けに日本語化（略語は出さない） ----
+        direction = str(plan.get("direction", "") or "").upper()
+        side_raw = plan.get("side", "—")
         entry = plan.get("entry", None)
         sl = plan.get("stop_loss", None)
         tp = plan.get("take_profit", None)
 
+        # 発注種別（成行/指値/逆指値）は、現在値との位置関係から推定（スイング運用の実務表記）
+        entry_kind = _infer_entry_order_kind(direction, float(entry or current_price), float(current_price))
+        entry_kind_jp = _jp_order_kind(entry_kind)
+
+        # 発注方式（IFD/OCO/IFDOCO）を明示
+        has_tp = (tp is not None) and (float(tp or 0.0) != 0.0)
+        has_sl = (sl is not None) and (float(sl or 0.0) != 0.0)
+        scheme = _jp_order_scheme(True, has_tp, has_sl)
+
         st.success("✅ エントリー候補（このアプリは発注しません。発注は運用者が実行）")
+
+        # 信頼度が中程度以下のときは注意喚起（急にエントリーになった不安を軽減）
+        if confidence < 0.55:
+            st.info(
+                "⚠️ 信頼度は中程度です。エントリー可でも“確定”ではありません。"
+                "（フェーズ/継続確率/構造判定が更新され、条件を満たした可能性があります）"
+            )
+
         st.markdown(f"""
-- **売買**: {side} / **注文**: {order_type} / **種別**: {entry_type}
-- **Entry**: {_fmt_price(entry)}
-- **SL**: {_fmt_price(sl)}
-- **TP**: {_fmt_price(tp)}
+- **売買**: {_jp_side(side_raw)}
+- **エントリー注文**: {entry_kind_jp}
+- **注文方式**: {scheme}（エントリー成立後、TP/SLは **OCO** で同時に置く想定）
+- **エントリー価格**: {_fmt_price(entry)}
+- **損切り(SL)**: {_fmt_price(sl)}
+- **利確(TP)**: {_fmt_price(tp)}
 """)
         st.caption(f"参考：勝率推定 p_win={p_win_ev:.2f}（あくまでモデル推定）。")
     else:
