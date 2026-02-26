@@ -1,3 +1,4 @@
+
 # main.py (v4 integrated, keeps v3 features + adds global risk overlays)
 from __future__ import annotations
 
@@ -2288,6 +2289,11 @@ def _build_ctx(pair_label: str, df: pd.DataFrame, feats: Dict[str, float], horiz
     ctx["style_name"] = style_name
     # Capital Governor inputs (user provided / optional)
     ctx.update(governor_cfg)
+    # stash recent bars for UI (target zones / reference chart)
+    try:
+        ctx["_df"] = df.tail(320).copy()
+    except Exception:
+        pass
     return ctx
 
 def _dominant_state(state_probs: Dict[str, Any]) -> str:
@@ -2794,7 +2800,7 @@ with tabs[0]:
 
             feats, ext_meta = feats_global, ext_meta_global
             ctx = _build_ctx(p, df, feats, horizon_days=int(horizon_days), min_expected_R=float(min_expected_R), style_name=style_name, governor_cfg=governor_cfg)
-            plan = logic.get_ai_order_strategy(api_key=keys.get("OPENAI_API_KEY",""), context_data=ctx)
+            plan = logic.get_ai_order_strategy(price_df=df, pair=p, context_data=ctx, ext_features=feats, api_key=keys.get("OPENAI_API_KEY",""))
 
 
             
@@ -3039,7 +3045,7 @@ with tabs[0]:
 
         feats, ext_meta = fetch_external(pair_label, keys=keys)
         ctx = _build_ctx(pair_label, df, feats, horizon_days=int(horizon_days), min_expected_R=float(min_expected_R), style_name=style_name, governor_cfg=governor_cfg)
-        plan = logic.get_ai_order_strategy(api_key=keys.get("OPENAI_API_KEY",""), context_data=ctx)
+        plan = logic.get_ai_order_strategy(price_df=df, pair=p, context_data=ctx, ext_features=feats, api_key=keys.get("OPENAI_API_KEY",""))
 
         # ---- operator guard (UI-level; default display-only) ----
 
