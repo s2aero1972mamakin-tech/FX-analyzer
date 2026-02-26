@@ -18,6 +18,260 @@ import numpy as np
 import pandas as pd
 
 # ---------------------------------------------------------------------
+# Economic calendar / event risk (optional, free feed)
+# ---------------------------------------------------------------------
+# This tool is swing-oriented but macro events can cause gaps/slippage.
+# We therefore compute an "event_risk_score" from upcoming releases and
+# optionally block trades within a high-impact window.
+#
+# Default feed: Forex Factory weekly export (JSON)
+# - https://nfs.faireconomy.media/ff_calendar_thisweek.json
+#
+# Notes:
+# - If the feed is unavailable, we fail safe (event_risk_score=0) and
+#   expose status in ctx_out so the UI can warn the operator.
+#
+import json
+import time
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
+
+_FF_CAL_URL_DEFAULT = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+_EVENT_CACHE = {
+    "ts": 0.0,     # epoch seconds
+    "url": None,
+    "data": None,  # list
+    "err": None,   # str
+}
+
+def _pair_to_ccys(pair: str) -> Tuple[str, str]:
+    s = (pair or "").upper().replace(" ", "")
+    s = s.replace("_", "/")
+    if "/" in s:
+        a, b = s.split("/", 1)
+        return (a[:3], b[:3])
+    # fallback: "USDJPY"
+    if len(s) >= 6:
+        return (s[:3], s[3:6])
+    return ("", "")
+
+def _fetch_ff_calendar(url: str, timeout: int = 12, ttl_sec: int = 1800) -> Tuple[Optional[List[dict]], str]:
+    """
+    Fetch weekly economic calendar JSON with very small cache to avoid rate limits.
+    Returns (data, status_string).
+    """
+    now = time.time()
+    if (_EVENT_CACHE["data"] is not None) and (_EVENT_CACHE["url"] == url) and (now - float(_EVENT_CACHE["ts"]) < ttl_sec):
+        return _EVENT_CACHE["data"], "cache"
+
+    try:
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0 (fx-analyzer; event-guard)"})
+        with urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+        data = json.loads(raw.decode("utf-8", errors="replace"))
+        if not isinstance(data, list):
+            raise ValueError("calendar json is not a list")
+        _EVENT_CACHE.update({"ts": now, "url": url, "data": data, "err": None})
+        return data, "ok"
+    except Exception as e:
+        _EVENT_CACHE.update({"ts": now, "url": url, "data": None, "err": f"{type(e).__name__}: {e}"})
+        return None, "fail"
+
+def _parse_event_dt(item: dict) -> Optional[datetime]:
+    """
+    Try multiple schemas:
+    - timestamp (epoch seconds)
+    - datetime / date+time string
+    """
+    try:
+        ts = item.get("timestamp", None)
+        if isinstance(ts, (int, float)) and math.isfinite(float(ts)) and float(ts) > 0:
+            # Many feeds use seconds; if it's too big, assume ms.
+            tsv = float(ts)
+            if tsv > 3e12:
+                tsv = tsv / 1000.0
+            return datetime.fromtimestamp(tsv, tz=timezone.utc)
+    except Exception:
+        pass
+
+    # Common FF export fields: "date" + "time" (strings)
+    dt_str = None
+    for k in ("datetime", "date_time", "dt", "dateTime"):
+        v = item.get(k)
+        if isinstance(v, str) and v.strip():
+            dt_str = v.strip()
+            break
+
+    if dt_str is None:
+        date_s = item.get("date", None)
+        time_s = item.get("time", None)
+        if isinstance(date_s, str) and date_s.strip():
+            if isinstance(time_s, str) and time_s.strip():
+                dt_str = f"{date_s.strip()} {time_s.strip()}"
+            else:
+                dt_str = date_s.strip()
+
+    if not dt_str:
+        return None
+
+    # Parse with pandas (robust) then assume UTC if no tz
+    try:
+        dt = pd.to_datetime(dt_str, utc=True, errors="coerce")
+        if pd.isna(dt):
+            return None
+        return dt.to_pydatetime()
+    except Exception:
+        return None
+
+def _compute_event_risk(
+    pair: str,
+    *,
+    now_tz: str = "Asia/Tokyo",
+    horizon_hours: int = 72,
+    impacts: Optional[List[str]] = None,
+    high_window_minutes: int = 60,
+    url: str = _FF_CAL_URL_DEFAULT,
+) -> Dict[str, Any]:
+    """
+    Returns:
+      {
+        "ok": bool,
+        "status": "ok|cache|fail",
+        "err": str|None,
+        "score": float,
+        "factor": float (0..1),
+        "window_high": bool,
+        "next_high_hours": float|None,
+        "upcoming": [ {dt_utc, currency, impact, title} ... ]  (<=10)
+      }
+    """
+    impacts = impacts or ["High", "Medium"]
+    a, b = _pair_to_ccys(pair)
+    ccys = {a, b}
+
+    data, status = _fetch_ff_calendar(url)
+    if not data:
+        return {
+            "ok": False,
+            "status": status,
+            "err": _EVENT_CACHE.get("err"),
+            "score": 0.0,
+            "factor": 0.0,
+            "window_high": False,
+            "next_high_hours": None,
+            "upcoming": [],
+        }
+
+    tz = ZoneInfo(now_tz)
+    now_local = datetime.now(tz=tz)
+    now_utc = now_local.astimezone(timezone.utc)
+
+    # weights by impact
+    w = {"High": 1.0, "Medium": 0.6, "Low": 0.3, "Holiday": 0.8, "Non-Economic": 0.2}
+
+    upcoming = []
+    for it in data:
+        if not isinstance(it, dict):
+            continue
+        cur = str(it.get("currency") or it.get("ccy") or it.get("cur") or "").upper().strip()
+        if not cur:
+            # some schemas use "country" as currency code
+            ctry = str(it.get("country") or "").upper().strip()
+            if len(ctry) == 3:
+                cur = ctry
+        if cur and (cur not in ccys):
+            continue
+
+        impact = str(it.get("impact") or "").strip()
+        if impacts and (impact not in impacts) and not (impact == "Holiday" and "Holiday" in impacts):
+            continue
+
+        dt = _parse_event_dt(it)
+        if dt is None:
+            continue
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt_utc = dt.astimezone(timezone.utc)
+
+        hrs = (dt_utc - now_utc).total_seconds() / 3600.0
+        if hrs < -1.0:
+            continue
+        if hrs > float(horizon_hours):
+            continue
+
+        title = str(it.get("title") or it.get("event") or it.get("name") or "").strip()
+        upcoming.append({
+            "dt_utc": dt_utc,
+            "hours": float(hrs),
+            "currency": cur,
+            "impact": impact,
+            "title": title,
+        })
+
+    upcoming.sort(key=lambda x: x["hours"])
+
+    # score: sum(weight/(1+hours)) over upcoming events
+    score = 0.0
+    next_high = None
+    window_high = False
+    for ev in upcoming:
+        impact = ev["impact"]
+        hrs = float(ev["hours"])
+        score += float(w.get(impact, 0.4)) / (1.0 + max(0.0, hrs))
+        if impact == "High":
+            if next_high is None:
+                next_high = hrs
+            # window check ±minutes
+            if abs(hrs) * 60.0 <= float(high_window_minutes):
+                window_high = True
+
+    # normalize to factor 0..1 (heuristic)
+    factor = _clamp(score / 1.25, 0.0, 1.0)
+
+    # trim upcoming list for UI
+    upcoming_ui = []
+    for ev in upcoming[:10]:
+        upcoming_ui.append({
+            "dt_utc": ev["dt_utc"].isoformat(),
+            "hours": float(ev["hours"]),
+            "currency": ev["currency"],
+            "impact": ev["impact"],
+            "title": ev["title"],
+        })
+
+    return {
+        "ok": True,
+        "status": status,
+        "err": None,
+        "score": float(score),
+        "factor": float(factor),
+        "window_high": bool(window_high),
+        "next_high_hours": (float(next_high) if next_high is not None else None),
+        "upcoming": upcoming_ui,
+    }
+
+def _compute_weekend_risk(now_tz: str = "Asia/Tokyo") -> float:
+    """
+    Simple weekend gap risk proxy:
+    - Fri evening (>=18:00 local) => 1.0
+    - Sat/Sun => 1.0
+    else 0.0
+    """
+    try:
+        tz = ZoneInfo(now_tz)
+        now = datetime.now(tz=tz)
+        wd = now.weekday()  # Mon=0..Sun=6
+        if wd >= 5:
+            return 1.0
+        if wd == 4 and now.hour >= 18:
+            return 1.0
+        return 0.0
+    except Exception:
+        return 0.0
+
+# ---------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------
 
@@ -421,7 +675,39 @@ def get_ai_order_strategy(
     else:
         macro_risk = _clamp(float(macro_risk), 0.0, 1.0)
 
-    # リスク調整 EV（表示用）
+    
+    # -----------------------------------------------------------------
+    # 6.5) 経済指標/イベント & 週末ギャップのリスク（任意・無料フィード）
+    # -----------------------------------------------------------------
+    # 重要: 以前の版では macro_risk のみで、"指標の近接"（発表まで何時間か）を
+    # 閾値や見送りに反映していませんでした。ここで明示的に加えます。
+    event_guard_enable = bool(ctx_in.get("event_guard_enable", True))
+    event_block_window = bool(ctx_in.get("event_block_high_impact_window", True))
+    event_horizon_hours = int(_safe_float(ctx_in.get("event_horizon_hours", 72), 72))
+    event_window_minutes = int(_safe_float(ctx_in.get("event_window_minutes", 60), 60))
+    event_impacts = ctx_in.get("event_impacts", None)
+    if not isinstance(event_impacts, list) or not event_impacts:
+        event_impacts = ["High", "Medium"]
+    event_calendar_url = str(ctx_in.get("event_calendar_url", _FF_CAL_URL_DEFAULT) or _FF_CAL_URL_DEFAULT)
+
+    ev_meta = {"ok": False, "status": "off", "err": None, "score": 0.0, "factor": 0.0,
+               "window_high": False, "next_high_hours": None, "upcoming": []}
+    if event_guard_enable:
+        try:
+            ev_meta = _compute_event_risk(
+                pair,
+                now_tz=str(ctx_in.get("event_timezone", "Asia/Tokyo") or "Asia/Tokyo"),
+                horizon_hours=event_horizon_hours,
+                impacts=[str(x) for x in event_impacts],
+                high_window_minutes=event_window_minutes,
+                url=event_calendar_url,
+            )
+        except Exception as e:
+            ev_meta = {"ok": False, "status": "fail", "err": f"{type(e).__name__}: {e}", "score": 0.0, "factor": 0.0,
+                       "window_high": False, "next_high_hours": None, "upcoming": []}
+
+    weekend_risk = float(_compute_weekend_risk(now_tz=str(ctx_in.get("event_timezone", "Asia/Tokyo") or "Asia/Tokyo")))
+# リスク調整 EV（表示用）
     risk_penalty = 0.12 + 0.55 * macro_risk   # 0.12..0.67
     ev_adj = ev_raw - 0.20 * risk_penalty
 
@@ -445,6 +731,14 @@ def get_ai_order_strategy(
     # リスク時は閾値を上げる（ただし上げ過ぎない）
     dynamic_threshold = dynamic_threshold + 0.04 * macro_risk
     dynamic_threshold = _clamp(dynamic_threshold, 0.02, 0.30)
+
+    # イベント/週末リスクも閾値に反映（主ゲートが raw+mom の場合でも抑止できるように）
+    try:
+        dynamic_threshold = dynamic_threshold + 0.06 * float(ev_meta.get("factor", 0.0) or 0.0) + 0.03 * float(weekend_risk or 0.0)
+    except Exception:
+        pass
+    dynamic_threshold = _clamp(dynamic_threshold, 0.02, 0.30)
+
 
     # -----------------------------------------------------------------
     # 8) モメンタム加点（上限 +0.06R）
@@ -472,7 +766,14 @@ def get_ai_order_strategy(
     why = ""
     gate_mode = "raw+mom"
 
-    if ev_gate >= dynamic_threshold:
+    # 高インパクト指標の“直前直後”は、スリッページ/ギャップの不確実性が高いので強制見送り（任意）
+    if event_guard_enable and event_block_window and bool(ev_meta.get("window_high", False)):
+        decision = "NO_TRADE"
+        gate_mode = "event_block"
+        reason = f"高インパクト指標の前後（±{event_window_minutes}分）のため見送り"
+        veto.append(reason)
+        why = reason
+    elif ev_gate >= dynamic_threshold:
         decision = "TRADE"
         why = f"EV通過(raw+mom): {ev_gate:+.3f} ≥ 動的閾値 {dynamic_threshold:.3f}"
     elif breakout_pass and (ev_gate >= dynamic_threshold - 0.04):
@@ -538,6 +839,14 @@ def get_ai_order_strategy(
         "rr": float(rr),
         "p_win": float(p_win),
         "macro_risk_score": float(macro_risk),
+        "event_risk_score": float(ev_meta.get("score", 0.0) or 0.0),
+        "event_risk_factor": float(ev_meta.get("factor", 0.0) or 0.0),
+        "event_window_high": bool(ev_meta.get("window_high", False)),
+        "event_next_high_hours": (float(ev_meta.get("next_high_hours")) if ev_meta.get("next_high_hours") is not None else None),
+        "event_feed_status": str(ev_meta.get("status", "") or ""),
+        "event_feed_error": str(ev_meta.get("err", "") or ""),
+        "event_upcoming": (ev_meta.get("upcoming", []) or []),
+        "weekend_risk": float(weekend_risk),
         "mom_bonus": float(mom_bonus),
         "dynamic_threshold": float(dynamic_threshold),
         "dynamic_threshold_base": float(base_thr),
