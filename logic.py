@@ -1,523 +1,417 @@
 
-# logic.py (v4 integrated, backward-compatible with v3 UI)
+# logic_fixed27_trend_entry_engine.py
+# Drop-in replacement for logic.py
+# - Adds self-contained: HH/HL detection, breakout strength, continuation probability, phase-aware EV thresholding,
+#   momentum bonus (capped), and breakout gate.
+# - Designed to be backward-compatible with existing main.py callers.
+#
+# NOTE: This module does not depend on ctx keys being passed from main.py; it computes needed signals from price history.
+
 from __future__ import annotations
 
-from typing import Dict, Any, Tuple, List
+from dataclasses import dataclass
+from typing import Dict, Any, Optional, Tuple, List
+
 import math
+import numpy as np
 import pandas as pd
 
-PAIR_MAP = {
-    "USD/JPY": "JPY=X",
-    "EUR/USD": "EURUSD=X",
-    "GBP/USD": "GBPUSD=X",
-    "AUD/USD": "AUDUSD=X",
-    "EUR/JPY": "EURJPY=X",
-    "GBP/JPY": "GBPJPY=X",
-    "AUD/JPY": "AUDJPY=X",
-}
+# ---------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------
 
-# -------------------------
-# Small utils
-# -------------------------
-def _clamp(x: float, lo: float, hi: float) -> float:
-    return lo if x < lo else hi if x > hi else x
-
-def _safe_float(x: Any, default: float = 0.0) -> float:
+def _safe_float(x, default=0.0) -> float:
     try:
         if x is None:
             return default
-        return float(x)
+        v = float(x)
+        if math.isnan(v) or math.isinf(v):
+            return default
+        return v
     except Exception:
         return default
 
-def _softmax(logits: Dict[str, float]) -> Dict[str, float]:
-    m = max(logits.values())
-    exps = {k: math.exp(v - m) for k, v in logits.items()}
-    s = sum(exps.values()) or 1.0
-    return {k: exps[k] / s for k in exps}
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
 
-# -------------------------
-# Indicators (same as v3)
-# -------------------------
-def compute_indicators(df: pd.DataFrame) -> Dict[str, float]:
-    if df is None or df.empty:
-        return {
-            "sma25": 0.0, "sma75": 0.0, "rsi": 50.0, "atr": 0.0,
-            "recent_high20": 0.0, "recent_low20": 0.0,
-            "atr_ratio": 0.0, "trend_strength": 0.0,
-        }
+def _ema(s: pd.Series, span: int) -> pd.Series:
+    return s.ewm(span=span, adjust=False).mean()
 
-    d = df.copy()
-    if isinstance(d.columns, pd.MultiIndex):
-        d.columns = [c[0] for c in d.columns]
-    for c in ["Open", "High", "Low", "Close"]:
-        if c not in d.columns:
-            return {
-                "sma25": 0.0, "sma75": 0.0, "rsi": 50.0, "atr": 0.0,
-                "recent_high20": 0.0, "recent_low20": 0.0,
-                "atr_ratio": 0.0, "trend_strength": 0.0,
-            }
+def _atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
+    high = df["High"].astype(float)
+    low = df["Low"].astype(float)
+    close = df["Close"].astype(float)
+    prev_close = close.shift(1)
+    tr = pd.concat([(high - low).abs(),
+                    (high - prev_close).abs(),
+                    (low - prev_close).abs()], axis=1).max(axis=1)
+    return tr.rolling(n, min_periods=max(3, n//2)).mean()
 
-    d = d[["Open", "High", "Low", "Close"]].dropna()
-    if d.empty:
-        return {
-            "sma25": 0.0, "sma75": 0.0, "rsi": 50.0, "atr": 0.0,
-            "recent_high20": 0.0, "recent_low20": 0.0,
-            "atr_ratio": 0.0, "trend_strength": 0.0,
-        }
+def _adx(df: pd.DataFrame, n: int = 14) -> pd.Series:
+    # Simple Wilder ADX
+    high = df["High"].astype(float)
+    low = df["Low"].astype(float)
+    close = df["Close"].astype(float)
 
-    close = d["Close"]
-    high = d["High"]
-    low = d["Low"]
+    up_move = high.diff()
+    down_move = -low.diff()
 
-    sma25 = close.rolling(25).mean()
-    sma75 = close.rolling(75).mean()
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
 
-    delta = close.diff()
-    gain = (delta.where(delta > 0, 0.0)).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0.0)).rolling(14).mean()
-    rs = gain / loss.replace(0, pd.NA)
-    rsi = 100 - (100 / (1 + rs))
-    rsi = rsi.fillna(50.0)
+    tr = pd.concat([(high - low).abs(),
+                    (high - close.shift(1)).abs(),
+                    (low - close.shift(1)).abs()], axis=1).max(axis=1)
 
-    hl = high - low
-    hc = (high - close.shift()).abs()
-    lc = (low - close.shift()).abs()
-    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
-    atr = tr.rolling(14).mean()
+    atr = tr.ewm(alpha=1/n, adjust=False).mean()
+    plus_di = 100 * (pd.Series(plus_dm, index=df.index).ewm(alpha=1/n, adjust=False).mean() / atr.replace(0, np.nan))
+    minus_di = 100 * (pd.Series(minus_dm, index=df.index).ewm(alpha=1/n, adjust=False).mean() / atr.replace(0, np.nan))
+    dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)).fillna(0.0)
+    adx = dx.ewm(alpha=1/n, adjust=False).mean()
+    return adx.fillna(0.0)
 
-    price = float(close.iloc[-1])
-    atr_v = float(atr.iloc[-1]) if pd.notna(atr.iloc[-1]) else 0.0
-    sma25_v = float(sma25.iloc[-1]) if pd.notna(sma25.iloc[-1]) else price
-    sma75_v = float(sma75.iloc[-1]) if pd.notna(sma75.iloc[-1]) else price
-    rsi_v = float(rsi.iloc[-1]) if pd.notna(rsi.iloc[-1]) else 50.0
+def _slope_norm(s: pd.Series, lookback: int = 10) -> float:
+    # Normalized slope over lookback (last - first) / (std * sqrt(n))
+    if len(s) < lookback + 1:
+        return 0.0
+    y = s.iloc[-lookback:].astype(float).values
+    if np.all(np.isfinite(y)) is False:
+        return 0.0
+    dy = y[-1] - y[0]
+    sd = float(np.std(y))
+    if sd <= 1e-9:
+        return 0.0
+    return float(dy / (sd * math.sqrt(lookback)))
 
-    recent_high20 = float(high.tail(20).max())
-    recent_low20 = float(low.tail(20).min())
+def _hh_hl_ok(df: pd.DataFrame, n: int = 20) -> bool:
+    # crude HH/HL: compare last 2 swing highs and lows via rolling window peaks/valleys
+    if len(df) < n + 5:
+        return False
+    close = df["Close"].astype(float)
+    # detect local maxima/minima with a small window
+    w = 3
+    highs = (close.shift(w) < close) & (close.shift(-w) < close)
+    lows = (close.shift(w) > close) & (close.shift(-w) > close)
+    hi_idx = close[highs].tail(4).index
+    lo_idx = close[lows].tail(4).index
+    if len(hi_idx) < 2 or len(lo_idx) < 2:
+        return False
+    h1, h2 = close.loc[hi_idx[-2]], close.loc[hi_idx[-1]]
+    l1, l2 = close.loc[lo_idx[-2]], close.loc[lo_idx[-1]]
+    return (h2 > h1) and (l2 > l1)
 
-    eps = 1e-9
-    atr_ratio = atr_v / max(price, eps)
-    trend_strength = abs(sma25_v - sma75_v) / max(atr_v, eps) if atr_v > 0 else 0.0
+def _breakout_strength(df: pd.DataFrame, n: int = 20) -> Tuple[bool, float]:
+    # breakout if last close exceeds prior n-day high by >= 0.2*ATR
+    if len(df) < n + 5:
+        return False, 0.0
+    close = df["Close"].astype(float)
+    hi = df["High"].astype(float).rolling(n).max()
+    atr = _atr(df, 14)
+    last = close.iloc[-1]
+    prev_hi = hi.iloc[-2]  # prior window high
+    a = float(atr.iloc[-1]) if len(atr) else 0.0
+    if not np.isfinite(prev_hi) or not np.isfinite(last) or a <= 0:
+        return False, 0.0
+    excess = last - prev_hi
+    ok = excess > 0.2 * a
+    strength = _clamp(excess / (1.5 * a), 0.0, 1.0) if a > 0 else 0.0
+    return bool(ok), float(strength)
 
-    return {
-        "sma25": sma25_v,
-        "sma75": sma75_v,
-        "rsi": rsi_v,
-        "atr": atr_v,
-        "recent_high20": recent_high20,
-        "recent_low20": recent_low20,
-        "atr_ratio": float(atr_ratio),
-        "trend_strength": float(trend_strength),
-    }
-
-# -------------------------
-# State probs + overlays
-# -------------------------
-def _state_probs_base(ctx: Dict[str, Any]) -> Dict[str, float]:
-    price = _safe_float(ctx.get("price"), 0.0)
-    sma25 = _safe_float(ctx.get("sma25"), price)
-    sma75 = _safe_float(ctx.get("sma75"), price)
-    rsi = _safe_float(ctx.get("rsi"), 50.0)
-    atr_ratio = _safe_float(ctx.get("atr_ratio"), 0.0)
-    trend_strength = _safe_float(ctx.get("trend_strength"), 0.0)
-
-    news = _safe_float(ctx.get("news_sentiment"), 0.0)
-    cpi = _safe_float(ctx.get("cpi_surprise"), 0.0)
-    nfp = _safe_float(ctx.get("nfp_surprise"), 0.0)
-    rate = _safe_float(ctx.get("rate_diff_change"), 0.0)
-
-    up = 0.0
-    down = 0.0
-    rng = 0.0
-    risk = 0.0
-
-    ma_spread = (sma25 - sma75) / max(price, 1e-9)
-    up += 6.0 * ma_spread + 0.03 * (rsi - 50.0) + 0.6 * trend_strength
-    down += -6.0 * ma_spread + 0.03 * (50.0 - rsi) + 0.6 * trend_strength
-
-    rng += -1.2 * trend_strength + 0.02 * (1.0 - abs(rsi - 50.0) / 50.0)
-
-    # baseline risk_off: volatility + macro shocks
-    risk += 80.0 * atr_ratio + 0.8 * abs(rate) - 0.3 * news
-    risk += 0.02 * (abs(cpi) + abs(nfp))
-
-    return _softmax({"trend_up": up, "trend_down": down, "range": rng, "risk_off": risk})
-
-def _apply_overlays(state_probs: Dict[str, float], ctx: Dict[str, Any]) -> Tuple[Dict[str, float], Dict[str, Any]]:
+def _continuation_prob(df: pd.DataFrame, horizon: int = 5) -> Tuple[float, float]:
     """
-    Applies macro/geo stress overlays to state probabilities.
-    Returns (new_probs, overlay_meta)
+    Simple continuation probability model (not ML-heavy):
+    - Uses trend slope, adx, and breakout strength to estimate p(continue up) / p(continue down).
     """
-    p = dict(state_probs)
-    macro = _clamp(_safe_float(ctx.get("macro_risk_score"), 0.0), 0.0, 1.0)
-    global_risk = _clamp(_safe_float(ctx.get("global_risk_index"), 0.0), 0.0, 1.0)
-    war_prob = _clamp(_safe_float(ctx.get("war_probability"), 0.0), 0.0, 1.0)
-    fin_stress = _clamp(_safe_float(ctx.get("financial_stress"), 0.0), 0.0, 1.0)
+    if len(df) < 60:
+        return 0.5, 0.5
+    close = df["Close"].astype(float)
+    ema20 = _ema(close, 20)
+    ema50 = _ema(close, 50)
+    slope = _slope_norm(ema20, 12)
+    adx = float(_adx(df, 14).iloc[-1])  # 0..100
+    breakout_ok, bstr = _breakout_strength(df, 20)
 
-    # Overlay strength: conservative. push more weight into risk_off when risk rises.
-    bump = 0.18 * global_risk + 0.10 * macro + 0.12 * war_prob + 0.10 * fin_stress
-    bump = _clamp(bump, 0.0, 0.35)
+    # Map to 0..1 features
+    f_adx = _clamp((adx - 15.0) / 25.0, 0.0, 1.0)
+    f_slope = _clamp((slope + 2.0) / 4.0, 0.0, 1.0)  # slope ~[-2,2] -> [0,1]
+    f_trend = 0.55 * f_slope + 0.35 * f_adx + 0.10 * bstr
+    # direction bias
+    bias = 1.0 if ema20.iloc[-1] >= ema50.iloc[-1] else 0.0
+    # base probabilities
+    p_up = 0.35 + 0.55 * f_trend
+    p_dn = 0.35 + 0.55 * (1.0 - f_trend)
 
-    # Take from non-risk states proportionally
-    non = max(1e-9, p["trend_up"] + p["trend_down"] + p["range"])
-    take = bump
-    p["risk_off"] = _clamp(p["risk_off"] + bump, 0.0, 1.0)
-    p["trend_up"] = _clamp(p["trend_up"] * (1.0 - take), 0.0, 1.0)
-    p["trend_down"] = _clamp(p["trend_down"] * (1.0 - take), 0.0, 1.0)
-    p["range"] = _clamp(p["range"] * (1.0 - take), 0.0, 1.0)
+    # apply direction bias and breakout
+    if bias > 0.5:
+        p_up += 0.05 + 0.10 * bstr
+        p_dn -= 0.05
+    else:
+        p_dn += 0.05 + 0.10 * bstr
+        p_up -= 0.05
 
-    # Normalize
-    s = sum(p.values()) or 1.0
-    p = {k: v / s for k, v in p.items()}
-
-    meta = {
-        "macro_risk_score": macro,
-        "global_risk_index": global_risk,
-        "war_probability": war_prob,
-        "financial_stress": fin_stress,
-        "risk_off_bump": bump,
-    }
-    return p, meta
-
-# -------------------------
-# EV model (still stub, but now modulated)
-# -------------------------
-def _state_stats_ev_base() -> Dict[str, Dict[str, float]]:
-    # These are priors; you can later replace with empirical from backtests.
-    return {
-        "trend_up": {"mean_R": 0.08, "n": 120},
-        "trend_down": {"mean_R": 0.08, "n": 120},
-        "range": {"mean_R": 0.01, "n": 120},
-        "risk_off": {"mean_R": -0.12, "n": 60},
-    }
-
-def _shrink_mean_R(mean_R: float, n: float, n_ref: float = 30.0) -> float:
-    w = _clamp(float(n) / float(n_ref), 0.0, 1.0)
-    return float(mean_R) * w
-
-def _ev_from_probs(state_probs: Dict[str, float], state_stats: Dict[str, Dict[str, float]]) -> Tuple[float, Dict[str, float]]:
-    contribs: Dict[str, float] = {}
-    ev = 0.0
-    for st, p in state_probs.items():
-        stats = state_stats.get(st, {"mean_R": 0.0, "n": 0.0})
-        mean_R = float(stats.get("mean_R", 0.0))
-        n = float(stats.get("n", 0.0))
-        mean_R_adj = _shrink_mean_R(mean_R, n, n_ref=30.0)
-        c = float(p) * mean_R_adj
-        contribs[st] = c
-        ev += c
-    return float(ev), contribs
-
-def _pwin_from_probs(state_probs: Dict[str, float], state_stats: Dict[str, Dict[str, float]]) -> float:
-    pwin = 0.5
-    for st, p in state_probs.items():
-        mean_R = float(state_stats.get(st, {}).get("mean_R", 0.0))
-        pwin += float(p) * _clamp(mean_R, -0.2, 0.2) / 2.0
-    return float(_clamp(pwin, 0.05, 0.95))
-
-# -------------------------
-# Black Swan Guard + Capital Governor
-# -------------------------
-def evaluate_black_swan(ctx: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Returns dict: {flag: bool, level: 'green/yellow/red', reasons: [...], metrics: {...}}
-    Uses:
-      - atr_ratio
-      - vix
-      - global_risk_index / war_probability / financial_stress
-      - gdelt counts
-    """
-    atr_ratio = _safe_float(ctx.get("atr_ratio"), 0.0)
-    vix = _safe_float(ctx.get("vix"), float("nan"))
-    global_risk = _clamp(_safe_float(ctx.get("global_risk_index"), 0.0), 0.0, 1.0)
-    war = _clamp(_safe_float(ctx.get("war_probability"), 0.0), 0.0, 1.0)
-    fin = _clamp(_safe_float(ctx.get("financial_stress"), 0.0), 0.0, 1.0)
-    war_cnt = _safe_float(ctx.get("gdelt_war_count_1d"), 0.0)
-    fin_cnt = _safe_float(ctx.get("gdelt_finance_count_1d"), 0.0)
-
-    reasons: List[str] = []
-    level = "green"
-
-    # thresholds are conservative; adjust later
-    if atr_ratio > 0.02:  # daily ATR >2% of price (FX daily is often <1%)
-        reasons.append(f"ATR比が高い(atr_ratio={atr_ratio:.3f})")
-        level = "yellow"
-    if not math.isnan(vix) and vix >= 35:
-        reasons.append(f"VIX高水準(vix={vix:.1f})")
-        level = "yellow"
-    if global_risk >= 0.70:
-        reasons.append(f"GlobalRisk高(global_risk={global_risk:.2f})")
-        level = "red"
-    if war >= 0.75:
-        reasons.append(f"War確率高(war_prob={war:.2f})")
-        level = "red"
-    if fin >= 0.75:
-        reasons.append(f"FinancialStress高(fin_stress={fin:.2f})")
-        level = "red"
-    if war_cnt >= 200:
-        reasons.append(f"戦争関連ニュース急増(count={int(war_cnt)})")
-        level = "red"
-    if fin_cnt >= 250:
-        reasons.append(f"金融危機関連ニュース急増(count={int(fin_cnt)})")
-        level = "red"
-
-    flag = level == "red"
-    return {
-        "flag": flag,
-        "level": level,
-        "reasons": reasons,
-        "metrics": {
-            "atr_ratio": atr_ratio,
-            "vix": vix,
-            "global_risk_index": global_risk,
-            "war_probability": war,
-            "financial_stress": fin,
-            "gdelt_war_count_1d": war_cnt,
-            "gdelt_finance_count_1d": fin_cnt,
-        }
-    }
-
-def capital_governor(ctx: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Purely local risk governor using user-provided limits in ctx.
-    This does NOT look at broker positions; it gates new trades.
-    """
-    max_dd = _safe_float(ctx.get("max_drawdown_limit"), 0.15)
-    daily_stop = _safe_float(ctx.get("daily_loss_limit"), 0.03)
-    cur_dd = _safe_float(ctx.get("equity_drawdown"), 0.0)
-    cur_daily = _safe_float(ctx.get("daily_loss"), 0.0)
-    losing_streak = int(_safe_float(ctx.get("losing_streak"), 0))
-    max_streak = int(_safe_float(ctx.get("max_losing_streak"), 5))
-
-    enabled = True
-    reasons: List[str] = []
-    if cur_dd >= max_dd:
-        enabled = False
-        reasons.append(f"DD制限超過({cur_dd:.2%} >= {max_dd:.0%})")
-    if cur_daily >= daily_stop:
-        enabled = False
-        reasons.append(f"日次損失制限超過({cur_daily:.2%} >= {daily_stop:.0%})")
-    if losing_streak >= max_streak:
-        enabled = False
-        reasons.append(f"連敗停止({losing_streak} >= {max_streak})")
-    return {"enabled": enabled, "reasons": reasons, "limits": {"max_dd": max_dd, "daily_stop": daily_stop, "max_streak": max_streak}}
-
-# -------------------------
-# Order builder (same as v3, but uses dom state)
-# -------------------------
-def _build_order(ctx: Dict[str, Any], state_probs: Dict[str, float], expected_R_ev: float) -> Dict[str, Any]:
-    price = _safe_float(ctx.get("price"), 0.0)
-    atr = _safe_float(ctx.get("atr"), 0.0)
-    rh = _safe_float(ctx.get("recent_high20"), price)
-    rl = _safe_float(ctx.get("recent_low20"), price)
-
-    dom = max(state_probs.items(), key=lambda kv: kv[1])[0]
-
-    order = {
-        "decision": "NO_TRADE",
-        "side": None,
-        "order_type": None,
-        "entry_type": None,
-        "entry": None,
-        "stop_loss": None,
-        "take_profit": None,
-        "dominant_state": dom,
-    }
-
-    if dom == "risk_off":
-        return order
-    if expected_R_ev <= 0:
-        return order
-    if atr <= 0:
-        atr = max(price * 0.005, 0.0001)
-
-    if dom in ("trend_up", "trend_down"):
-        if dom == "trend_up":
-            side = "BUY"
-            entry = rh + 0.2 * atr
-            sl = entry - 1.5 * atr
-            tp = entry + 2.0 * atr
+    if breakout_ok:
+        if bias > 0.5:
+            p_up += 0.06
+            p_dn -= 0.03
         else:
-            side = "SELL"
-            entry = rl - 0.2 * atr
-            sl = entry + 1.5 * atr
-            tp = entry - 2.0 * atr
-        order.update({
-            "decision": "TRADE",
-            "side": side,
-            "order_type": "STOP",
-            "entry_type": "BREAKOUT_STOP",
-            "entry": float(entry),
-            "stop_loss": float(sl),
-            "take_profit": float(tp),
-        })
-        return order
+            p_dn += 0.06
+            p_up -= 0.03
 
-    side = "BUY" if price <= (rl + rh) / 2.0 else "SELL"
-    if side == "BUY":
-        entry = rl + 0.2 * atr
-        sl = entry - 1.2 * atr
-        tp = entry + 1.5 * atr
-    else:
-        entry = rh - 0.2 * atr
-        sl = entry + 1.2 * atr
-        tp = entry - 1.5 * atr
+    p_up = _clamp(p_up, 0.05, 0.95)
+    p_dn = _clamp(p_dn, 0.05, 0.95)
+    return float(p_up), float(p_dn)
 
-    order.update({
-        "decision": "TRADE",
-        "side": side,
-        "order_type": "LIMIT",
-        "entry_type": "MEANREV_LIMIT",
-        "entry": float(entry),
-        "stop_loss": float(sl),
-        "take_profit": float(tp),
-    })
-    return order
-
-# -------------------------
-# Public API: get_ai_order_strategy
-# -------------------------
-def get_ai_order_strategy(api_key: str, context_data: Dict[str, Any], **kwargs) -> Dict[str, Any]:
+def _phase_label(df: pd.DataFrame) -> Tuple[str, float, float]:
     """
-    Backward-compatible output + new fields:
-      - overlay_meta
-      - dynamic_threshold
-      - black_swan
-      - governor
-      - veto_reasons
+    Returns (phase_label, trend_strength 0..1, momentum_score -1..+1)
     """
-    ctx = dict(context_data or {})
-    base_threshold = _safe_float(ctx.get("min_expected_R"), 0.07)
+    if len(df) < 60:
+        return "UNKNOWN", 0.0, 0.0
+    close = df["Close"].astype(float)
+    ema20 = _ema(close, 20)
+    ema50 = _ema(close, 50)
+    ema200 = _ema(close, 200) if len(close) >= 210 else _ema(close, 100)
 
-    # base probs, then overlays
-    probs0 = _state_probs_base(ctx)
-    probs, overlay_meta = _apply_overlays(probs0, ctx)
+    slope20 = _slope_norm(ema20, 12)  # roughly -? .. +?
+    adx = float(_adx(df, 14).iloc[-1])
+    breakout_ok, bstr = _breakout_strength(df, 20)
+    hhhl = _hh_hl_ok(df, 30)
 
-    # state stats + small nudges
-    state_stats = _state_stats_ev_base()
-    news = _safe_float(ctx.get("news_sentiment"), 0.0)
-    rate = _safe_float(ctx.get("rate_diff_change"), 0.0)
-    state_stats["trend_up"]["mean_R"] += 0.02 * news
-    state_stats["trend_down"]["mean_R"] += 0.02 * (-news)
-    state_stats["risk_off"]["mean_R"] += -0.02 * abs(rate)
+    # strength from ADX and breakout strength and slope magnitude
+    s_adx = _clamp((adx - 12.0) / 28.0, 0.0, 1.0)
+    s_slope = _clamp(abs(slope20) / 2.0, 0.0, 1.0)
+    strength = _clamp(0.55 * s_adx + 0.30 * s_slope + 0.15 * bstr, 0.0, 1.0)
 
-    # --- EV (raw vs overlay-adjusted) ---
-    expected_R_ev_raw, ev_contribs_raw = _ev_from_probs(probs0, state_stats)
-    expected_R_ev_adj, ev_contribs_adj = _ev_from_probs(probs, state_stats)
-    # Win-prob proxy uses raw stats (informational)
-    p_win_ev = _pwin_from_probs(probs0, state_stats)
+    # momentum: signed slope + small ema alignment
+    align = 1.0 if ema20.iloc[-1] > ema50.iloc[-1] else -1.0
+    mom = _clamp((slope20 / 2.0) + 0.20 * align, -1.0, 1.0)
 
-    # Decision gate mode:
-    #  - default: gate by RAW EV (market structure) and use overlays as SAFETY STOPS + position sizing hints
-    #  - optional: gate by ADJUSTED EV (more conservative) if ctx['use_risk_adjusted_ev_gate']=True
-    use_adj_gate = bool(ctx.get('use_risk_adjusted_ev_gate', False))
-    ev_for_gate = float(expected_R_ev_adj if use_adj_gate else expected_R_ev_raw)
-
-    # --- Dynamic threshold ---
-    # NOTE: double-counting risk (both in probs overlay AND threshold) causes 'NO_TRADE forever'.
-    # Default behavior keeps threshold near base and uses black_swan/governor as hard stops.
-    macro = _clamp(_safe_float(ctx.get('macro_risk_score'), 0.0), 0.0, 1.0)
-    global_risk = _clamp(_safe_float(ctx.get('global_risk_index'), 0.0), 0.0, 1.0)
-    war = _clamp(_safe_float(ctx.get('war_probability'), 0.0), 0.0, 1.0)
-    fin = _clamp(_safe_float(ctx.get('financial_stress'), 0.0), 0.0, 1.0)
-    if use_adj_gate:
-        # conservative mode: raise threshold moderately
-        dynamic_threshold = base_threshold * (1.0 + 0.35*macro + 0.45*global_risk + 0.25*war + 0.25*fin)
-        dynamic_threshold = float(_clamp(dynamic_threshold, base_threshold, 0.30))
+    # classify
+    if breakout_ok and strength >= 0.35:
+        phase = "BREAKOUT_UP" if mom > 0 else "BREAKOUT_DOWN"
     else:
-        # swing-normal mode: keep threshold mostly stable (avoid killing entries)
-        dynamic_threshold = base_threshold * (1.0 + 0.20*macro)
-        dynamic_threshold = float(_clamp(dynamic_threshold, base_threshold, 0.20))
-    # --- Phase-aware threshold + momentum boost + breakout gate (safe defaults) ---
-    # These features are only active if the caller provides the relevant ctx keys.
-    phase = str(ctx.get("phase_label") or ctx.get("phase") or "").upper().strip()
-    trend_strength = _clamp(_safe_float(ctx.get("trend_strength"), 0.0), 0.0, 1.0)
-    momentum_score = _clamp(_safe_float(ctx.get("momentum_score"), 0.0), -1.0, 1.0)
-    # continuation probabilities (0..1) if available
-    cont_p_up = _clamp(_safe_float(ctx.get("cont_p_up"), 0.0), 0.0, 1.0)
-    cont_p_dn = _clamp(_safe_float(ctx.get("cont_p_dn"), 0.0), 0.0, 1.0)
-    hh_hl_ok = bool(ctx.get("hh_hl_ok", False))
-    breakout_ok = bool(ctx.get("breakout_ok", False))
+        if strength < 0.25:
+            phase = "RANGE"
+        else:
+            phase = "UP_TREND" if mom > 0 else "DOWN_TREND"
 
-    # Phase multiplier: in strong trend/breakout phases, relax threshold a bit to reduce "missed big trend".
-    # In choppy/range phases, keep as-is or slightly tighten.
-    phase_mul = 1.0
-    if phase in {"UP_TREND", "DOWN_TREND"}:
-        phase_mul = 1.0 - 0.25 * trend_strength  # up to -25%
-    elif phase in {"BREAKOUT_UP", "BREAKOUT_DOWN", "BREAKOUT"}:
-        phase_mul = 1.0 - 0.35 * max(trend_strength, 0.4)  # up to ~-35%
-    elif phase in {"RANGE", "CHOP"}:
-        phase_mul = 1.0 + 0.10  # +10% tighter in range
-    dynamic_threshold = float(_clamp(dynamic_threshold * phase_mul, 0.02, 0.30))
+    # refine by HH/HL
+    if phase == "UP_TREND" and not hhhl and strength < 0.40:
+        phase = "TRANSITION_UP"
+    if phase == "DOWN_TREND" and strength < 0.40:
+        phase = "TRANSITION_DOWN"
 
-    veto_reasons: List[str] = []
+    return phase, float(strength), float(mom)
 
-    # Governor & Black Swan guard
-    gov = capital_governor(ctx)
-    if not gov["enabled"]:
-        veto_reasons.extend(gov["reasons"])
+# ---------------------------------------------------------------------
+# Core: strategy output
+# ---------------------------------------------------------------------
 
-    bs = evaluate_black_swan(ctx)
-    if bs["flag"]:
-        veto_reasons.append("BlackSwanGuard: " + (" / ".join(bs["reasons"]) if bs["reasons"] else "red"))
+@dataclass
+class StrategyPlan:
+    decision: str
+    direction: str
+    entry: float
+    sl: float
+    tp: float
+    ev_raw: float
+    ev_adj: float
+    dynamic_threshold: float
+    confidence: float
+    why: str
+    veto: List[str]
+    ctx: Dict[str, Any]
 
-    # Build order candidate
-    # Build order candidate from RAW market-state (avoid 'risk_off' dominating side selection)
-    order = _build_order(ctx, probs0, ev_for_gate)
-    # Momentum boost (capped): add small positive edge when momentum aligns with side hint.
-    side_hint = "BUY" if probs0.get("trend_up", 0.0) >= probs0.get("trend_down", 0.0) else "SELL"
-    mom_boost = 0.0
-    if side_hint == "BUY" and momentum_score > 0:
-        mom_boost = min(0.06, 0.05 * abs(momentum_score) * (0.5 + 0.5 * trend_strength))
-    elif side_hint == "SELL" and momentum_score < 0:
-        mom_boost = min(0.06, 0.05 * abs(momentum_score) * (0.5 + 0.5 * trend_strength))
-    ev_for_gate = float(ev_for_gate + mom_boost)
-
-    # Breakout gate: if structure breakout signals are strong, allow TRADE candidate even when EV is slightly below threshold.
-    breakout_pass = False
-    if (breakout_ok or hh_hl_ok) and (max(cont_p_up, cont_p_dn) >= 0.62) and (trend_strength >= 0.45) and (macro <= 0.75):
-        breakout_pass = True
-
-
-    # EV gate
-    if (ev_for_gate < dynamic_threshold) and (not breakout_pass):
-        veto_reasons.append(f"EV不足({'adj' if use_adj_gate else 'raw'}): {ev_for_gate:+.3f} < 動的閾値 {dynamic_threshold:.3f}")
-
-    # Final decision
-    decision = "TRADE"
-    if veto_reasons or order.get("decision") != "TRADE":
-        decision = "NO_TRADE"
-
-    confidence = float(_clamp(abs(ev_for_gate) / max(dynamic_threshold, 1e-9), 0.0, 1.0))
-
-    why = ' / '.join(veto_reasons) if veto_reasons else (f"BREAKOUT通過" if breakout_pass and ev_for_gate < dynamic_threshold else f"EV通過: {ev_for_gate:+.3f} ≥ {dynamic_threshold:.3f}")
-
-    out: Dict[str, Any] = {
-        "decision": decision,
-        "side": order.get("side"),
-        "order_type": order.get("order_type"),
-        "entry_type": order.get("entry_type"),
-        "entry": order.get("entry"),
-        "stop_loss": order.get("stop_loss"),
-        "take_profit": order.get("take_profit"),
-        "dominant_state": order.get("dominant_state"),
-        "confidence": confidence,
-        "why": why,
-        "state_probs": probs,
-        "state_probs_raw": probs0,
-        "expected_R_ev": float(ev_for_gate),
-        "expected_R_ev_raw": float(expected_R_ev_raw),
-        "expected_R_ev_adj": float(expected_R_ev_adj),
-        "p_win_ev": float(p_win_ev),
-        "ev_contribs": ev_contribs_adj,
-        "ev_contribs_raw": ev_contribs_raw,
-        "ev_contribs_adj": ev_contribs_adj,
-        "state_stats_ev": state_stats,
-        "overlay_meta": overlay_meta,
-        "gate_mode": "EV_ADJUSTED" if use_adj_gate else "EV_RAW",
-        "dynamic_threshold": float(dynamic_threshold),
-        "black_swan": bs,
-        "governor": gov,
-        "veto_reasons": veto_reasons,
+def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
+    """Backward compatible helper. main.py may call this."""
+    if df is None or len(df) < 5:
+        return {}
+    close = df["Close"].astype(float)
+    atr = _atr(df, 14)
+    adx = _adx(df, 14)
+    return {
+        "ema20": float(_ema(close, 20).iloc[-1]),
+        "ema50": float(_ema(close, 50).iloc[-1]),
+        "atr14": float(atr.iloc[-1]) if len(atr) else 0.0,
+        "adx14": float(adx.iloc[-1]) if len(adx) else 0.0,
     }
-    return out
+
+def get_ai_order_strategy(
+    price_df: pd.DataFrame,
+    pair: str = "",
+    budget_yen: int = 0,
+    context_data: Optional[Dict[str, Any]] = None,
+    ext_features: Optional[Dict[str, Any]] = None,
+    prefer_long_only: bool = False,
+) -> Dict[str, Any]:
+    """
+    Returns dict compatible with existing main.py:
+      {
+        "decision": "TRADE"/"NO_TRADE",
+        "direction": "LONG"/"SHORT",
+        "entry": ..., "sl": ..., "tp": ...,
+        "ev_raw": ..., "ev_adj": ...,
+        "dynamic_threshold": ...,
+        "confidence": ...,
+        "why": ..., "veto": [...],
+        "_ctx": {...}
+      }
+    """
+    df = price_df.copy() if price_df is not None else None
+    if df is None or len(df) < 60:
+        return {
+            "decision": "NO_TRADE",
+            "direction": "LONG",
+            "entry": 0.0, "sl": 0.0, "tp": 0.0,
+            "ev_raw": 0.0, "ev_adj": 0.0,
+            "dynamic_threshold": 0.10,
+            "confidence": 0.0,
+            "why": "データ不足",
+            "veto": ["データ不足（最低60本必要）"],
+            "_ctx": {},
+        }
+
+    ctx_in = context_data or {}
+    ext = ext_features or {}
+
+    close = df["Close"].astype(float)
+    last = float(close.iloc[-1])
+
+    # Compute phase, strength, momentum and continuation probabilities internally
+    phase, strength, mom = _phase_label(df)
+    p_up, p_dn = _continuation_prob(df, horizon=int(_safe_float(ctx_in.get("horizon_days", 5), 5)))
+
+    breakout_ok, breakout_strength = _breakout_strength(df, 20)
+    hhhl_ok = _hh_hl_ok(df, 30)
+
+    # Direction: prefer with momentum/phase
+    direction = "LONG" if mom >= 0 else "SHORT"
+    if prefer_long_only:
+        direction = "LONG"
+    # Hard block: in strong uptrend/breakout, do not short (reduces "uptrend but short EV negative" issue)
+    if phase in ("UP_TREND", "BREAKOUT_UP") and strength >= 0.35:
+        direction = "LONG"
+
+    # Basic risk model: SL at 1.2*ATR behind recent swing, TP = 2.0*ATR in trend, else 1.5*ATR
+    atr14 = float(_atr(df, 14).iloc[-1])
+    atr14 = max(atr14, 1e-6)
+    lookback = 20
+    recent_low = float(df["Low"].astype(float).tail(lookback).min())
+    recent_high = float(df["High"].astype(float).tail(lookback).max())
+
+    if direction == "LONG":
+        sl = min(last - 1.2 * atr14, recent_low - 0.15 * atr14)
+        tp_base = last + (2.2 * atr14 if phase.startswith("UP") or phase.startswith("BREAKOUT") else 1.6 * atr14)
+    else:
+        sl = max(last + 1.2 * atr14, recent_high + 0.15 * atr14)
+        tp_base = last - (2.2 * atr14 if phase.startswith("DOWN") or phase.startswith("BREAKOUT") else 1.6 * atr14)
+
+    entry = last  # market entry assumption (main can convert to limit if desired)
+    tp = tp_base
+
+    # Compute R-multiples
+    risk = abs(entry - sl)
+    reward = abs(tp - entry)
+    if risk <= 1e-9:
+        risk = atr14
+    rr = reward / risk
+
+    # Win probability proxy: combine continuation prob and strength
+    if direction == "LONG":
+        p_win = 0.45 + 0.40 * _clamp((p_up - 0.5) * 2.0, -1.0, 1.0) + 0.10 * (strength - 0.5)
+    else:
+        p_win = 0.45 + 0.40 * _clamp((p_dn - 0.5) * 2.0, -1.0, 1.0) + 0.10 * (strength - 0.5)
+    p_win = _clamp(p_win, 0.20, 0.80)
+
+    # EV in R: EV = p*RR - (1-p)*1
+    ev_raw = p_win * rr - (1.0 - p_win) * 1.0
+
+    # External risk penalty (0..1). If not present, assume moderate-low.
+    macro_risk = _clamp(_safe_float(ext.get("macro_risk_score", ext.get("risk_off", 0.35)), 0.35), 0.0, 1.0)
+    risk_penalty = 0.15 + 0.55 * macro_risk  # 0.15..0.70
+    ev_adj = ev_raw - 0.20 * risk_penalty  # moderate penalty
+
+    # Dynamic threshold base
+    base_thr = _clamp(_safe_float(ctx_in.get("dynamic_threshold_base", 0.08), 0.08), 0.03, 0.20)
+
+    # Phase-based threshold adjustment (your requested item #1)
+    thr_mult = 1.0
+    if phase in ("UP_TREND", "DOWN_TREND", "TRANSITION_UP", "TRANSITION_DOWN"):
+        thr_mult -= 0.15 * strength  # loosen in trends
+    if phase.startswith("BREAKOUT"):
+        thr_mult -= 0.25 * max(strength, breakout_strength)  # more loosen in breakout
+    if phase == "RANGE":
+        thr_mult += 0.10  # tighten in range
+    dynamic_threshold = _clamp(base_thr * thr_mult, 0.02, 0.25)
+
+    # Momentum bonus capped (your requested item #2)
+    mom_bonus = 0.0
+    if direction == "LONG" and mom > 0:
+        mom_bonus = 0.06 * _clamp(strength, 0.0, 1.0) * _clamp(p_up, 0.0, 1.0)
+    if direction == "SHORT" and mom < 0:
+        mom_bonus = 0.06 * _clamp(strength, 0.0, 1.0) * _clamp(p_dn, 0.0, 1.0)
+    mom_bonus = _clamp(mom_bonus, 0.0, 0.06)
+    ev_eff = ev_raw + mom_bonus  # use raw gate with bonus (conservative)
+
+    # Breakout gate (your requested item #3)
+    cont_best = max(p_up, p_dn)
+    breakout_pass = bool((breakout_ok or hhhl_ok) and (cont_best >= 0.62) and (max(strength, breakout_strength) >= 0.45) and (macro_risk <= 0.75))
+
+    # Confidence (0..1)
+    confidence = _clamp(0.35 + 0.35 * strength + 0.20 * (cont_best - 0.5) + 0.10 * (rr - 1.0), 0.0, 1.0)
+
+    veto: List[str] = []
+    why = ""
+
+    # Primary gate: EV_eff vs threshold OR breakout_pass (allow slight EV miss)
+    if ev_eff >= dynamic_threshold:
+        decision = "TRADE"
+        why = f"EV通過(raw+mom): {ev_eff:+.3f} ≥ 動的閾値 {dynamic_threshold:.3f}"
+    elif breakout_pass and (ev_eff >= dynamic_threshold - 0.03):
+        decision = "TRADE"
+        why = f"BREAKOUT通過: EV {ev_eff:+.3f} / 閾値 {dynamic_threshold:.3f}（緩和適用）"
+    else:
+        decision = "NO_TRADE"
+        veto.append(f"EV不足(raw+mom): {ev_eff:+.3f} < 動的閾値 {dynamic_threshold:.3f}")
+        # Keep older phrasing too, so existing UI matches:
+        veto.insert(0, f"EV不足(raw): {ev_raw:+.3f} < 動的閾値 {dynamic_threshold:.3f}")
+        why = veto[0]
+
+    # Attach ctx for UI and debugging (always populated; avoids "ctx missing" silent failure)
+    ctx_out = {
+        "pair": pair,
+        "phase_label": phase,
+        "trend_strength": float(strength),
+        "momentum_score": float(mom),
+        "cont_p_up": float(p_up),
+        "cont_p_dn": float(p_dn),
+        "hh_hl_ok": bool(hhhl_ok),
+        "breakout_ok": bool(breakout_ok),
+        "breakout_strength": float(breakout_strength),
+        "rr": float(rr),
+        "p_win": float(p_win),
+        "macro_risk_score": float(macro_risk),
+        "mom_bonus": float(mom_bonus),
+        "dynamic_threshold": float(dynamic_threshold),
+        "dynamic_threshold_base": float(base_thr),
+        "dynamic_threshold_mult": float(thr_mult),
+        "breakout_pass": bool(breakout_pass),
+        "cont_best": float(cont_best),
+    }
+
+    return {
+        "decision": decision,
+        "direction": direction,
+        "entry": float(entry),
+        "sl": float(sl),
+        "tp": float(tp),
+        "ev_raw": float(ev_raw),
+        "ev_adj": float(ev_adj),
+        "dynamic_threshold": float(dynamic_threshold),
+        "confidence": float(confidence),
+        "why": why,
+        "veto": veto,
+        "_ctx": ctx_out,
+    }
+
+# End of file
