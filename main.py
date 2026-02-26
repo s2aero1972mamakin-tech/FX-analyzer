@@ -1172,10 +1172,14 @@ def _estimate_target_zones(df: Optional[pd.DataFrame]) -> Dict[str, Any]:
 def _render_ai_engine_panel(ctx: Dict[str, Any], plan_ui: Dict[str, Any]):
     st.markdown("### 🤖 AIエンジン（フェーズ分類 / 継続確率 / 類似パターン / 利確管理）")
     with st.expander("AI診断（トレンド・継続・パターン・利確）", expanded=False):
-        phase = str(ctx.get("phase","UNKNOWN"))
-        strength = float(ctx.get("trend_strength", 0.0) or 0.0)
-        p_up = ctx.get("p_cont_up", float("nan"))
-        p_dn = ctx.get("p_cont_dn", float("nan"))
+        phase = str((ctx.get("phase") if isinstance(ctx, dict) else None) or (ctx.get("phase_label") if isinstance(ctx, dict) else None) or "UNKNOWN")
+        strength = float((ctx.get("trend_strength", 0.0) if isinstance(ctx, dict) else 0.0) or 0.0)
+        p_up = (ctx.get("p_cont_up") if isinstance(ctx, dict) else None)
+        if p_up is None:
+            p_up = (ctx.get("cont_p_up") if isinstance(ctx, dict) else float("nan"))
+        p_dn = (ctx.get("p_cont_dn") if isinstance(ctx, dict) else None)
+        if p_dn is None:
+            p_dn = (ctx.get("cont_p_dn") if isinstance(ctx, dict) else float("nan"))
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("フェーズ", phase)
         c2.metric("トレンド強度", f"{strength:.2f}")
@@ -2527,6 +2531,34 @@ def _render_risk_dashboard(plan: Dict[str, Any], feats: Dict[str, float], ext_me
     c4.metric("マクロ不安", f"{macro:.2f}", help="0〜1。VIX/DXY/金利等からの合成")
     c5.metric("ニュースムード", f"{news:.2f}", help="0〜1。高いほどネガ寄り（定義は実装依存）")
 
+    # ---- event / weekend risk (pair-specific; returned from logic in plan["_ctx"]) ----
+    ctxp = plan.get("_ctx", {}) if isinstance(plan.get("_ctx", {}), dict) else {}
+    try:
+        ev_factor = float(ctxp.get("event_risk_factor", 0.0) or 0.0)
+        ev_score = float(ctxp.get("event_risk_score", 0.0) or 0.0)
+    except Exception:
+        ev_factor, ev_score = 0.0, 0.0
+    ev_window = bool(ctxp.get("event_window_high", False))
+    next_high = ctxp.get("event_next_high_hours", None)
+    try:
+        weekend_r = float(ctxp.get("weekend_risk", 0.0) or 0.0)
+    except Exception:
+        weekend_r = 0.0
+    feed_status = str(ctxp.get("event_feed_status", "") or "")
+    feed_err = str(ctxp.get("event_feed_error", "") or "")
+
+    ec1, ec2, ec3 = st.columns(3)
+    ec1.metric("イベント近接リスク", f"{ev_factor:.2f}", help="0〜1。高/中インパクト指標が近いほど上がります（無料カレンダー）。")
+    ec2.metric("高インパクト窓", "ON" if ev_window else "OFF", help="発表前後は強制見送り(設定ON時)。")
+    ec3.metric("週末ギャップ", f"{weekend_r:.2f}", help="金曜夜〜週末はギャップ/窓開けリスクが上がります（簡易）。")
+
+    if isinstance(next_high, (int, float)) and (next_high == next_high):
+        st.caption(f"次の高インパクトまで: 約 {float(next_high):.1f} 時間")
+    if feed_status and feed_status not in ("ok", "cache"):
+        st.warning(f"イベントカレンダー取得: {feed_status}（イベントリスク=0扱い）")
+        if feed_err:
+            st.caption(f"理由: {feed_err}")
+
     st.caption(
         f"判定：相場全体={_bucket_01(global_risk)} / 地政学={_bucket_01(war)} / 金融={_bucket_01(fin)} / マクロ={_bucket_01(macro)}"
     )
@@ -2568,6 +2600,54 @@ def _render_risk_dashboard(plan: Dict[str, Any], feats: Dict[str, float], ext_me
             st.markdown("#### 外部データ取得ステータス（0固定/異常が出たら最優先でここ）")
             st.caption("OKでも中身が空/一部失敗があり得ます。error / detail を必ず見ます。")
             df = _parts_status_table(ext_meta)
+
+            # ---- Economic calendar (event guard) ----
+            try:
+                st.markdown("#### 📅 経済指標カレンダー（イベントリスク）")
+                if feed_status in ("ok", "cache"):
+                    st.success(f"カレンダー取得: {feed_status} / score={ev_score:.3f} / factor={ev_factor:.2f}")
+                elif feed_status == "off":
+                    st.info("カレンダー: OFF（設定でONにできます）")
+                else:
+                    st.warning(f"カレンダー取得: {feed_status or 'unknown'}（イベントリスク=0扱い）")
+                    if feed_err:
+                        st.caption(f"理由: {feed_err}")
+
+                ev_list = ctxp.get("event_upcoming", []) if isinstance(ctxp, dict) else []
+                if isinstance(ev_list, list) and ev_list:
+                    # show top items in local time
+                    rows = []
+                    tzname = str(ctxp.get("event_timezone") or st.session_state.get("event_timezone","Asia/Tokyo") or "Asia/Tokyo")
+                    try:
+                        from zoneinfo import ZoneInfo
+                        tz = ZoneInfo(tzname)
+                    except Exception:
+                        tz = None
+                    for it in ev_list[:8]:
+                        try:
+                            dt_utc = str(it.get("dt_utc") or "")
+                            dt = pd.to_datetime(dt_utc, utc=True, errors="coerce")
+                            if pd.isna(dt):
+                                continue
+                            if tz is not None:
+                                dt_local = dt.tz_convert(tz)
+                                dt_show = dt_local.strftime("%m/%d %H:%M")
+                            else:
+                                dt_show = dt.strftime("%m/%d %H:%M UTC")
+                            rows.append({
+                                "時刻": dt_show,
+                                "通貨": str(it.get("currency") or ""),
+                                "重要度": str(it.get("impact") or ""),
+                                "内容": str(it.get("title") or "")[:60],
+                                "あと(h)": f"{float(it.get('hours') or 0.0):.1f}",
+                            })
+                        except Exception:
+                            continue
+                    if rows:
+                        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            except Exception:
+                pass
+
 
             # Runtime fingerprint: proof of what is actually running
             runtime_line = ""
@@ -2736,7 +2816,7 @@ if "pair_label" not in st.session_state:
     st.session_state["pair_label"] = "USD/JPY"
 pair_label = st.session_state.get("pair_label", "USD/JPY")
 
-st.title("FX 自動AI判断ツール")
+st.title("FX 自動AI判断ツール（EV最大化） v4 Integrated")
 
 with st.sidebar:
     st.header("運用操作（見る順）")
@@ -2785,6 +2865,35 @@ with st.sidebar:
             index=0,
         )
         lot_risk_alpha = st.slider("推奨ロット係数の強さ（α）", 0.0, 1.0, 0.35, 0.05, help="lot_mult = clamp(1 - α*global_risk_index, 0.2, 1.0)")
+
+        # 📅 Economic events guard (recommended ON)
+        st.markdown("---")
+        st.markdown("##### 📅 経済指標/イベント リスクガード")
+        st.session_state["event_guard_enable"] = st.checkbox(
+            "経済指標の近接をリスクに反映（推奨）",
+            value=True,
+            help="無料の経済指標カレンダー（週次JSON）から、直近の高/中インパクト指標を取得して閾値・見送りに反映します。"
+        )
+        st.session_state["event_block_high_impact_window"] = st.checkbox(
+            "高インパクト指標の前後は強制見送り（±60分）",
+            value=True,
+            help="発表前後はスプレッド拡大/ギャップ/急変が起きやすいため、運用上の安全弁として推奨。"
+        )
+        st.session_state["event_window_minutes"] = st.slider("高インパクト窓（分）", 15, 180, 60, 5)
+        st.session_state["event_horizon_hours"] = st.slider("先読み時間（h）", 24, 168, 72, 6, help="この時間範囲のイベントだけを評価します。")
+        st.session_state["event_impacts"] = st.multiselect(
+            "対象インパクト",
+            ["High", "Medium", "Low", "Holiday"],
+            default=["High", "Medium"],
+            help="Lowまで入れると見送りが増えがちです。まずは High/Medium 推奨。"
+        )
+        with st.expander("（上級）イベントソース設定", expanded=False):
+            st.session_state["event_timezone"] = st.text_input("表示タイムゾーン", value="Asia/Tokyo")
+            st.session_state["event_calendar_url"] = st.text_input(
+                "カレンダーURL（JSON）",
+                value="https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+                help="既定: Forex Factory 週次エクスポート（無料）。取得不可の時はイベントリスク=0で動作します。"
+            )
 
         force_no_trade_env = (os.getenv("FORCE_NO_TRADE", "") or "").strip().lower() in ("1","true","yes","on")
         force_no_trade = st.checkbox("🛑 手動緊急停止（最終判断を全てNO_TRADE）", value=force_no_trade_env)
@@ -2877,6 +2986,19 @@ with tabs[0]:
 
             feats, ext_meta = feats_global, ext_meta_global
             ctx = _build_ctx(p, df, feats, horizon_days=int(horizon_days), min_expected_R=float(min_expected_R), style_name=style_name, governor_cfg=governor_cfg)
+            # Event guard settings (passed to logic)
+            try:
+                ctx.update({
+                    "event_guard_enable": bool(st.session_state.get("event_guard_enable", True)),
+                    "event_block_high_impact_window": bool(st.session_state.get("event_block_high_impact_window", True)),
+                    "event_window_minutes": int(st.session_state.get("event_window_minutes", 60) or 60),
+                    "event_horizon_hours": int(st.session_state.get("event_horizon_hours", 72) or 72),
+                    "event_impacts": list(st.session_state.get("event_impacts", ["High","Medium"]) or ["High","Medium"]),
+                    "event_timezone": str(st.session_state.get("event_timezone","Asia/Tokyo") or "Asia/Tokyo"),
+                    "event_calendar_url": str(st.session_state.get("event_calendar_url","https://nfs.faireconomy.media/ff_calendar_thisweek.json") or "https://nfs.faireconomy.media/ff_calendar_thisweek.json"),
+                })
+            except Exception:
+                pass
             plan = logic.get_ai_order_strategy(price_df=df, pair=p, context_data=ctx, ext_features=feats, api_key=keys.get("OPENAI_API_KEY",""))
 
 
@@ -3122,6 +3244,19 @@ with tabs[0]:
 
         feats, ext_meta = fetch_external(pair_label, keys=keys)
         ctx = _build_ctx(pair_label, df, feats, horizon_days=int(horizon_days), min_expected_R=float(min_expected_R), style_name=style_name, governor_cfg=governor_cfg)
+        # Event guard settings (passed to logic)
+        try:
+            ctx.update({
+                "event_guard_enable": bool(st.session_state.get("event_guard_enable", True)),
+                "event_block_high_impact_window": bool(st.session_state.get("event_block_high_impact_window", True)),
+                "event_window_minutes": int(st.session_state.get("event_window_minutes", 60) or 60),
+                "event_horizon_hours": int(st.session_state.get("event_horizon_hours", 72) or 72),
+                "event_impacts": list(st.session_state.get("event_impacts", ["High","Medium"]) or ["High","Medium"]),
+                "event_timezone": str(st.session_state.get("event_timezone","Asia/Tokyo") or "Asia/Tokyo"),
+                "event_calendar_url": str(st.session_state.get("event_calendar_url","https://nfs.faireconomy.media/ff_calendar_thisweek.json") or "https://nfs.faireconomy.media/ff_calendar_thisweek.json"),
+            })
+        except Exception:
+            pass
         plan = logic.get_ai_order_strategy(price_df=df, pair=p, context_data=ctx, ext_features=feats, api_key=keys.get("OPENAI_API_KEY",""))
 
         # ---- operator guard (UI-level; default display-only) ----
@@ -3462,4 +3597,3 @@ with st.expander("🔧 Webhook診断（送信テスト/失敗理由の表示）"
         st.caption("直近の送信結果（デバッグ）")
         st.json(st.session_state["last_webhook_result"])
 # --- /Webhook Diagnostics ---
-
