@@ -354,7 +354,10 @@ import logic
 try:
     import data_layer
 except Exception:
-    data_layer = None
+    try:
+        import data_layer0225 as data_layer  # fallback for local filename
+    except Exception:
+        data_layer = None
 
 # yfinance rate-limit exception (version dependent)
 try:
@@ -2609,7 +2612,8 @@ def _render_top_trade_panel(pair_label: str, plan: Dict[str, Any], current_price
         tp = plan.get("take_profit", None)
 
         # 発注種別（成行/指値/逆指値）は、現在値との位置関係から推定（スイング運用の実務表記）
-        entry_kind = _infer_entry_order_kind(direction, float(entry or current_price), float(current_price))
+        entry_kind_src = str(plan.get("entry_type") or plan.get("order_type") or "")
+        entry_kind = entry_kind_src if _jp_order_kind(entry_kind_src) != "—" else _infer_entry_order_kind(direction, float(entry or current_price), float(current_price))
         entry_kind_jp = _jp_order_kind(entry_kind)
 
         # 発注方式（IFD/OCO/IFDOCO）を明示
@@ -2637,6 +2641,31 @@ def _render_top_trade_panel(pair_label: str, plan: Dict[str, Any], current_price
         st.caption(f"参考：勝率推定 p_win={p_win_ev:.2f}（あくまでモデル推定）。")
     else:
         st.warning("⏸ 見送り（NO_TRADE）")
+
+        # --- 要件: NO_TRADEでも「注文方式（指値/逆指値/IFD/OCO/IFDOCO）」を必ず表示 ---
+        direction = str(plan.get("direction", "") or "").upper()
+        side_raw = plan.get("side", "—")
+        entry = plan.get("entry", None)
+        sl = plan.get("stop_loss", None)
+        tp = plan.get("take_profit", None)
+
+        entry_kind_src = str(plan.get("entry_type") or plan.get("order_type") or "")
+        entry_kind = entry_kind_src if _jp_order_kind(entry_kind_src) != "—" else _infer_entry_order_kind(direction, float(entry or current_price), float(current_price))
+        entry_kind_jp = _jp_order_kind(entry_kind)
+
+        has_tp = (tp is not None) and (float(tp or 0.0) != 0.0)
+        has_sl = (sl is not None) and (float(sl or 0.0) != 0.0)
+        scheme = _jp_order_scheme(True, has_tp, has_sl)
+
+        st.markdown(f"""
+- **売買候補（参考）**: {_jp_side(side_raw)}
+- **エントリー注文（参考）**: {entry_kind_jp}
+- **注文方式（参考）**: {scheme}
+- **参考エントリー価格**: {_fmt_price(entry)}
+- **参考損切り(SL)**: {_fmt_price(sl)}
+- **参考利確(TP)**: {_fmt_price(tp)}
+""")
+
 
         # 表示は「主因」を1行に統一（重複を避ける）
         why = str(plan.get("why", "") or "").strip()
@@ -3357,12 +3386,14 @@ with tabs[0]:
                 plan_ui = plan
 
             ev = float(plan.get("expected_R_ev") or 0.0)
+            score = float(plan.get("rank_score") or plan.get("final_score") or ev)
             decision = str(plan.get("decision") or "NO_TRADE")
             conf = float(plan.get("confidence") or 0.0)
             dom = _dominant_state(plan.get("state_probs", {}))
 
             rows.append({
                 "pair": p,
+                "score": score,
                 "EV": ev,
                 "decision": decision,
                 "confidence": conf,
@@ -3375,8 +3406,8 @@ with tabs[0]:
                 "_ext_meta": ext_meta,
             })
 
-        ranked = [r for r in rows if isinstance(r.get("EV"), (int, float))]
-        ranked.sort(key=lambda r: float(r["EV"]), reverse=True)
+        ranked = [r for r in rows if isinstance(r.get("score"), (int, float))]
+        ranked.sort(key=lambda r: float(r["score"]), reverse=True)
         if not ranked:
             st.error("有効なペアがありません（全てNO_DATA）。")
             st.dataframe(pd.DataFrame(rows)[["pair", "decision"]], use_container_width=True)
@@ -3404,9 +3435,10 @@ with tabs[0]:
         # Logging (optional)
         _render_logging_panel(best["pair"], plan_ui_best, best.get("_ctx", {}), feats, best.get("_price_meta", {}), best.get("_ext_meta", {}))
 
-        st.markdown("### EVランキング（代替案ペアはここ）")
+        st.markdown("### 統合ランキング（代替案ペアはここ）")
         view = [{
             "pair": r["pair"],
+            "score": float(r.get("score", r.get("EV", 0.0))),
             "EV": float(r["EV"]),
             "decision": r["decision"],
             "confidence": float(r["confidence"]),
