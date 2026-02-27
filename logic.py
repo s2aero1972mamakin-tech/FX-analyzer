@@ -1,5 +1,6 @@
 
 
+
 # logic_fixed28_trend_entry_engine_compat.py
 # Drop-in replacement for logic.py
 # - Adds self-contained: HH/HL detection, breakout strength, continuation probability, phase-aware EV thresholding,
@@ -718,6 +719,11 @@ def get_ai_order_strategy(
     価格DFが無い（or 60本未満）の場合は NO_TRADE で "データ不足" を返します。
     """
 
+    # 安全対策: NameError防止のため先に初期化
+    phase = "UNKNOWN"
+    phase_label = "UNKNOWN"
+    
+
     # -----------------------------------------------------------------
     # 1) 引数の吸収（互換）
     # -----------------------------------------------------------------
@@ -977,7 +983,31 @@ def get_ai_order_strategy(
         mom_bonus = 0.06 * _clamp(strength, 0.0, 1.0) * _clamp(p_dn, 0.0, 1.0)
     mom_bonus = _clamp(mom_bonus, 0.0, 0.06)
 
-    ev_gate = ev_raw + mom_bonus  # gateに使うEV（従来要望の "raw+mom"）
+    # 通貨強弱プロキシ加点（上限 +0.04R）
+    # - 通貨強弱“単独”で方向決定はしない（補助のみ）
+    ccy_bonus = 0.0
+    ccy_strength_proxy = 0.0
+    try:
+        c = df["Close"].astype(float)
+        # 20/60日リターンをボラで正規化（zっぽい尺度）
+        r20 = (c.iloc[-1] / c.iloc[-21] - 1.0) if len(c) >= 21 else 0.0
+        r60 = (c.iloc[-1] / c.iloc[-61] - 1.0) if len(c) >= 61 else 0.0
+        vol20 = float(c.pct_change().rolling(20).std().iloc[-1]) if len(c) >= 21 else 0.0
+        vol60 = float(c.pct_change().rolling(60).std().iloc[-1]) if len(c) >= 61 else 0.0
+        z20 = (r20 / (vol20 + 1e-9)) if vol20 > 0 else 0.0
+        z60 = (r60 / (vol60 + 1e-9)) if vol60 > 0 else 0.0
+        ccy_strength_proxy = float(_clamp(0.5 * z20 + 0.5 * z60, -1.0, 1.0))
+    except Exception:
+        ccy_strength_proxy = 0.0
+
+    if direction == "LONG" and ccy_strength_proxy > 0:
+        ccy_bonus = 0.04 * _clamp(abs(ccy_strength_proxy), 0.0, 1.0)
+    elif direction == "SHORT" and ccy_strength_proxy < 0:
+        ccy_bonus = 0.04 * _clamp(abs(ccy_strength_proxy), 0.0, 1.0)
+    ccy_bonus = _clamp(ccy_bonus, 0.0, 0.04)
+
+
+    ev_gate = ev_raw + mom_bonus + ccy_bonus  # gateに使うEV（従来要望の "raw+mom"）
 
     # -----------------------------------------------------------------
     # 9) ブレイク別ゲート（救済）：HH/HL または breakout + 継続確率 + 強度
@@ -1086,9 +1116,11 @@ def get_ai_order_strategy(
     # -----------------------------------------------------------------
     ctx_out = {
         "pair": pair,
-        "phase_label": phase,
+        "phase_label": phase_label,
         "trend_strength": float(strength),
         "momentum_score": float(mom),
+        "ccy_strength_proxy": float(ccy_strength_proxy),
+        "ccy_bonus": float(ccy_bonus),
         "cont_p_up": float(p_up),
         "cont_p_dn": float(p_dn),
         "hh_hl_ok": bool(hhhl_ok),
