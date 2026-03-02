@@ -3031,7 +3031,7 @@ if "pair_label" not in st.session_state:
     st.session_state["pair_label"] = "USD/JPY"
 pair_label = st.session_state.get("pair_label", "USD/JPY")
 
-st.title("FX 自動AI判断ツール（EV最大化） v4 Integrated")
+st.title("FX 自動AI判断ツール")
 
 with st.sidebar:
     st.header("運用操作（見る順）")
@@ -3865,3 +3865,4 @@ with st.expander("🔧 Webhook診断（送信テスト/失敗理由の表示）"
         st.caption("直近の送信結果（デバッグ）")
         st.json(st.session_state["last_webhook_result"])
 # --- /Webhook Diagnostics ---
+
