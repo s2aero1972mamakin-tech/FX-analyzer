@@ -1695,6 +1695,126 @@ def _apply_swing_lot_guards(lot_mult: float, plan: Any) -> float:
 
 
 
+def _round_half_up(x: float) -> int:
+    """Half-up rounding for positive numbers (SBI: integer lots)."""
+    try:
+        x = float(x)
+    except Exception:
+        return 0
+    if not math.isfinite(x):
+        return 0
+    if x >= 0:
+        return int(math.floor(x + 0.5))
+    return int(math.ceil(x - 0.5))
+
+
+def _apply_sbi_minlot_policy(
+    plan: Any,
+    *,
+    enable: bool = True,
+    min_lots: int = 1,
+    max_lots: int = 1,
+    base_lots: int = 1,
+    allow_scale_up: bool = False,
+) -> Any:
+    """SBI前提: 最小1建・建玉は整数のみ。
+    - plan['_lot_multiplier_reco'] は「縮退係数（0.2..1.0）」であり、建玉数ではない。
+    - enable=True のとき、縮退できないことによるリスク上振れをAI判断に反映（必要なら見送りへ上書き）。
+    互換のため、plan['_lots_reco'] を追加するだけで既存キーは壊さない。
+    """
+    if not isinstance(plan, dict):
+        return plan
+
+    p = plan  # mutate in place (main.py側の互換のため)
+    try:
+        lot_mult = float(p.get("_lot_multiplier_reco") or 1.0)
+    except Exception:
+        lot_mult = 1.0
+    if not math.isfinite(lot_mult):
+        lot_mult = 1.0
+    lot_mult = max(0.20, min(1.00, lot_mult))
+
+    # --- optional: scale-up by signal strength (OFF by default; max_lots controls) ---
+    lots_scale = 1.0
+    if allow_scale_up:
+        try:
+            fs = float(p.get("final_score") or p.get("rank_score") or 0.0)
+            ev = float(p.get("expected_R_ev") or 0.0)
+            conf = float(p.get("confidence") or 0.0)
+        except Exception:
+            fs, ev, conf = 0.0, 0.0, 0.0
+
+        # very conservative scale-up: only when strong AND low event/macro penalty
+        try:
+            ctx = p.get("_ctx", {}) if isinstance(p.get("_ctx", {}), dict) else {}
+            macro = float(ctx.get("macro_risk_score") or 0.0)
+            event_mode = str(ctx.get("event_mode") or p.get("event_mode") or "NORMAL")
+            # do not scale up in PRE_EVENT
+            if event_mode == "PRE_EVENT":
+                macro = 1.0
+        except Exception:
+            macro = 1.0
+
+        if (fs >= 1.45) and (ev >= 0.22) and (conf >= 0.56) and (macro <= 0.28):
+            # fs 1.45..1.95 => scale 1.0..3.0
+            lots_scale = 1.0 + max(0.0, min(2.0, (fs - 1.45) / 0.25))
+
+    # raw (can be decimal)
+    lots_raw = float(max(0, int(base_lots))) * float(lots_scale) * float(lot_mult)
+    lots_int = _round_half_up(lots_raw)
+
+    if enable:
+        min_lots = max(1, int(min_lots))
+        max_lots = max(min_lots, int(max_lots))
+        lots_int = max(min_lots, min(max_lots, lots_int))
+
+        # --- shrink-not-possible guard (AI側で見送りにする) ---
+        try:
+            decision = str(p.get("decision") or "NO_TRADE").upper()
+        except Exception:
+            decision = "NO_TRADE"
+
+        if decision == "TRADE":
+            try:
+                ev_gate = float(p.get("expected_R_ev") or 0.0)
+                dyn_th = float(p.get("dynamic_threshold") or 0.0)
+            except Exception:
+                ev_gate, dyn_th = 0.0, 0.0
+            margin = ev_gate - dyn_th
+
+            # if lot_mult wants shrink (<1) but broker can't (min 1 lot), require extra EV margin.
+            need = 0.0
+            if lot_mult < 0.55:
+                need = 0.20
+            elif lot_mult < 0.70:
+                need = 0.12
+            elif lot_mult < 0.85:
+                need = 0.06
+
+            if (lot_mult < 1.0) and (lots_int <= min_lots) and (margin < need):
+                # override to NO_TRADE (safety: cannot execute shrink)
+                p["_decision_original"] = p.get("decision")
+                p["decision"] = "NO_TRADE"
+                p["_decision_override_reason"] = f"SBI最小{min_lots}建で縮退不可（係数={lot_mult:.2f}）→ 安全見送り"
+
+                vr = p.get("veto_reasons") or []
+                if not isinstance(vr, list):
+                    vr = [str(vr)]
+                msg = f"SBI_MINLOT_GUARD: 縮退不可のため追加EV余裕が必要（余裕={margin:+.3f} / 必要={need:.3f}）"
+                if msg not in vr:
+                    vr.append(msg)
+                p["veto_reasons"] = vr
+                p["veto"] = vr  # keep backward-compatible
+
+                lots_int = 0  # no trade
+
+    else:
+        # do not override decision; still provide integer lots for display
+        lots_int = max(0, int(lots_int))
+
+    p["_lots_reco"] = int(lots_int)
+    return p
+
 def _jp_side(side: str) -> str:
     s = str(side or "").upper()
     if s in ("BUY", "LONG"):
@@ -2591,8 +2711,9 @@ def _render_top_trade_panel(pair_label: str, plan: Dict[str, Any], current_price
 
     r3c1, r3c2 = st.columns(2)
     r3c1.metric("信頼度", f"{confidence:.2f}")
-    r3c2.metric("推奨ロット係数", f"{lot_mult:.2f}")
-
+    lots_reco = int(plan.get("_lots_reco") or (0 if str(plan.get("decision", "")).upper() != "TRADE" else 1))
+    r3c2.metric("推奨建玉数（SBI）", f"{lots_reco}建")
+    st.caption(f"（内部）推奨ロット係数={lot_mult:.2f} ※SBIは最小1建のため整数建玉に丸めます")
     if orig is not None and ovr:
         st.warning(f"判断は上書きされています：{_jp_decision(str(orig))} → {decision_jp}（理由：{ovr}）")
 
@@ -3031,7 +3152,7 @@ if "pair_label" not in st.session_state:
     st.session_state["pair_label"] = "USD/JPY"
 pair_label = st.session_state.get("pair_label", "USD/JPY")
 
-st.title("FX 自動AI判断ツール")
+st.title("FX 自動AI判断ツール（EV最大化） v4 Integrated")
 
 with st.sidebar:
     st.header("運用操作（見る順）")
@@ -3173,6 +3294,11 @@ with st.sidebar:
         if allow_override:
             min_expected_R = st.slider("min_expected_R", 0.0, 0.30, float(min_expected_R), 0.01)
             horizon_days = st.slider("horizon_days", 1, 30, int(horizon_days), 1)
+
+        st.markdown("##### ブローカー（SBI想定）")
+        sbi_minlot_mode = st.checkbox("SBI最小1建モード（縮退不可をAI判断に反映）", value=True)
+        sbi_max_lots = st.slider("最大建玉（SBI）", 1, 10, 1, 1)
+        sbi_allow_scale_up = st.checkbox("強いシグナル時のみ建玉増（実験）", value=False)
         pair_custom = st.multiselect("スキャン対象（任意）", PAIR_LIST_DEFAULT, default=PAIR_LIST_DEFAULT)
 
         if st.button("🔄 キャッシュクリアして再取得"):
@@ -3184,6 +3310,10 @@ show_meta = locals().get("show_meta", False)
 show_debug = locals().get("show_debug", False)
 pair_custom = locals().get("pair_custom", PAIR_LIST_DEFAULT)
 
+
+sbi_minlot_mode = bool(locals().get("sbi_minlot_mode", True))
+sbi_max_lots = int(locals().get("sbi_max_lots", 1))
+sbi_allow_scale_up = bool(locals().get("sbi_allow_scale_up", False))
 
 guard_apply = locals().get("guard_apply", "表示のみ（推奨）")
 lot_risk_alpha = float(locals().get("lot_risk_alpha", 0.35))
@@ -3369,6 +3499,14 @@ with tabs[0]:
             plan = dict(plan or {})
 
             plan["_lot_multiplier_reco"] = float(_apply_swing_lot_guards(lot_mult, plan))
+            plan = _apply_sbi_minlot_policy(
+                plan,
+                enable=bool(sbi_minlot_mode),
+                min_lots=1,
+                max_lots=int(sbi_max_lots),
+                base_lots=1,
+                allow_scale_up=bool(sbi_allow_scale_up),
+            )
 
             plan_ui = plan
             try:
@@ -3865,4 +4003,3 @@ with st.expander("🔧 Webhook診断（送信テスト/失敗理由の表示）"
         st.caption("直近の送信結果（デバッグ）")
         st.json(st.session_state["last_webhook_result"])
 # --- /Webhook Diagnostics ---
-
