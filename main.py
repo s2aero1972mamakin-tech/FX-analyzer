@@ -3804,12 +3804,27 @@ with tabs[1]:
         bt_horizon = st.number_input("horizon_days", min_value=1, max_value=14, value=int(horizon_days), step=1)
     with colC:
         bt_min_ev = st.slider("min_expected_R", 0.0, 0.3, float(min_expected_R), 0.01)
+        clear_wfa_cache = st.checkbox("（推奨）WFAキャッシュをクリアして実行", value=True,
+                                      help="ペアを変えても結果が同じになる場合、Streamlitのキャッシュが原因のことがあります。")
+
+    sym_preview = _pair_label_to_symbol(bt_pair)
+    st.caption(f"使用シンボル: {bt_pair} → {sym_preview}")
 
     run = st.button("バックテスト実行", type="primary")
     if run:
         try:
             import backtest_ev_v1
+
+            # If the backtest module (or its data loader) is cached incorrectly, results can become identical across pairs.
+            # Clearing cache here is safe (this tab only) and prevents false comparisons.
+            if clear_wfa_cache:
+                try:
+                    st.cache_data.clear()
+                except Exception:
+                    pass
+
             sym = _pair_label_to_symbol(bt_pair)
+
             wf_df, summ = backtest_ev_v1.run_backtest(
                 pair_symbol=sym,
                 period=bt_period,
@@ -3818,13 +3833,48 @@ with tabs[1]:
                 test_months=int(test_months),
                 min_expected_R=float(bt_min_ev),
             )
+
+            # Embed metadata so the CSV can't be mixed up later
+            try:
+                wf_df = wf_df.copy()
+                wf_df.insert(0, "pair", bt_pair)
+                wf_df.insert(1, "symbol", sym)
+            except Exception:
+                pass
+            try:
+                summ = dict(summ or {})
+                summ["pair"] = bt_pair
+                summ["symbol"] = sym
+            except Exception:
+                pass
+
+            # Same-result detector (common when cache key misses symbol)
+            try:
+                import hashlib as _hashlib
+                _csv_bytes_tmp = wf_df.to_csv(index=False).encode("utf-8")
+                _h = _hashlib.md5(_csv_bytes_tmp).hexdigest()
+                _prev_h = st.session_state.get("_wfa_prev_hash")
+                _prev_pair = st.session_state.get("_wfa_prev_pair")
+                if _prev_h and (_prev_h == _h) and _prev_pair and (_prev_pair != bt_pair):
+                    st.warning(f"⚠️ 前回（{_prev_pair}）と結果が完全一致しました。キャッシュ/シンボル変換の問題の可能性があります。"
+                               f"『WFAキャッシュをクリアして実行』をONにして再実行してください。")
+                st.session_state["_wfa_prev_hash"] = _h
+                st.session_state["_wfa_prev_pair"] = bt_pair
+            except Exception:
+                _csv_bytes_tmp = None
+
             st.markdown("### サマリー")
             st.json(summ)
             st.markdown("### WFA結果")
             st.dataframe(wf_df, use_container_width=True)
 
-            csv = wf_df.to_csv(index=False).encode("utf-8")
-            st.download_button("CSVダウンロード", data=csv, file_name=f"ev_wfa_{bt_pair.replace('/','_')}.csv", mime="text/csv")
+            csv_bytes = (_csv_bytes_tmp if _csv_bytes_tmp is not None else wf_df.to_csv(index=False).encode("utf-8"))
+            st.download_button(
+                "CSVダウンロード",
+                data=csv_bytes,
+                file_name=f"ev_wfa_{bt_pair.replace('/','_')}.csv",
+                mime="text/csv",
+            )
         except Exception as e:
             st.error(f"バックテストでエラー: {type(e).__name__}: {e}")
 
