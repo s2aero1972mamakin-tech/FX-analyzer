@@ -3549,76 +3549,108 @@ with tabs[0]:
             st.dataframe(pd.DataFrame(rows)[["pair", "decision"]], use_container_width=True)
             st.stop()
 
-        best = ranked[0]
+        # --- AI selection: pick ONE pair to act on (SBIガード込みのTRADE候補から) ---
+        trade_ranked = [r for r in ranked if str(r.get("decision", "")) == "TRADE"]
+        trade_ranked.sort(key=lambda r: float(r.get("score", 0.0)), reverse=True)
+
+        if trade_ranked:
+            best = trade_ranked[0]
+            st.markdown(f"## 🧠 AI選択：本日の実行ペア  **{best['pair']}**")
+        else:
+            best = ranked[0]
+            st.markdown("## 🧠 AI選択：本日は **見送り**（トレード候補なし）")
+            st.caption("※ SBI最小1建ガード・イベント近接・閾値条件により、相場全体で見ても全ペアが見送り判定です。")
+
         plan = best["_plan"]
         plan_ui_best = best.get("_plan_ui", plan)
         plan_ui_best = _apply_trend_assist(plan_ui_best, best.get("_ctx", {}))
         feats = best["_feats"]
         price = float(best["_ctx"].get("price", 0.0))
 
-        # Top panel must show entry format + price (user request)
-        _render_top_trade_panel(best["pair"], plan_ui_best, price)
+        # 見送りの日は「詳細は必要なときだけ」開けるようにする
+        details_box = st.container() if trade_ranked else st.expander("参考（最良候補の診断・ログ）", expanded=False)
+        with details_box:
+            # Top panel must show entry format + price (user request)
+            _render_top_trade_panel(best["pair"], plan_ui_best, price)
 
-        # Risk dashboard (new)
-        _render_risk_dashboard(plan_ui_best, feats, ext_meta=best.get("_ext_meta", {}))
+            # Risk dashboard (new)
+            _render_risk_dashboard(plan_ui_best, feats, ext_meta=best.get("_ext_meta", {}))
 
-        _render_ai_engine_panel(best.get("_ctx", {}), plan_ui_best)
+            _render_ai_engine_panel(best.get("_ctx", {}), plan_ui_best)
 
-        # Holding management (event/weekend approach)
-        _render_hold_manage_panel(best["pair"], best.get("_ctx", {}), plan_ui_best, feats, keys)
+            # Holding management (event/weekend approach)
+            _render_hold_manage_panel(best["pair"], best.get("_ctx", {}), plan_ui_best, feats, keys)
 
+            # Logging (optional)
+            _render_logging_panel(best["pair"], plan_ui_best, best.get("_ctx", {}), feats, best.get("_price_meta", {}), best.get("_ext_meta", {}))
 
-        # Logging (optional)
-        _render_logging_panel(best["pair"], plan_ui_best, best.get("_ctx", {}), feats, best.get("_price_meta", {}), best.get("_ext_meta", {}))
+            # 「ランキング」は“トレード可能が複数あるときだけ”表示（上位3まで）
+            if len(trade_ranked) >= 2:
+                st.markdown("### トレード可能候補（上位3）")
+                view = []
+                for r in trade_ranked[:3]:
+                    p = r.get("_plan_ui", r.get("_plan", {})) or {}
+                    view.append({
+                        "pair": r["pair"],
+                        "score": float(r.get("score", 0.0) or 0.0),
+                        "EV(R)": float(r.get("EV", 0.0) or 0.0),
+                        "confidence": float(r.get("confidence", 0.0) or 0.0),
+                        "注文": _order_type_jp(p.get("order_type", "")),
+                        "エントリー": _entry_type_jp(p.get("entry_type", "")),
+                        "event_mode": str(p.get("event_mode", "")),
+                    })
+                st.dataframe(pd.DataFrame(view), use_container_width=True)
+                st.caption("※ 1つしかトレード候補がない日は表示しません。")
 
-        st.markdown("### 統合ランキング（代替案ペアはここ）")
-        view = [{
-            "pair": r["pair"],
-            "score": float(r.get("score", r.get("EV", 0.0))),
-            "EV": float(r["EV"]),
-            "decision": r["decision"],
-            "confidence": float(r["confidence"]),
-            "dominant_state": _state_label_full(r["dom_state"]),
-            "global_risk": float(r["_feats"].get("global_risk_index", 0.0)),
-            "war": float(r["_feats"].get("war_probability", 0.0)),
-        } for r in ranked]
-        st.dataframe(pd.DataFrame(view), use_container_width=True)
+            # デバッグ用途：全ペア一覧は必要なときだけ（通常は非表示）
+            if bool(show_debug):
+                with st.expander("デバッグ：全ペア一覧（参考）", expanded=False):
+                    view_all = [{
+                        "pair": r["pair"],
+                        "score": float(r.get("score", r.get("EV", 0.0))),
+                        "EV": float(r["EV"]),
+                        "decision": r["decision"],
+                        "confidence": float(r["confidence"]),
+                        "dominant_state": _state_label_full(r["dom_state"]),
+                        "global_risk": float(r["_feats"].get("global_risk_index", 0.0)),
+                        "war": float(r["_feats"].get("war_probability", 0.0)),
+                    } for r in ranked]
+                    st.dataframe(pd.DataFrame(view_all), use_container_width=True)
 
-        st.markdown("### EV内訳（最適ペア）")
+            st.markdown("### EV内訳（AI選択ペア）")
 
-        # モバイル前提：棒グラフだけだと「0の棒が見えない」ため、
-        # まず表で「確率(%) / 寄与EV(R)」を明示し、図は折りたたみにします。
-        ev_contribs = (plan.get("ev_contribs", {}) or {})
-        state_probs = (plan.get("state_probs", {}) or {})
-        _states = ["trend_up", "trend_down", "range", "risk_off"]
+            # モバイル前提：棒グラフだけだと「0の棒が見えない」ため、
+            # まず表で「確率(%) / 寄与EV(R)」を明示し、図は折りたたみにします。
+            ev_contribs = (plan.get("ev_contribs", {}) or {})
+            state_probs = (plan.get("state_probs", {}) or {})
+            _states = ["trend_up", "trend_down", "range", "risk_off"]
 
-        rows_ev = []
-        for st_name in _states:
-            c = float((ev_contribs or {}).get(st_name, 0.0) or 0.0)
-            p = float((state_probs or {}).get(st_name, 0.0) or 0.0)
-            rows_ev.append({
-                "状態": _state_label_full(st_name),
-                "確率(%)": round(p * 100.0, 1),
-                "寄与EV(R)": round(c, 4),
-            })
+            rows_ev = []
+            for st_name in _states:
+                c = float((ev_contribs or {}).get(st_name, 0.0) or 0.0)
+                p = float((state_probs or {}).get(st_name, 0.0) or 0.0)
+                rows_ev.append({
+                    "状態": _state_label_full(st_name),
+                    "確率(%)": round(p * 100.0, 1),
+                    "寄与EV(R)": round(c, 4),
+                })
 
-        cdf = pd.DataFrame(rows_ev)
-        if not cdf.empty:
-            st.dataframe(cdf, use_container_width=True)
-            st.caption("※ 棒が見えない＝寄与が0付近です。未計算ではありません。")
+            cdf = pd.DataFrame(rows_ev)
+            if not cdf.empty:
+                st.dataframe(cdf, use_container_width=True)
+                st.caption("※ 棒が見えない＝寄与が0付近です。未計算ではありません。")
 
-            with st.expander("棒グラフ（参考）", expanded=False):
-                st.bar_chart(cdf.set_index("状態")[["寄与EV(R)"]])
-        else:
-            st.info("EV内訳が空です。")
+                with st.expander("棒グラフ（参考）", expanded=False):
+                    st.bar_chart(cdf.set_index("状態")[["寄与EV(R)"]])
+            else:
+                st.info("EV内訳が空です。")
 
-        with st.expander("詳細（最適ペア）", expanded=False):
-            st.json({"plan": plan})
-            if show_debug:
-                st.json({"ctx": best["_ctx"], "feats": feats})
-            if show_meta:
-                st.json({"price_meta": best.get("_price_meta", {}), "external_meta": best.get("_ext_meta", {})})
-
+            with st.expander("詳細（AI選択ペア）", expanded=False):
+                st.json({"plan": plan})
+                if show_debug:
+                    st.json({"ctx": best["_ctx"], "feats": feats})
+                if show_meta:
+                    st.json({"price_meta": best.get("_price_meta", {}), "external_meta": best.get("_ext_meta", {})})
     else:
         # 単一ペアはプルダウン（ユーザビリティ改善）
         common_pairs = [
