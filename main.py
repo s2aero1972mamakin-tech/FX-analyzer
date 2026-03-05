@@ -392,6 +392,14 @@ def _pair_label_to_symbol(pair_label: str) -> str:
         "EUR/JPY": "EURJPY=X",
         "GBP/JPY": "GBPJPY=X",
         "AUD/JPY": "AUDJPY=X",
+
+        "EUR/GBP": "EURGBP=X",
+
+        "AUD/NZD": "AUDNZD=X",
+
+        "EUR/CHF": "EURCHF=X",
+
+        "GBP/AUD": "GBPAUD=X",
     }
     return fallback.get(pl, "JPY=X")
 
@@ -406,6 +414,14 @@ def _pair_label_to_stooq_symbol(pair_label: str) -> Optional[str]:
         "EUR/JPY": "eurjpy",
         "GBP/JPY": "gbpjpy",
         "AUD/JPY": "audjpy",
+
+        "EUR/GBP": "eurgbp",
+
+        "AUD/NZD": "audnzd",
+
+        "EUR/CHF": "eurchf",
+
+        "GBP/AUD": "gbpaud",
     }
     return mapping.get(pl)
 
@@ -735,15 +751,17 @@ def _dominant_state(state_probs: Dict[str, Any]) -> str:
 # Utilities
 # =========================
 PAIR_LIST_DEFAULT = [
-    "USD/JPY",
     "EUR/USD",
     "GBP/USD",
     "AUD/USD",
     "EUR/JPY",
     "GBP/JPY",
     "AUD/JPY",
+    "EUR/GBP",
+    "AUD/NZD",
+    "EUR/CHF",
+    "GBP/AUD",
 ]
-
 
 # =========================
 # Build / Diagnostics
