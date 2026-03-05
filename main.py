@@ -824,18 +824,25 @@ def _dominant_state(state_probs: Dict[str, Any]) -> str:
 # =========================
 # Utilities
 # =========================
-PAIR_LIST_DEFAULT = [
+PAIR_LIST_CORE = [
     "EUR/USD",
     "GBP/USD",
     "AUD/USD",
     "EUR/JPY",
     "GBP/JPY",
     "AUD/JPY",
+]
+# 追加ペア（必要なときだけ有効化）
+PAIR_LIST_EXTRA = [
     "EUR/GBP",
     "AUD/NZD",
     "EUR/CHF",
     "GBP/AUD",
 ]
+PAIR_LIST_ALL = PAIR_LIST_CORE + PAIR_LIST_EXTRA
+
+# UIのデフォルト選択（= core）
+PAIR_LIST_DEFAULT = list(PAIR_LIST_CORE)
 
 # =========================
 # Build / Diagnostics
@@ -3379,7 +3386,7 @@ with st.sidebar:
         if allow_override:
             min_expected_R = st.slider("min_expected_R", 0.0, 0.30, float(min_expected_R), 0.01)
             horizon_days = st.slider("horizon_days", 1, 30, int(horizon_days), 1)
-        pair_custom = st.multiselect("スキャン対象（任意）", PAIR_LIST_DEFAULT, default=PAIR_LIST_DEFAULT)
+        pair_custom = st.multiselect("スキャン対象（任意）", PAIR_LIST_ALL, default=PAIR_LIST_DEFAULT)
 
         if st.button("🔄 キャッシュクリアして再取得"):
             st.cache_data.clear()
@@ -3870,7 +3877,7 @@ with tabs[1]:
 
     colA, colB, colC = st.columns(3)
     with colA:
-        bt_pair = st.selectbox("バックテスト対象ペア", PAIR_LIST_DEFAULT, index=0)
+        bt_pair = st.selectbox("バックテスト対象ペア", PAIR_LIST_ALL, index=0)
         bt_period = st.selectbox("BT期間", ["5y", "10y"], index=1)
         train_years = st.number_input("train_years", min_value=1, max_value=8, value=3, step=1)
     with colB:
