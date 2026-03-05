@@ -1,3 +1,4 @@
+
 # backtest_ev_v1_fixed.py
 # Ver1: EVゲート簡易ウォークフォワード検証
 # - Streamlit Cloud / yfinance レート制限を避けるため、基本は Stooq (daily) を使用
@@ -41,7 +42,23 @@ _STOOQ_MAP = {
 
 def _stooq_symbol(pair_symbol: str) -> Optional[str]:
     s = (pair_symbol or "").strip().upper()
-    return _STOOQ_MAP.get(s)
+    if s in _STOOQ_MAP:
+        return _STOOQ_MAP.get(s)
+
+    # Auto-derive for most FX tickers like EURGBP=X -> eurgbp
+    # (Stooq uses lower-case 6-letter pair codes for many FX series.)
+    if s.endswith("=X"):
+        base = s[:-2]
+        base = base.replace("/", "").replace("-", "").strip()
+        if len(base) == 6 and base.isalpha():
+            return base.lower()
+
+    # also accept plain 6-letter forms
+    base = s.replace("/", "").replace("-", "").strip()
+    if len(base) == 6 and base.isalpha():
+        return base.lower()
+
+    return None
 
 
 def _parse_period_to_days(period: str) -> int:
