@@ -349,6 +349,12 @@ except Exception:
 
 # ---- local modules ----
 import logic
+import importlib as _importlib
+try:
+    _importlib.reload(logic)
+except Exception:
+    pass
+
 
 # Integrated external features
 try:
@@ -2623,7 +2629,12 @@ def _style_defaults(style_name: str) -> Dict[str, Any]:
 
 def _build_ctx(pair_label: str, df: pd.DataFrame, feats: Dict[str, float], horizon_days: int, min_expected_R: float, style_name: str,
                governor_cfg: Dict[str, Any]) -> Dict[str, Any]:
-    indicators = logic.compute_indicators(df)
+    # indicators may not exist if a stale/incorrect logic module is loaded
+    try:
+        indicators = logic.compute_indicators(df) if hasattr(logic, 'compute_indicators') else {}
+    except Exception:
+        indicators = {}
+
     ctx: Dict[str, Any] = {}
     ctx.update(indicators)
     ctx.update(feats)
