@@ -31,6 +31,80 @@ except Exception:
 import requests
 import pandas as pd
 
+# ---- JP display helpers (SBI運用向け) ----
+def _order_type_jp(order_type: str) -> str:
+    t = (order_type or "").strip().upper()
+    mp = {"MARKET": "成行", "LIMIT": "指値", "STOP": "逆指値"}
+    return mp.get(t, t or "—")
+
+def _entry_type_jp(entry_type: str) -> str:
+    t = (entry_type or "").strip().upper()
+    mp = {
+        "MARKET_NOW": "成行（即時）",
+        "MARKET": "成行（即時）",
+        "LIMIT_PULLBACK": "指値（押し目/戻り）",
+        "LIMIT": "指値",
+        "STOP_BREAKOUT": "逆指値（ブレイク）",
+        "STOP_BREAKDOWN": "逆指値（ブレイクダウン）",
+        "STOP": "逆指値",
+    }
+    return mp.get(t, t or "—")
+
+# ---- indicators compat (古いlogicでも落とさない) ----
+def _compute_indicators_fallback(df: pd.DataFrame) -> Dict[str, Any]:
+    try:
+        if df is None or df.empty or len(df) < 5:
+            return {"ema20": 0.0, "ema50": 0.0, "atr14": 0.0, "adx14": 0.0}
+        d = df.copy()
+        for c in ["Open", "High", "Low", "Close"]:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+        d = d.dropna(subset=["High", "Low", "Close"])
+        close = d["Close"].astype(float)
+
+        # EMA
+        ema20 = close.ewm(span=20, adjust=False).mean().iloc[-1]
+        ema50 = close.ewm(span=50, adjust=False).mean().iloc[-1]
+
+        # ATR(14)
+        high = d["High"].astype(float)
+        low = d["Low"].astype(float)
+        prev_close = close.shift(1)
+        tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+        atr14 = tr.rolling(14).mean().iloc[-1] if len(tr) >= 14 else float(tr.mean())
+
+        # ADX(14) (簡易・軽量版)
+        up_move = high.diff()
+        down_move = -low.diff()
+        plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+        minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+        atr = tr.rolling(14).sum()
+        plus_di = 100 * (plus_dm.rolling(14).sum() / atr.replace(0, pd.NA))
+        minus_di = 100 * (minus_dm.rolling(14).sum() / atr.replace(0, pd.NA))
+        dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, pd.NA))
+        adx14 = dx.rolling(14).mean().iloc[-1] if len(dx) >= 28 else float(dx.dropna().mean() if dx.notna().any() else 0.0)
+
+        return {"ema20": float(ema20), "ema50": float(ema50), "atr14": float(atr14 or 0.0), "adx14": float(adx14 or 0.0)}
+    except Exception:
+        return {"ema20": 0.0, "ema50": 0.0, "atr14": 0.0, "adx14": 0.0}
+
+def _compute_indicators_compat(df: pd.DataFrame) -> Dict[str, Any]:
+    fn = getattr(logic, "compute_indicators", None)
+    if callable(fn):
+        try:
+            out = fn(df)
+            if isinstance(out, dict):
+                # ensure keys exist
+                return {
+                    "ema20": float(out.get("ema20", 0.0) or 0.0),
+                    "ema50": float(out.get("ema50", 0.0) or 0.0),
+                    "atr14": float(out.get("atr14", 0.0) or 0.0),
+                    "adx14": float(out.get("adx14", 0.0) or 0.0),
+                }
+        except Exception:
+            pass
+    return _compute_indicators_fallback(df)
+
+
 # ===== RL core (WFA + Q-learning) definitions (must appear before any usage) =====
 def _phase_to_id(phase: str) -> int:
     p = str(phase or "").upper()
@@ -349,12 +423,6 @@ except Exception:
 
 # ---- local modules ----
 import logic
-import importlib as _importlib
-try:
-    _importlib.reload(logic)
-except Exception:
-    pass
-
 
 # Integrated external features
 try:
@@ -2629,12 +2697,7 @@ def _style_defaults(style_name: str) -> Dict[str, Any]:
 
 def _build_ctx(pair_label: str, df: pd.DataFrame, feats: Dict[str, float], horizon_days: int, min_expected_R: float, style_name: str,
                governor_cfg: Dict[str, Any]) -> Dict[str, Any]:
-    # indicators may not exist if a stale/incorrect logic module is loaded
-    try:
-        indicators = logic.compute_indicators(df) if hasattr(logic, 'compute_indicators') else {}
-    except Exception:
-        indicators = {}
-
+    indicators = _compute_indicators_compat(df)
     ctx: Dict[str, Any] = {}
     ctx.update(indicators)
     ctx.update(feats)
@@ -3815,27 +3878,12 @@ with tabs[1]:
         bt_horizon = st.number_input("horizon_days", min_value=1, max_value=14, value=int(horizon_days), step=1)
     with colC:
         bt_min_ev = st.slider("min_expected_R", 0.0, 0.3, float(min_expected_R), 0.01)
-        clear_wfa_cache = st.checkbox("（推奨）WFAキャッシュをクリアして実行", value=True,
-                                      help="ペアを変えても結果が同じになる場合、Streamlitのキャッシュが原因のことがあります。")
-
-    sym_preview = _pair_label_to_symbol(bt_pair)
-    st.caption(f"使用シンボル: {bt_pair} → {sym_preview}")
 
     run = st.button("バックテスト実行", type="primary")
     if run:
         try:
             import backtest_ev_v1
-
-            # If the backtest module (or its data loader) is cached incorrectly, results can become identical across pairs.
-            # Clearing cache here is safe (this tab only) and prevents false comparisons.
-            if clear_wfa_cache:
-                try:
-                    st.cache_data.clear()
-                except Exception:
-                    pass
-
             sym = _pair_label_to_symbol(bt_pair)
-
             wf_df, summ = backtest_ev_v1.run_backtest(
                 pair_symbol=sym,
                 period=bt_period,
@@ -3844,48 +3892,13 @@ with tabs[1]:
                 test_months=int(test_months),
                 min_expected_R=float(bt_min_ev),
             )
-
-            # Embed metadata so the CSV can't be mixed up later
-            try:
-                wf_df = wf_df.copy()
-                wf_df.insert(0, "pair", bt_pair)
-                wf_df.insert(1, "symbol", sym)
-            except Exception:
-                pass
-            try:
-                summ = dict(summ or {})
-                summ["pair"] = bt_pair
-                summ["symbol"] = sym
-            except Exception:
-                pass
-
-            # Same-result detector (common when cache key misses symbol)
-            try:
-                import hashlib as _hashlib
-                _csv_bytes_tmp = wf_df.to_csv(index=False).encode("utf-8")
-                _h = _hashlib.md5(_csv_bytes_tmp).hexdigest()
-                _prev_h = st.session_state.get("_wfa_prev_hash")
-                _prev_pair = st.session_state.get("_wfa_prev_pair")
-                if _prev_h and (_prev_h == _h) and _prev_pair and (_prev_pair != bt_pair):
-                    st.warning(f"⚠️ 前回（{_prev_pair}）と結果が完全一致しました。キャッシュ/シンボル変換の問題の可能性があります。"
-                               f"『WFAキャッシュをクリアして実行』をONにして再実行してください。")
-                st.session_state["_wfa_prev_hash"] = _h
-                st.session_state["_wfa_prev_pair"] = bt_pair
-            except Exception:
-                _csv_bytes_tmp = None
-
             st.markdown("### サマリー")
             st.json(summ)
             st.markdown("### WFA結果")
             st.dataframe(wf_df, use_container_width=True)
 
-            csv_bytes = (_csv_bytes_tmp if _csv_bytes_tmp is not None else wf_df.to_csv(index=False).encode("utf-8"))
-            st.download_button(
-                "CSVダウンロード",
-                data=csv_bytes,
-                file_name=f"ev_wfa_{bt_pair.replace('/','_')}.csv",
-                mime="text/csv",
-            )
+            csv = wf_df.to_csv(index=False).encode("utf-8")
+            st.download_button("CSVダウンロード", data=csv, file_name=f"ev_wfa_{bt_pair.replace('/','_')}.csv", mime="text/csv")
         except Exception as e:
             st.error(f"バックテストでエラー: {type(e).__name__}: {e}")
 
