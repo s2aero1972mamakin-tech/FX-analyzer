@@ -1646,6 +1646,101 @@ def _lot_multiplier(global_risk_index: Any, alpha: Any, floor: float = 0.2, ceil
     return float(x)
 
 
+def _apply_sbi_minlot_guard(plan: dict, *, sbi_min_lot: int = 1) -> dict:
+    """SBI（最小1建・小数不可）を前提に、縮退が効かない局面をAI側で『見送り』に倒す。
+
+    目的：
+      - 画面が「エントリー可」と出ても、実際は縮退できず事故りやすいケースを可視化＆抑制
+      - 根拠を“数値”で説明（SBI補正EV、EV余裕、必要余裕、実質リスク倍率）
+
+    方針（過度に見送り地獄にしないための段階制）：
+      - hard: 推奨ロット係数が極端に低い（<0.35）→ ほぼ確実に縮退必須なので見送り
+      - soft: 係数が低い（<0.55）かつ、EV余裕が薄い/イベント近接ガード中 → 見送り
+      - それ以外は元の decision を尊重
+    """
+    try:
+        if not isinstance(plan, dict):
+            return plan
+        decision = str(plan.get("decision", "NO_TRADE"))
+        # 既に見送りならそのまま
+        if decision != "TRADE":
+            plan["_sbi_exec_lots"] = 0
+            return plan
+
+        ctx = plan.get("_ctx", {}) if isinstance(plan.get("_ctx", {}), dict) else {}
+        ev = float(plan.get("expected_R_ev") or 0.0)
+        dyn = float(plan.get("dynamic_threshold") or 0.0)
+        lot_mult = float(plan.get("_lot_multiplier_reco") or 1.0)
+        lot_mult = max(0.000001, min(1.0, lot_mult))
+
+        # SBIは最小1建。ここでは「基準建玉=1」を前提に、縮退不能による実質リスク倍率を算出。
+        base_lots = 1.0
+        desired_lots = base_lots * lot_mult
+        exec_lots = max(float(sbi_min_lot), float(int(round(desired_lots))))
+        # roundで0になる可能性があるので再ガード
+        exec_lots = max(float(sbi_min_lot), exec_lots)
+
+        risk_x = float(exec_lots) / max(desired_lots, 1e-9)  # 例: 0.269→1建=3.7倍
+        ev_sbi = ev / max(risk_x, 1e-9)  # ＝ ev * desired/exec
+        ev_margin = ev - dyn
+
+        # 必要余裕（数値基準）
+        req_margin = 0.03  # 通常時の最低余裕
+        event_ban = bool(ctx.get("event_market_ban_active", False))
+        if event_ban:
+            req_margin += 0.03  # イベント近接中は余裕を上乗せ（見送り地獄防止のため控えめ）
+        if float(ctx.get("weekcross_risk") or 0.0) > 0.0:
+            req_margin += 0.02
+        if float(ctx.get("weekend_risk") or 0.0) > 0.0:
+            req_margin += 0.03
+        # 縮退不能の度合い（実質リスク倍率）を余裕に反映（上限0.10R）
+        req_margin += min(0.10, 0.04 * max(0.0, risk_x - 1.0))
+
+        hard_veto = (lot_mult < 0.35)
+        soft_veto = (lot_mult < 0.55) and (event_ban or (ev_margin < req_margin) or (ev_sbi < dyn))
+
+        # 情報はplanに格納（UI表示用）
+        plan["_sbi"] = {
+            "min_lot": int(sbi_min_lot),
+            "base_lots": base_lots,
+            "desired_lots": float(desired_lots),
+            "exec_lots": int(exec_lots),
+            "risk_x": float(risk_x),
+            "ev_sbi": float(ev_sbi),
+            "ev_margin": float(ev_margin),
+            "ev_margin_req": float(req_margin),
+            "event_ban": bool(event_ban),
+            "decision_sbi": "NO_TRADE" if (hard_veto or soft_veto) else "TRADE",
+        }
+        plan["_sbi_exec_lots"] = int(exec_lots) if not (hard_veto or soft_veto) else 0
+
+        if hard_veto or soft_veto:
+            reasons = []
+            reasons.append(f"SBI最小{int(sbi_min_lot)}建のため縮退不可（推奨係数{lot_mult:.3f}→実質リスク×{risk_x:.2f}）")
+            reasons.append(f"SBI補正EV {ev_sbi:+.3f} / 閾値 {dyn:.3f}")
+            reasons.append(f"EV余裕 {ev_margin:+.3f} / 必要余裕 {req_margin:.3f}" + ("（イベント近接）" if event_ban else ""))
+
+            plan["_decision_original"] = plan.get("decision")
+            plan["decision"] = "NO_TRADE"
+            plan["_decision_override_reason"] = "SBI最小1建ガード: " + " / ".join(reasons)
+
+            # veto表示にも反映（既存の理由を壊さない）
+            vr = plan.get("veto_reasons")
+            if not isinstance(vr, list):
+                vr = []
+            for r in reasons:
+                vr.append(r)
+            plan["veto_reasons"] = vr
+            plan["veto"] = vr
+
+            # why も補足
+            plan["why"] = " / ".join(reasons[:2])
+
+        return plan
+    except Exception:
+        # 失敗してもアプリを落とさない（安全側：元のplanを返す）
+        return plan
+
 
 
 def _apply_swing_lot_guards(lot_mult: float, plan: Any) -> float:
@@ -2592,8 +2687,25 @@ def _render_top_trade_panel(pair_label: str, plan: Dict[str, Any], current_price
     r3c1, r3c2 = st.columns(2)
     r3c1.metric("信頼度", f"{confidence:.2f}")
     # SBI想定：最小1建・小数建て不可のため、ロットは「整数建玉」で表示
-    sbi_lots = 0 if decision == "NO_TRADE" else 1
+    sbi_lots = int(plan.get("_sbi_exec_lots") or (0 if decision == "NO_TRADE" else 1))
     r3c2.metric("推奨建玉（SBI）", f"{sbi_lots}建")
+
+    # SBIガードの数値根拠（必要なときだけ）
+    sbi_info = plan.get("_sbi") if isinstance(plan.get("_sbi"), dict) else None
+    if isinstance(sbi_info, dict) and sbi_info:
+        try:
+            ev_sbi = float(sbi_info.get("ev_sbi") or 0.0)
+            risk_x = float(sbi_info.get("risk_x") or 1.0)
+            ev_margin = float(sbi_info.get("ev_margin") or 0.0)
+            req = float(sbi_info.get("ev_margin_req") or 0.0)
+            if decision == "NO_TRADE":
+                st.caption(f"SBI最小1建ガード：実質リスク×{risk_x:.2f} / SBI補正EV {ev_sbi:+.3f} / EV余裕 {ev_margin:+.3f}（必要 {req:.3f}）")
+            else:
+                # TRADEでも縮退推奨が残る場合は注意喚起だけ表示
+                if float(plan.get("_lot_multiplier_reco") or 1.0) < 0.80:
+                    st.caption(f"SBI参考：縮退推奨 係数{float(plan.get('_lot_multiplier_reco') or 1.0):.3f}（実質リスク×{risk_x:.2f}）")
+        except Exception:
+            pass
 
     if orig is not None and ovr:
         st.warning(f"判断は上書きされています：{_jp_decision(str(orig))} → {decision_jp}（理由：{ovr}）")
@@ -2800,7 +2912,7 @@ def _render_risk_dashboard(plan: Dict[str, Any], feats: Dict[str, float], ext_me
     # Next action hint
     hint = _action_hint(global_risk, war, fin, macro, bs_flag, gov_enabled)
     st.markdown(f"#### 次のアクション（提案）\n- {hint}")
-    st.caption(f"ガード設定: {str(guard_apply)} / 推奨ロット係数は最上段に表示。")
+    st.caption(f"ガード設定: {str(guard_apply)} / SBI最小1建前提で『縮退不能』は自動で見送りに倒す場合があります。")
 
     # Overlay notes (debug-level)
     if isinstance(overlay, dict) and overlay:
@@ -3033,7 +3145,7 @@ if "pair_label" not in st.session_state:
     st.session_state["pair_label"] = "USD/JPY"
 pair_label = st.session_state.get("pair_label", "USD/JPY")
 
-st.title("FX EV判断（スイング）")
+st.title("FX EV判断")
 
 with st.sidebar:
     st.header("運用操作（見る順）")
@@ -3372,6 +3484,10 @@ with tabs[0]:
 
             plan["_lot_multiplier_reco"] = float(_apply_swing_lot_guards(lot_mult, plan))
 
+
+            # SBI最小1建ガード（縮退できない局面はAI側で「見送り」に倒す）
+
+            plan = _apply_sbi_minlot_guard(plan, sbi_min_lot=1)
             plan_ui = plan
             try:
                 parts = (ext_meta or {}).get("parts", {}) if isinstance(ext_meta, dict) else {}
@@ -3577,6 +3693,10 @@ with tabs[0]:
 
         plan["_lot_multiplier_reco"] = float(_apply_swing_lot_guards(lot_mult, plan))
 
+
+        # SBI最小1建ガード（縮退できない局面はAI側で「見送り」に倒す）
+
+        plan = _apply_sbi_minlot_guard(plan, sbi_min_lot=1)
         plan_ui = plan
         try:
             parts = (ext_meta or {}).get("parts", {}) if isinstance(ext_meta, dict) else {}
