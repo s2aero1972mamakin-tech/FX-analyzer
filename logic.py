@@ -38,6 +38,10 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
+import ssl
+import tempfile
+from pathlib import Path
+import xml.etree.ElementTree as ET
 
 _FF_CAL_URL_DEFAULT = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 _EVENT_CACHE = {
@@ -47,6 +51,96 @@ _EVENT_CACHE = {
     "err": None,   # str
 }
 
+
+
+# Persistent file cache (survives Streamlit reruns / transient rate limits)
+_EVENT_FILE_CACHE_PATH = Path(tempfile.gettempdir()) / "fx_analyzer_ff_calendar_cache.json"
+
+def _read_event_file_cache(max_age_sec: int = 24 * 3600) -> Optional[List[dict]]:
+    try:
+        p = _EVENT_FILE_CACHE_PATH
+        if not p.exists():
+            return None
+        obj = json.loads(p.read_text(encoding="utf-8", errors="replace"))
+        if not isinstance(obj, dict):
+            return None
+        ts = float(obj.get("ts", 0.0) or 0.0)
+        data = obj.get("data", None)
+        if not isinstance(data, list):
+            return None
+        if ts > 0 and (time.time() - ts) > float(max_age_sec):
+            return None
+        return data
+    except Exception:
+        return None
+
+def _write_event_file_cache(url: str, data: List[dict]) -> None:
+    try:
+        p = _EVENT_FILE_CACHE_PATH
+        payload = {"ts": time.time(), "url": url, "data": data}
+        p.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+def _derive_xml_url(url: str) -> str:
+    u = str(url or "").strip()
+    if not u:
+        return "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
+    if ".json" in u:
+        return u.replace(".json", ".xml")
+    if u.endswith("/"):
+        u = u[:-1]
+    # fallback
+    return "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
+
+def _fetch_ff_calendar_xml(url: str, timeout: int = 12) -> Optional[List[dict]]:
+    """Parse ForexFactory weekly XML export into list[dict] compatible with _compute_event_risk."""
+    try:
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0 (fx-analyzer; event-guard)"})
+        ctx = None
+        try:
+            ctx = ssl.create_default_context()
+        except Exception:
+            ctx = None
+        try:
+            with urlopen(req, timeout=timeout, context=ctx) as resp:
+                raw = resp.read()
+        except TypeError:
+            # python without context param
+            with urlopen(req, timeout=timeout) as resp:
+                raw = resp.read()
+
+        # XML is often windows-1252
+        txt = raw.decode("utf-8", errors="replace")
+        # Some servers send the XML declaration with windows-1252; ElementTree can parse bytes too.
+        root = ET.fromstring(txt)
+        out: List[dict] = []
+        ny_tz = ZoneInfo("America/New_York")
+        for ev in root.findall(".//event"):
+            title = (ev.findtext("title") or "").strip()
+            ctry = (ev.findtext("country") or "").strip().upper()
+            impact = (ev.findtext("impact") or "").strip()
+            date_s = (ev.findtext("date") or "").strip()
+            time_s = (ev.findtext("time") or "").strip()
+            # Date is typically MM-DD-YYYY in FF XML export
+            dt_obj = None
+            try:
+                mm, dd, yy = date_s.split("-")
+                hh, mi = (time_s.split(":") + ["0"])[:2] if time_s else ("0","0")
+                dt_obj = datetime(int(yy), int(mm), int(dd), int(hh), int(mi), 0, tzinfo=ny_tz)
+            except Exception:
+                dt_obj = None
+            if dt_obj is None:
+                continue
+            out.append({
+                "title": title,
+                "country": ctry,
+                "impact": impact,
+                "timestamp": float(dt_obj.astimezone(timezone.utc).timestamp()),
+            })
+        return out if out else None
+    except Exception:
+        return None
 def _pair_to_ccys(pair: str) -> Tuple[str, str]:
     s = (pair or "").upper().replace(" ", "")
     s = s.replace("_", "/")
@@ -70,26 +164,74 @@ def _round_to_pip(x: float, pair: str) -> float:
         return float(round(float(x) / p) * p)
     except Exception:
         return float(x)
+
 def _fetch_ff_calendar(url: str, timeout: int = 12, ttl_sec: int = 1800) -> Tuple[Optional[List[dict]], str]:
-    """
-    Fetch weekly economic calendar JSON with very small cache to avoid rate limits.
-    Returns (data, status_string).
+    """Fetch weekly economic calendar (JSON preferred) with robust caching + XML/file fallback.
+
+    Streamlit Cloud reruns the script frequently. Also, the free FF weekly export can occasionally
+    return 429/5xx or time out. We therefore:
+      1) use in-memory TTL cache
+      2) try JSON fetch
+      3) on failure, try XML export (same host)
+      4) on failure, fall back to a local file cache (<=24h)
     """
     now = time.time()
-    if (_EVENT_CACHE["data"] is not None) and (_EVENT_CACHE["url"] == url) and (now - float(_EVENT_CACHE["ts"]) < ttl_sec):
+
+    # 1) in-memory cache
+    if (_EVENT_CACHE.get("data") is not None) and (_EVENT_CACHE.get("url") == url) and (now - float(_EVENT_CACHE.get("ts", 0.0)) < float(ttl_sec)):
         return _EVENT_CACHE["data"], "cache"
 
+    def _urlopen_bytes(req: Request) -> bytes:
+        # Default SSL context; on TLS issues fall back to unverified context
+        try:
+            ctx = ssl.create_default_context()
+        except Exception:
+            ctx = None
+        try:
+            try:
+                with urlopen(req, timeout=timeout, context=ctx) as resp:
+                    return resp.read()
+            except TypeError:
+                with urlopen(req, timeout=timeout) as resp:
+                    return resp.read()
+        except Exception:
+            # last resort (some environments)
+            try:
+                uctx = ssl._create_unverified_context()
+                with urlopen(req, timeout=timeout, context=uctx) as resp:
+                    return resp.read()
+            except Exception:
+                raise
+
+    # 2) JSON fetch
     try:
-        req = Request(url, headers={"User-Agent": "Mozilla/5.0 (fx-analyzer; event-guard)"})
-        with urlopen(req, timeout=timeout) as resp:
-            raw = resp.read()
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0 (fx-analyzer; event-guard)", "Accept": "application/json,text/plain,*/*"})
+        raw = _urlopen_bytes(req)
         data = json.loads(raw.decode("utf-8", errors="replace"))
         if not isinstance(data, list):
             raise ValueError("calendar json is not a list")
         _EVENT_CACHE.update({"ts": now, "url": url, "data": data, "err": None})
+        _write_event_file_cache(url, data)
         return data, "ok"
-    except Exception as e:
-        _EVENT_CACHE.update({"ts": now, "url": url, "data": None, "err": f"{type(e).__name__}: {e}"})
+    except Exception as e_json:
+        # 3) XML fallback
+        try:
+            xml_url = _derive_xml_url(url)
+            data_xml = _fetch_ff_calendar_xml(xml_url, timeout=timeout)
+            if isinstance(data_xml, list) and data_xml:
+                _EVENT_CACHE.update({"ts": now, "url": url, "data": data_xml, "err": f"json_fail={type(e_json).__name__}"})
+                _write_event_file_cache(url, data_xml)
+                return data_xml, "ok"
+        except Exception:
+            pass
+
+        # 4) file cache fallback
+        cached = _read_event_file_cache(max_age_sec=24 * 3600)
+        if isinstance(cached, list) and cached:
+            _EVENT_CACHE.update({"ts": now, "url": url, "data": cached, "err": f"json_fail={type(e_json).__name__}: {e_json}"})
+            return cached, "cache"
+
+        _EVENT_CACHE.update({"ts": now, "url": url, "data": None, "err": f"{type(e_json).__name__}: {e_json}"})
         return None, "fail"
 
 def _parse_event_dt(item: dict) -> Optional[datetime]:
@@ -980,8 +1122,8 @@ def get_ai_order_strategy(
     # -----------------------------------------------------------------
     # 6.5) 経済指標/イベント（直前の実行リスク + 直後の捕獲）
     # -----------------------------------------------------------------
-    event_guard_enable = True
-    event_block_window = True
+    event_guard_enable = bool(ctx_in.get('event_guard_enable', True))
+    event_block_window = bool(ctx_in.get('event_block_high_impact_window', True))
     event_horizon_hours = int(_safe_float(ctx_in.get("event_horizon_hours", 168), 168))
     event_past_lookback_hours = int(_safe_float(ctx_in.get("event_past_lookback_hours", 24), 24))
     event_window_minutes = int(_safe_float(ctx_in.get("event_window_minutes", 60), 60))
