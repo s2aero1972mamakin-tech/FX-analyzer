@@ -1680,3 +1680,78 @@ def get_ai_order_strategy(
     return plan
 
 # End of file
+
+
+
+
+# ===============================
+# FX_AI_PRO_v7 FULL PATCH BLOCK
+# (non-breaking additive upgrades)
+# ===============================
+
+# --- probability normalization ---
+def _normalize_probs(p_up: float, p_dn: float):
+    try:
+        p_up = float(p_up)
+        p_dn = float(p_dn)
+        s = p_up + p_dn
+        if s > 1.0 and s > 0:
+            p_up = p_up / s
+            p_dn = p_dn / s
+        return p_up, p_dn
+    except Exception:
+        return 0.5, 0.5
+
+
+# --- volatility regime detection ---
+def _volatility_regime(df):
+    try:
+        atr = (df["High"] - df["Low"]).rolling(14).mean()
+        atr_mean = atr.rolling(50).mean()
+        if atr.iloc[-1] > 1.4 * atr_mean.iloc[-1]:
+            return "VOL_EXPANSION"
+        elif atr.iloc[-1] < 0.7 * atr_mean.iloc[-1]:
+            return "VOL_COMPRESSION"
+        return "VOL_NORMAL"
+    except Exception:
+        return "VOL_UNKNOWN"
+
+
+# --- liquidity sweep detection ---
+def _detect_liquidity_sweep(df):
+    try:
+        highs = df["High"].astype(float)
+        lows = df["Low"].astype(float)
+
+        recent_high = highs.tail(20).max()
+        prev_high = highs.tail(40).head(20).max()
+
+        recent_low = lows.tail(20).min()
+        prev_low = lows.tail(40).head(20).min()
+
+        sweep_up = recent_high > prev_high * 1.0005
+        sweep_down = recent_low < prev_low * 0.9995
+
+        return {"sweep_up": bool(sweep_up), "sweep_down": bool(sweep_down)}
+    except Exception:
+        return {"sweep_up": False, "sweep_down": False}
+
+
+# --- no-lookahead helper (use closed bar) ---
+def _last_closed(series):
+    try:
+        return series.iloc[-2]
+    except Exception:
+        return series.iloc[-1]
+
+
+# --- improved trend strength model ---
+def _trend_strength_v7(adx, slope, atr_expansion):
+    try:
+        return max(0.0, min(1.0, 0.5*adx + 0.3*slope + 0.2*atr_expansion))
+    except Exception:
+        return 0.0
+
+# ===============================
+# END PATCH
+# ===============================
