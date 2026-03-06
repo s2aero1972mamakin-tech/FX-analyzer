@@ -1466,7 +1466,7 @@ def _render_hold_manage_panel(pair_label: str, ctx_in: Dict[str, Any], plan_ui: 
 
         c1, c2, c3 = st.columns([1,1,2])
         with c1:
-            if st.button("📌 このプランで保有開始登録", key=f"pos_register_{pair_label}"):
+            if st.button("📌 このプランで保有開始として登録", key=f"pos_register_{pair_label}"):
                 st.session_state[pos_key] = {
                     "pair": str(pair_label),
                     "side": str(side_plan).upper(),
@@ -1567,7 +1567,7 @@ def _render_hold_manage_panel(pair_label: str, ctx_in: Dict[str, Any], plan_ui: 
 def _render_logging_panel(pair_label: str, plan_ui: Dict[str, Any], ctx: Dict[str, Any], feats: Dict[str, Any],
                           price_meta: Dict[str, Any], ext_meta: Dict[str, Any]):
     """UI: save signal + record trade outcome. Keeps everything optional and non-blocking."""
-    st.markdown("### 📝 シグナル/損益ログ")
+    st.markdown("### 📝 シグナル/損益ログ（運用用）")
     with st.expander("📝 保存（signals / trades）+ 外部Sink（Webhook/Supabase）", expanded=False):
         row = _build_signal_row(pair_label, ctx, feats, plan_ui, price_meta=price_meta, ext_meta=ext_meta)
         st.caption("運用の第一歩：**『シグナル保存 → 決済後に損益保存 → パフォーマンス自動集計』** の流れを固定します。")
@@ -3636,10 +3636,10 @@ with tabs[0]:
 
         if trade_ranked:
             best = trade_ranked[0]
-            st.markdown(f"## 🧠 AI選択：トレードペア  **{best['pair']}**")
+            st.markdown(f"## 🧠 AI選択：本日の実行ペア  **{best['pair']}**")
         else:
             best = ranked[0]
-            st.markdown("## 🧠 AI選択：**見送り**")
+            st.markdown("## 🧠 AI選択：本日は **見送り**（トレード候補なし）")
             st.caption("※ SBI最小1建ガード・イベント近接・閾値条件により、相場全体で見ても全ペアが見送り判定です。")
 
         plan = best["_plan"]
@@ -4121,3 +4121,21 @@ with st.expander("🔧 Webhook診断（送信テスト/失敗理由の表示）"
 
 
 
+
+# ===============================
+# FX_AI_PRO_v7 MAIN PATCH BLOCK
+# ===============================
+
+def _safe_probabilities(p_up, p_dn):
+    try:
+        s = p_up + p_dn
+        if s > 1:
+            p_up /= s
+            p_dn /= s
+        return p_up, p_dn
+    except Exception:
+        return 0.5, 0.5
+
+# ===============================
+# END PATCH
+# ===============================
