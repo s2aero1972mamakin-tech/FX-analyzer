@@ -1567,7 +1567,7 @@ def _render_hold_manage_panel(pair_label: str, ctx_in: Dict[str, Any], plan_ui: 
 def _render_logging_panel(pair_label: str, plan_ui: Dict[str, Any], ctx: Dict[str, Any], feats: Dict[str, Any],
                           price_meta: Dict[str, Any], ext_meta: Dict[str, Any]):
     """UI: save signal + record trade outcome. Keeps everything optional and non-blocking."""
-    st.markdown("### 📝 シグナル/損益ログ（運用用）")
+    st.markdown("### 📝 シグナル/損益ログ")
     with st.expander("📝 保存（signals / trades）+ 外部Sink（Webhook/Supabase）", expanded=False):
         row = _build_signal_row(pair_label, ctx, feats, plan_ui, price_meta=price_meta, ext_meta=ext_meta)
         st.caption("運用の第一歩：**『シグナル保存 → 決済後に損益保存 → パフォーマンス自動集計』** の流れを固定します。")
@@ -4118,4 +4118,5 @@ with st.expander("🔧 Webhook診断（送信テスト/失敗理由の表示）"
         st.caption("直近の送信結果（デバッグ）")
         st.json(st.session_state["last_webhook_result"])
 # --- /Webhook Diagnostics ---
+
 
