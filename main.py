@@ -3636,10 +3636,10 @@ with tabs[0]:
 
         if trade_ranked:
             best = trade_ranked[0]
-            st.markdown(f"## 🧠 AI選択：本日の実行ペア  **{best['pair']}**")
+            st.markdown(f"## 🧠 AI選択：トレードペア  **{best['pair']}**")
         else:
             best = ranked[0]
-            st.markdown("## 🧠 AI選択：本日は **見送り**（トレード候補なし）")
+            st.markdown("## 🧠 AI選択：**見送り**")
             st.caption("※ SBI最小1建ガード・イベント近接・閾値条件により、相場全体で見ても全ペアが見送り判定です。")
 
         plan = best["_plan"]
@@ -4118,3 +4118,4 @@ with st.expander("🔧 Webhook診断（送信テスト/失敗理由の表示）"
         st.caption("直近の送信結果（デバッグ）")
         st.json(st.session_state["last_webhook_result"])
 # --- /Webhook Diagnostics ---
+
