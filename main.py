@@ -1466,7 +1466,7 @@ def _render_hold_manage_panel(pair_label: str, ctx_in: Dict[str, Any], plan_ui: 
 
         c1, c2, c3 = st.columns([1,1,2])
         with c1:
-            if st.button("📌 このプランで保有開始として登録", key=f"pos_register_{pair_label}"):
+            if st.button("📌 このプランで保有開始登録", key=f"pos_register_{pair_label}"):
                 st.session_state[pos_key] = {
                     "pair": str(pair_label),
                     "side": str(side_plan).upper(),
@@ -4118,5 +4118,6 @@ with st.expander("🔧 Webhook診断（送信テスト/失敗理由の表示）"
         st.caption("直近の送信結果（デバッグ）")
         st.json(st.session_state["last_webhook_result"])
 # --- /Webhook Diagnostics ---
+
 
 
