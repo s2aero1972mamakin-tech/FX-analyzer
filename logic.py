@@ -1,4 +1,72 @@
 
+# ------------------- B-RANK + PROP AI PATCH -------------------
+
+def _range_center_penalty(range_pos: float) -> float:
+    try:
+        d = abs(range_pos - 0.5)
+        if d < 0.15:
+            return 0.35
+        if d < 0.25:
+            return 0.15
+        return 0.0
+    except:
+        return 0.0
+
+def _event_unknown_adjust(ev_meta):
+    try:
+        if not ev_meta.get("ok", True):
+            return 0.15
+        return 0.0
+    except:
+        return 0.0
+
+def _liquidity_sweep(df):
+    try:
+        if len(df) < 5:
+            return False
+        h = df["High"].astype(float)
+        l = df["Low"].astype(float)
+        c = df["Close"].astype(float)
+        prev_high = h.iloc[-2]
+        prev_low = l.iloc[-2]
+        last_close = c.iloc[-1]
+        if h.iloc[-1] > prev_high and last_close < prev_high:
+            return True
+        if l.iloc[-1] < prev_low and last_close > prev_low:
+            return True
+        return False
+    except:
+        return False
+
+def _volatility_expansion(df):
+    try:
+        c = df["Close"].astype(float)
+        if len(c) < 30:
+            return 0.0
+        r = c.pct_change().rolling(10).std().iloc[-1]
+        r2 = c.pct_change().rolling(30).std().iloc[-1]
+        if r2 == 0:
+            return 0.0
+        return min(1.0, r / r2)
+    except:
+        return 0.0
+
+def _market_regime(df):
+    try:
+        if len(df) < 100:
+            return "UNKNOWN"
+        c = df["Close"].astype(float)
+        ma50 = c.rolling(50).mean().iloc[-1]
+        ma200 = c.rolling(200).mean().iloc[-1] if len(c) >= 200 else c.rolling(100).mean().iloc[-1]
+        if ma50 > ma200:
+            return "BULL"
+        elif ma50 < ma200:
+            return "BEAR"
+        return "RANGE"
+    except:
+        return "UNKNOWN"
+
+
 
 
 # logic_fixed28_trend_entry_engine_compat.py
@@ -1310,6 +1378,17 @@ def get_ai_order_strategy(
     ccy_bonus = float(_clamp(ccy_bonus, 0.0, 0.04))
 
     ev_gate = float(ev_raw + mom_bonus + ccy_bonus)
+    ev_gate = ev_gate * _quality_decay(strength, breakout_ok, hhhl_ok, confidence)
+    ev_gate -= _range_center_penalty(range_pos)
+    ev_gate -= _event_unknown_adjust(ev_meta)
+    if _liquidity_sweep(df):
+        ev_gate -= 0.25
+    vol_exp = _volatility_expansion(df)
+    ev_gate += 0.08 * vol_exp
+    regime = _market_regime(df)
+    if regime == "RANGE":
+        ev_gate -= 0.15
+    
     ev_gate = ev_gate * _quality_decay(strength, breakout_ok, hhhl_ok, confidence)
 
     # -----------------------------------------------------------------
