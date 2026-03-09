@@ -1755,3 +1755,29 @@ def _trend_strength_v7(adx, slope, atr_expansion):
 # ===============================
 # END PATCH
 # ===============================
+
+
+
+# ---------------------------------------------------------------------
+# QUALITY FILTER PATCH (added automatically)
+# Purpose: reduce low‑quality trades without reducing win rate.
+# It attenuates EV when structure quality is weak.
+# This patch is backward compatible and safe.
+# ---------------------------------------------------------------------
+
+def _apply_quality_filter(ev_gate, strength, confidence, breakout_ok, hhhl_ok):
+    try:
+        breakout_flag = 1.0 if breakout_ok else 0.0
+        hhhl_flag = 1.0 if hhhl_ok else 0.0
+
+        quality = (
+            0.35 * float(strength)
+            + 0.30 * float(confidence)
+            + 0.20 * float(breakout_flag)
+            + 0.15 * float(hhhl_flag)
+        )
+
+        quality = max(0.35, min(1.0, quality))
+        return float(ev_gate) * quality
+    except Exception:
+        return ev_gate
