@@ -853,7 +853,7 @@ def _slope_norm(s: pd.Series, lookback: int = 10) -> float:
     return float(dy / (sd * math.sqrt(lookback)))
 
 
-# --- PATCH: SHORT structure separation + RR floor gate ---
+# --- PATCH: SHORT structure separation ---
 def _ll_lh_ok(df, n: int = 20) -> bool:
     try:
         if len(df) < n + 5:
@@ -1158,6 +1158,7 @@ def get_ai_order_strategy(
 
     breakout_ok, breakout_strength = _breakout_strength(df, 20)
     hhhl_ok = _hh_hl_ok(df, 30)
+    lllh_ok = _ll_lh_ok(df, 30)
 
     # 表示用ラベル（NameError根絶）
     if str(phase) == "RANGE":
@@ -1213,13 +1214,8 @@ def get_ai_order_strategy(
     if risk <= 1e-9:
         risk = atr14
     rr = reward / risk
-
-    # --- PATCH: RR minimum gate ---
-    rr_min = float(ctx_in.get("rr_min_floor", 1.0))
-    if rr < rr_min:
-        veto.append(f"RR不足: {rr:.2f} < {rr_min:.2f}")
-        decision = "NO_TRADE"
-
+    rr_min = float(ctx_in.get("rr_min_floor", 1.0) or 1.0)
+    rr_floor_fail = bool(rr < rr_min)
 
     # -----------------------------------------------------------------
     # 5) 勝率 proxy（モデル）→ confidenceで縮退（p_eff）
@@ -1232,7 +1228,8 @@ def get_ai_order_strategy(
     p_win_model = float(_clamp(p_win_model - _failure_features(df), 0.20, 0.80))
 
     # 信頼度（0..1）
-    structure_flag = 1.0 if (breakout_ok or hhhl_ok) else 0.0
+    structure_ok_dir = (breakout_ok or (hhhl_ok if direction == "LONG" else lllh_ok))
+    structure_flag = 1.0 if structure_ok_dir else 0.0
     confidence = float(_clamp(
         0.30
         + 0.40 * float(strength)
@@ -1435,7 +1432,7 @@ def get_ai_order_strategy(
     # 9) 構造ゲート（最優先）
     # -----------------------------------------------------------------
     breakout_pass = bool(_entry_timing_filter(df, direction) and 
-        (breakout_ok or hhhl_ok)
+        (breakout_ok or (hhhl_ok if direction == "LONG" else lllh_ok))
         and (float(cont_best) >= 0.57)
         and (max(float(strength), float(breakout_strength)) >= 0.35)
         and (float(macro_risk) <= 0.90)
@@ -1465,12 +1462,12 @@ def get_ai_order_strategy(
         center_avoid = bool(abs(float(range_pos) - 0.5) >= 0.18)
         structure_ok = bool((breakout_pass or range_edge_setup) and center_avoid)
     else:
-        if (float(strength) < 0.18) and not (breakout_ok or hhhl_ok):
+        if (float(strength) < 0.18) and not (breakout_ok or (hhhl_ok if direction == "LONG" else lllh_ok)):
             structure_ok = False
 
     # POST_BREAKOUTはブレイク根拠必須（取り逃がし防止と事故回避を両立）
     if event_mode == "POST_BREAKOUT":
-        structure_ok = bool(breakout_ok or hhhl_ok)
+        structure_ok = bool(breakout_ok or (hhhl_ok if direction == "LONG" else lllh_ok))
 
     # -----------------------------------------------------------------
     # 10) veto/decision（veto乱立を抑える）
@@ -1486,8 +1483,14 @@ def get_ai_order_strategy(
     why = ""
     gate_mode = "raw+mom"
 
+    if rr_floor_fail:
+        _veto(f"RR不足: {rr:.2f} < {rr_min:.2f}")
+        decision = "NO_TRADE"
+
     # mandatory event window block
-    if event_guard_enable and event_block_window and event_mode == "EVENT_WINDOW":
+    if rr_floor_fail:
+        pass
+    elif event_guard_enable and event_block_window and event_mode == "EVENT_WINDOW":
         gate_mode = "event_block"
         why = f"高インパクト指標の前後（±{event_window_minutes}分）のため見送り"
         _veto(why)
@@ -1620,6 +1623,7 @@ def get_ai_order_strategy(
         "cont_p_up": float(p_up),
         "cont_p_dn": float(p_dn),
         "hh_hl_ok": bool(hhhl_ok),
+        "ll_lh_ok": bool(lllh_ok),
         "breakout_ok": bool(breakout_ok),
         "breakout_strength": float(breakout_strength),
         "breakout_pass": bool(breakout_pass),
