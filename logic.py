@@ -128,6 +128,36 @@ def _failure_features(df):
         return 0.0
 # --- END PATCH ---
 
+
+
+# ===================== TP OPTIMIZER PATCH =====================
+
+def _liquidity_pool_tp(df, direction, lookback=40):
+    try:
+        high = df["High"].astype(float)
+        low = df["Low"].astype(float)
+        recent_high = float(high.tail(lookback).max())
+        recent_low = float(low.tail(lookback).min())
+        return recent_high if direction == "LONG" else recent_low
+    except Exception:
+        return None
+
+def _regime_tp_multiple(phase_label):
+    try:
+        if str(phase_label).startswith("BREAKOUT"):
+            return 3.0
+        if phase_label in ("UP_TREND", "DOWN_TREND"):
+            return 2.5
+        if "TRANSITION" in str(phase_label):
+            return 1.8
+        if phase_label == "RANGE":
+            return 1.3
+        return 2.0
+    except Exception:
+        return 2.0
+
+# ===============================================================
+
 from dataclasses import dataclass
 from typing import Dict, Any, Optional, Tuple, List
 
@@ -1201,12 +1231,20 @@ def get_ai_order_strategy(
     atr14 = float(_atr(df, 14).iloc[-1])
     atr14 = max(atr14, 1e-6)
 
-    if direction == "LONG":
-        sl = min(last - 1.2 * atr14, recent_low - 0.15 * atr14)
-        tp = last + (2.2 * atr14 if phase_label in ("UP_TREND",) else 1.6 * atr14)
-    else:
-        sl = max(last + 1.2 * atr14, recent_high + 0.15 * atr14)
-        tp = last - (2.2 * atr14 if phase_label in ("DOWN_TREND",) else 1.6 * atr14)
+    
+if direction == "LONG":
+    sl = min(last - 1.2 * atr14, recent_low - 0.15 * atr14)
+    regime_mult = _regime_tp_multiple(phase_label)
+    atr_tp = last + regime_mult * atr14
+    liq_tp = _liquidity_pool_tp(df, "LONG")
+    tp = max(atr_tp, liq_tp) if liq_tp else atr_tp
+else:
+    sl = max(last + 1.2 * atr14, recent_high + 0.15 * atr14)
+    regime_mult = _regime_tp_multiple(phase_label)
+    atr_tp = last - regime_mult * atr14
+    liq_tp = _liquidity_pool_tp(df, "SHORT")
+    tp = min(atr_tp, liq_tp) if liq_tp else atr_tp
+last - (2.2 * atr14 if phase_label in ("DOWN_TREND",) else 1.6 * atr14)
 
     entry = last
     risk = abs(entry - sl)
