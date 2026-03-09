@@ -11,6 +11,52 @@
 
 from __future__ import annotations
 
+
+# --- AI Quality / Timing / Failure Feature Patch (Auto-added) ---
+def _quality_decay(strength, breakout_ok, hhhl_ok, confidence):
+    q = (
+        0.40 * float(strength) +
+        0.30 * float(confidence) +
+        0.20 * (1.0 if breakout_ok else 0.0) +
+        0.10 * (1.0 if hhhl_ok else 0.0)
+    )
+    q = max(0.35, min(1.0, q))
+    return q
+
+def _entry_timing_filter(df, direction):
+    try:
+        o = df["Open"].astype(float)
+        h = df["High"].astype(float)
+        l = df["Low"].astype(float)
+        c = df["Close"].astype(float)
+        if len(c) < 3:
+            return True
+        if direction == "LONG":
+            cond = (c.iloc[-1] > c.iloc[-2]) and (c.iloc[-1] > o.iloc[-1])
+        else:
+            cond = (c.iloc[-1] < c.iloc[-2]) and (c.iloc[-1] < o.iloc[-1])
+        return bool(cond)
+    except Exception:
+        return True
+
+def _failure_features(df):
+    try:
+        c = df["Close"].astype(float)
+        h = df["High"].astype(float)
+        l = df["Low"].astype(float)
+        o = df["Open"].astype(float)
+        if len(c) < 5:
+            return 0.0
+        body = abs(c.iloc[-1] - o.iloc[-1])
+        rng = max(1e-9, h.iloc[-1] - l.iloc[-1])
+        wick_ratio = (rng - body) / rng
+        pullback = abs(c.iloc[-1] - c.iloc[-3]) / max(1e-9, rng)
+        penalty = min(0.4, wick_ratio * 0.5 + pullback * 0.3)
+        return penalty
+    except Exception:
+        return 0.0
+# --- END PATCH ---
+
 from dataclasses import dataclass
 from typing import Dict, Any, Optional, Tuple, List
 
@@ -1084,7 +1130,7 @@ def get_ai_order_strategy(
         p_win_model = 0.46 + 0.42 * _clamp((float(p_up) - 0.5) * 2.0, -1.0, 1.0) + 0.10 * (float(strength) - 0.5)
     else:
         p_win_model = 0.46 + 0.42 * _clamp((float(p_dn) - 0.5) * 2.0, -1.0, 1.0) + 0.10 * (float(strength) - 0.5)
-    p_win_model = float(_clamp(p_win_model, 0.20, 0.80))
+    p_win_model = float(_clamp(p_win_model - _failure_features(df), 0.20, 0.80))
 
     # 信頼度（0..1）
     structure_flag = 1.0 if (breakout_ok or hhhl_ok) else 0.0
@@ -1092,7 +1138,7 @@ def get_ai_order_strategy(
         0.30
         + 0.40 * float(strength)
         + 0.18 * (float(cont_best) - 0.5)
-        + 0.08 * _clamp(float(rr - 1.0), -1.0, 2.0)
+        + 0.0
         + 0.04 * float(structure_flag),
         0.0, 1.0
     ))
@@ -1264,11 +1310,12 @@ def get_ai_order_strategy(
     ccy_bonus = float(_clamp(ccy_bonus, 0.0, 0.04))
 
     ev_gate = float(ev_raw + mom_bonus + ccy_bonus)
+    ev_gate = ev_gate * _quality_decay(strength, breakout_ok, hhhl_ok, confidence)
 
     # -----------------------------------------------------------------
     # 9) 構造ゲート（最優先）
     # -----------------------------------------------------------------
-    breakout_pass = bool(
+    breakout_pass = bool(_entry_timing_filter(df, direction) and 
         (breakout_ok or hhhl_ok)
         and (float(cont_best) >= 0.57)
         and (max(float(strength), float(breakout_strength)) >= 0.35)
@@ -1342,6 +1389,9 @@ def get_ai_order_strategy(
         # EV gate (post-breakout has its own rescue)
         if ev_gate >= float(dynamic_threshold):
             decision = "TRADE"
+            if not _entry_timing_filter(df, direction):
+                decision = "NO_TRADE"
+                veto.append("Entry timing filter rejected")
             why = f"EV通過: {ev_gate:+.3f} ≥ 動的閾値 {float(dynamic_threshold):.3f}"
         elif event_mode == "POST_BREAKOUT" and (ev_gate >= float(dynamic_threshold) - 0.08) and float(confidence) >= 0.42:
             decision = "TRADE"
