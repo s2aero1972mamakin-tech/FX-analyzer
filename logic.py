@@ -1216,7 +1216,6 @@ def get_ai_order_strategy(
     lllh_ok = _ll_lh_ok(df, 30)
     structure_long = bool(hhhl_ok or breakout_ok)
     structure_short = bool(lllh_ok or breakout_ok)
-    structure_dir_ok = bool(structure_long if direction == "LONG" else structure_short)
 
     # 表示用ラベル（NameError根絶）
     if str(phase) == "RANGE":
@@ -1252,6 +1251,7 @@ def get_ai_order_strategy(
             direction = "SHORT"
 
     side = "BUY" if direction == "LONG" else "SELL"
+    structure_dir_ok = bool(structure_long if direction == "LONG" else structure_short)
 
     # -----------------------------------------------------------------
     # 4) リスクモデル（SL/TP）: ATRベース
@@ -1305,7 +1305,7 @@ def get_ai_order_strategy(
         + 0.04 * float(structure_flag),
         0.0, 1.0
     ))
-    # Direction/structure alignment penalty (safe after confidence is defined)
+    # Direction/structure alignment penalty
     if not structure_dir_ok:
         confidence = float(_clamp(confidence * 0.70, 0.0, 1.0))
 
