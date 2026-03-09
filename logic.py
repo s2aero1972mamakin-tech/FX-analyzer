@@ -153,11 +153,29 @@ def _regime_tp_multiple(phase_label: str) -> float:
     except Exception:
         return 2.0
 
-def _compute_partial_tp(entry: float, sl: float, direction: str) -> Optional[float]:
+
+def _compute_partial_tp(entry: float, sl: float, tp: float, direction: str):
     try:
-        risk = abs(float(entry) - float(sl))
+        entry = float(entry)
+        sl = float(sl)
+        tp = float(tp)
+        risk = abs(entry - sl)
         if risk <= 1e-9:
             return None
+
+        if str(direction).upper() == "LONG":
+            tp1 = entry + 0.7 * risk
+            if tp1 >= tp:
+                tp1 = entry + 0.5 * (tp - entry)
+        else:
+            tp1 = entry - 0.7 * risk
+            if tp1 <= tp:
+                tp1 = entry - 0.5 * (entry - tp)
+
+        return float(tp1)
+    except Exception:
+        return None
+
         if str(direction).upper() == "LONG":
             return float(entry) + risk
         return float(entry) - risk
@@ -1259,7 +1277,7 @@ def get_ai_order_strategy(
     rr = reward / risk
     rr_min = float(ctx_in.get("rr_min_floor", 1.0) or 1.0)
     rr_floor_fail = bool(rr < rr_min)
-    partial_tp = _compute_partial_tp(entry, sl, direction)
+    partial_tp = _compute_partial_tp(entry, sl, tp, direction)
     tp1 = partial_tp if partial_tp is not None else tp
     tp2 = tp
 
