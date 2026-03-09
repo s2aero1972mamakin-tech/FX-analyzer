@@ -1510,6 +1510,16 @@ def _render_hold_manage_panel(pair_label: str, ctx_in: Dict[str, Any], plan_ui: 
         ctx2["manage_only"] = True
 
         try:
+
+# ---- safety guards (auto patch) ----
+if 'keys' not in locals():
+    keys = {}
+if 'feats' not in locals():
+    feats = {}
+if 'ctx' not in locals():
+    ctx = {}
+# ------------------------------------
+
             plan2 = logic.get_ai_order_strategy(price_df=df_ref, pair=pair_label, context_data=ctx2, ext_features=feats, api_key=keys.get("OPENAI_API_KEY", ""))
             hold = plan2.get("hold_manage", {}) or {}
         except Exception as e:
@@ -3467,7 +3477,7 @@ with tabs[0]:
                 })
             except Exception:
                 pass
-            plan = logic.get_ai_order_strategy(price_df=df, pair=p, context_data=ctx, ext_features=feats, api_key=keys.get("OPENAI_API_KEY",""))
+            plan = logic.get_ai_order_strategy(price_df=df, pair=(p if 'p' in locals() else pair_label), context_data=ctx, ext_features=feats, api_key=keys.get("OPENAI_API_KEY",""))
 
 
             
@@ -3774,7 +3784,7 @@ with tabs[0]:
             })
         except Exception:
             pass
-        plan = logic.get_ai_order_strategy(price_df=df, pair=p, context_data=ctx, ext_features=feats, api_key=keys.get("OPENAI_API_KEY",""))
+        plan = logic.get_ai_order_strategy(price_df=df, pair=(p if 'p' in locals() else pair_label), context_data=ctx, ext_features=feats, api_key=keys.get("OPENAI_API_KEY",""))
 
         # ---- operator guard (UI-level; default display-only) ----
 
