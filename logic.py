@@ -852,6 +852,27 @@ def _slope_norm(s: pd.Series, lookback: int = 10) -> float:
         return 0.0
     return float(dy / (sd * math.sqrt(lookback)))
 
+
+# --- PATCH: SHORT structure separation + RR floor gate ---
+def _ll_lh_ok(df, n: int = 20) -> bool:
+    try:
+        if len(df) < n + 5:
+            return False
+        close = df["Close"].astype(float)
+        w = 3
+        highs = (close.shift(w) < close) & (close.shift(-w) < close)
+        lows = (close.shift(w) > close) & (close.shift(-w) > close)
+        hi_idx = close[highs].tail(4).index
+        lo_idx = close[lows].tail(4).index
+        if len(hi_idx) < 2 or len(lo_idx) < 2:
+            return False
+        h1, h2 = close.loc[hi_idx[-2]], close.loc[hi_idx[-1]]
+        l1, l2 = close.loc[lo_idx[-2]], close.loc[lo_idx[-1]]
+        return (h2 < h1) and (l2 < l1)
+    except Exception:
+        return False
+# --- END PATCH ---
+
 def _hh_hl_ok(df: pd.DataFrame, n: int = 20) -> bool:
     # crude HH/HL: compare last 2 swing highs and lows via rolling window peaks/valleys
     if len(df) < n + 5:
@@ -1192,6 +1213,13 @@ def get_ai_order_strategy(
     if risk <= 1e-9:
         risk = atr14
     rr = reward / risk
+
+    # --- PATCH: RR minimum gate ---
+    rr_min = float(ctx_in.get("rr_min_floor", 1.0))
+    if rr < rr_min:
+        veto.append(f"RR不足: {rr:.2f} < {rr_min:.2f}")
+        decision = "NO_TRADE"
+
 
     # -----------------------------------------------------------------
     # 5) 勝率 proxy（モデル）→ confidenceで縮退（p_eff）
