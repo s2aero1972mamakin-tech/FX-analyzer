@@ -1,72 +1,4 @@
 
-# ------------------- B-RANK + PROP AI PATCH -------------------
-
-def _range_center_penalty(range_pos: float) -> float:
-    try:
-        d = abs(range_pos - 0.5)
-        if d < 0.15:
-            return 0.35
-        if d < 0.25:
-            return 0.15
-        return 0.0
-    except:
-        return 0.0
-
-def _event_unknown_adjust(ev_meta):
-    try:
-        if not ev_meta.get("ok", True):
-            return 0.15
-        return 0.0
-    except:
-        return 0.0
-
-def _liquidity_sweep(df):
-    try:
-        if len(df) < 5:
-            return False
-        h = df["High"].astype(float)
-        l = df["Low"].astype(float)
-        c = df["Close"].astype(float)
-        prev_high = h.iloc[-2]
-        prev_low = l.iloc[-2]
-        last_close = c.iloc[-1]
-        if h.iloc[-1] > prev_high and last_close < prev_high:
-            return True
-        if l.iloc[-1] < prev_low and last_close > prev_low:
-            return True
-        return False
-    except:
-        return False
-
-def _volatility_expansion(df):
-    try:
-        c = df["Close"].astype(float)
-        if len(c) < 30:
-            return 0.0
-        r = c.pct_change().rolling(10).std().iloc[-1]
-        r2 = c.pct_change().rolling(30).std().iloc[-1]
-        if r2 == 0:
-            return 0.0
-        return min(1.0, r / r2)
-    except:
-        return 0.0
-
-def _market_regime(df):
-    try:
-        if len(df) < 100:
-            return "UNKNOWN"
-        c = df["Close"].astype(float)
-        ma50 = c.rolling(50).mean().iloc[-1]
-        ma200 = c.rolling(200).mean().iloc[-1] if len(c) >= 200 else c.rolling(100).mean().iloc[-1]
-        if ma50 > ma200:
-            return "BULL"
-        elif ma50 < ma200:
-            return "BEAR"
-        return "RANGE"
-    except:
-        return "UNKNOWN"
-
-
 
 
 # logic_fixed28_trend_entry_engine_compat.py
@@ -79,6 +11,77 @@ def _market_regime(df):
 
 from __future__ import annotations
 
+
+
+
+
+# ------------------- B-RANK + PROP AI PATCH -------------------
+def _range_center_penalty(range_pos: float) -> float:
+    try:
+        d = abs(float(range_pos) - 0.5)
+        if d < 0.15:
+            return 0.35
+        if d < 0.25:
+            return 0.15
+        return 0.0
+    except Exception:
+        return 0.0
+
+def _event_unknown_adjust(ev_meta: dict) -> float:
+    try:
+        ok = bool((ev_meta or {}).get("ok", False))
+        return 0.15 if not ok else 0.0
+    except Exception:
+        return 0.15
+
+def _liquidity_sweep(df) -> bool:
+    try:
+        if df is None or len(df) < 5:
+            return False
+        h = df["High"].astype(float)
+        l = df["Low"].astype(float)
+        c = df["Close"].astype(float)
+        prev_high = float(h.iloc[-2])
+        prev_low = float(l.iloc[-2])
+        last_high = float(h.iloc[-1])
+        last_low = float(l.iloc[-1])
+        last_close = float(c.iloc[-1])
+        if last_high > prev_high and last_close < prev_high:
+            return True
+        if last_low < prev_low and last_close > prev_low:
+            return True
+        return False
+    except Exception:
+        return False
+
+def _volatility_expansion(df) -> float:
+    try:
+        c = df["Close"].astype(float)
+        if len(c) < 30:
+            return 0.0
+        v10 = float(c.pct_change().rolling(10).std().iloc[-1] or 0.0)
+        v30 = float(c.pct_change().rolling(30).std().iloc[-1] or 0.0)
+        if v30 <= 1e-12:
+            return 0.0
+        return max(0.0, min(1.0, v10 / v30))
+    except Exception:
+        return 0.0
+
+def _market_regime(df) -> str:
+    try:
+        if df is None or len(df) < 100:
+            return "UNKNOWN"
+        c = df["Close"].astype(float)
+        ma50 = float(c.rolling(50).mean().iloc[-1])
+        ma200 = float(c.rolling(200).mean().iloc[-1]) if len(c) >= 200 else float(c.rolling(100).mean().iloc[-1])
+        if ma50 > ma200:
+            return "BULL"
+        if ma50 < ma200:
+            return "BEAR"
+        return "RANGE"
+    except Exception:
+        return "UNKNOWN"
+# ---------------------------------------------------------------
 
 # --- AI Quality / Timing / Failure Feature Patch (Auto-added) ---
 def _quality_decay(strength, breakout_ok, hhhl_ok, confidence):
@@ -1263,7 +1266,7 @@ def get_ai_order_strategy(
                 url=event_calendar_url,
             )
         except Exception as e:
-            ev_meta = {"ok": False, "status": "fail", "err": f"{type(e).__name__}: {e}", "score": 0.0, "factor": 0.0,
+            ev_meta = {"ok": False, "status": "unknown", "err": f"{type(e).__name__}: {e}", "score": 0.0, "factor": 0.0,
                        "window_high": False, "next_high_hours": None, "last_high_hours": None,
                        "next_any_hours": None, "last_any_hours": None, "upcoming": [], "recent": [], "impact_ccys": {}}
 
@@ -1347,6 +1350,16 @@ def get_ai_order_strategy(
     except Exception:
         pass
 
+
+    # B-rank: condition-specific threshold optimization
+    try:
+        if phase_label == "RANGE":
+            dynamic_threshold = float(_clamp(dynamic_threshold + 0.04, 0.02, 0.30))
+        elif phase_label in ("UP_TREND", "DOWN_TREND"):
+            dynamic_threshold = float(_clamp(dynamic_threshold - 0.02, 0.02, 0.30))
+    except Exception:
+        pass
+
     # -----------------------------------------------------------------
     # 8) モメンタム/通貨強弱（補助のみ、上限あり）
     # -----------------------------------------------------------------
@@ -1379,17 +1392,16 @@ def get_ai_order_strategy(
 
     ev_gate = float(ev_raw + mom_bonus + ccy_bonus)
     ev_gate = ev_gate * _quality_decay(strength, breakout_ok, hhhl_ok, confidence)
-    ev_gate -= _range_center_penalty(range_pos)
-    ev_gate -= _event_unknown_adjust(ev_meta)
+    # B-rank + prop AI adjustments
+    ev_gate -= float(_range_center_penalty(range_pos))
+    ev_gate -= float(_event_unknown_adjust(ev_meta))
     if _liquidity_sweep(df):
         ev_gate -= 0.25
-    vol_exp = _volatility_expansion(df)
+    vol_exp = float(_volatility_expansion(df))
     ev_gate += 0.08 * vol_exp
     regime = _market_regime(df)
     if regime == "RANGE":
         ev_gate -= 0.15
-    
-    ev_gate = ev_gate * _quality_decay(strength, breakout_ok, hhhl_ok, confidence)
 
     # -----------------------------------------------------------------
     # 9) 構造ゲート（最優先）
@@ -1422,7 +1434,8 @@ def get_ai_order_strategy(
     # 全体の構造妥当性
     structure_ok = True
     if phase_label == "RANGE":
-        structure_ok = bool(breakout_pass or range_edge_setup)
+        center_avoid = bool(abs(float(range_pos) - 0.5) >= 0.18)
+        structure_ok = bool((breakout_pass or range_edge_setup) and center_avoid)
     else:
         if (float(strength) < 0.18) and not (breakout_ok or hhhl_ok):
             structure_ok = False
@@ -1468,6 +1481,9 @@ def get_ai_order_strategy(
         # EV gate (post-breakout has its own rescue)
         if ev_gate >= float(dynamic_threshold):
             decision = "TRADE"
+            if bool(ctx_in.get("sbi_min_lot_guard", True)) and int(ctx_in.get("sbi_min_lot", 1) or 1) >= 1 and float(confidence) < 0.42:
+                decision = "NO_TRADE"
+                _veto("SBI最小1建リスク")
             if not _entry_timing_filter(df, direction):
                 decision = "NO_TRADE"
                 veto.append("Entry timing filter rejected")
@@ -1554,6 +1570,9 @@ def get_ai_order_strategy(
         - float(macro_pen)
     )
     final_score = rank_score
+    decision_score = float(ev_gate)
+    ranking_score = float(rank_score)
+    execution_score = float(confidence * (1.0 + max(0.0, float(strength))))
 
     # -----------------------------------------------------------------
     # 13) ctx（デバッグ/可視化用）
@@ -1565,6 +1584,9 @@ def get_ai_order_strategy(
         "momentum_score": float(mom),
         "range_pos": float(range_pos),
         "range_edge_setup": bool(range_edge_setup),
+        "market_regime": str(regime),
+        "volatility_expansion": float(vol_exp),
+        "liquidity_sweep": bool(_liquidity_sweep(df)),
         "ccy_strength_proxy": float(ccy_strength_proxy),
         "ccy_bonus": float(ccy_bonus),
         "cont_p_up": float(p_up),
@@ -1783,6 +1805,9 @@ def get_ai_order_strategy(
 
         "rank_score": float(rank_score),
         "final_score": float(final_score),
+        "decision_score": float(decision_score),
+        "ranking_score": float(ranking_score),
+        "execution_score": float(execution_score),
 
         "dynamic_threshold": float(dynamic_threshold),
         "gate_mode": str(gate_mode),
