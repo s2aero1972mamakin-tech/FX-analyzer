@@ -1250,6 +1250,19 @@ def get_ai_order_strategy(
 
     side = "BUY" if direction == "LONG" else "SELL"
 
+    # --- PATCH A: direction / structure consistency filter ---
+    structure_long = bool(hhhl_ok or breakout_ok)
+    structure_short = bool(lllh_ok or breakout_ok)
+
+    if direction == "LONG" and not structure_long:
+        # downgrade confidence and EV gate bias
+        confidence *= 0.7
+        ev_raw -= 0.10
+    if direction == "SHORT" and not structure_short:
+        confidence *= 0.7
+        ev_raw -= 0.10
+
+
     # -----------------------------------------------------------------
     # 4) リスクモデル（SL/TP）: ATRベース
     # -----------------------------------------------------------------
@@ -1280,6 +1293,17 @@ def get_ai_order_strategy(
     partial_tp = _compute_partial_tp(entry, sl, tp, direction)
     tp1 = partial_tp if partial_tp is not None else tp
     tp2 = tp
+
+    # --- PATCH B: TP priority logic (liquidity > regime ATR > fallback) ---
+    if direction == "LONG":
+        tp_candidates = [x for x in [liq_tp, atr_tp] if x is not None]
+        if tp_candidates:
+            tp = max(tp_candidates)
+    else:
+        tp_candidates = [x for x in [liq_tp, atr_tp] if x is not None]
+        if tp_candidates:
+            tp = min(tp_candidates)
+
 
     # -----------------------------------------------------------------
     # 5) 勝率 proxy（モデル）→ confidenceで縮退（p_eff）
