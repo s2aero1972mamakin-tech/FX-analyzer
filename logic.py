@@ -1214,6 +1214,9 @@ def get_ai_order_strategy(
     breakout_ok, breakout_strength = _breakout_strength(df, 20)
     hhhl_ok = _hh_hl_ok(df, 30)
     lllh_ok = _ll_lh_ok(df, 30)
+    structure_long = bool(hhhl_ok or breakout_ok)
+    structure_short = bool(lllh_ok or breakout_ok)
+    structure_dir_ok = bool(structure_long if direction == "LONG" else structure_short)
 
     # 表示用ラベル（NameError根絶）
     if str(phase) == "RANGE":
@@ -1250,19 +1253,6 @@ def get_ai_order_strategy(
 
     side = "BUY" if direction == "LONG" else "SELL"
 
-    # --- PATCH A: direction / structure consistency filter ---
-    structure_long = bool(hhhl_ok or breakout_ok)
-    structure_short = bool(lllh_ok or breakout_ok)
-
-    if direction == "LONG" and not structure_long:
-        # downgrade confidence and EV gate bias
-        confidence *= 0.7
-        ev_raw -= 0.10
-    if direction == "SHORT" and not structure_short:
-        confidence *= 0.7
-        ev_raw -= 0.10
-
-
     # -----------------------------------------------------------------
     # 4) リスクモデル（SL/TP）: ATRベース
     # -----------------------------------------------------------------
@@ -1294,17 +1284,6 @@ def get_ai_order_strategy(
     tp1 = partial_tp if partial_tp is not None else tp
     tp2 = tp
 
-    # --- PATCH B: TP priority logic (liquidity > regime ATR > fallback) ---
-    if direction == "LONG":
-        tp_candidates = [x for x in [liq_tp, atr_tp] if x is not None]
-        if tp_candidates:
-            tp = max(tp_candidates)
-    else:
-        tp_candidates = [x for x in [liq_tp, atr_tp] if x is not None]
-        if tp_candidates:
-            tp = min(tp_candidates)
-
-
     # -----------------------------------------------------------------
     # 5) 勝率 proxy（モデル）→ confidenceで縮退（p_eff）
     # -----------------------------------------------------------------
@@ -1326,6 +1305,9 @@ def get_ai_order_strategy(
         + 0.04 * float(structure_flag),
         0.0, 1.0
     ))
+    # Direction/structure alignment penalty (safe after confidence is defined)
+    if not structure_dir_ok:
+        confidence = float(_clamp(confidence * 0.70, 0.0, 1.0))
 
     # p_eff: confidenceが低いほど0.5に寄せる（整合崩れ対策）
     conf_k = float(_clamp(confidence / 0.75, 0.0, 1.0))
@@ -1515,6 +1497,8 @@ def get_ai_order_strategy(
     regime = _market_regime(df)
     if regime == "RANGE":
         ev_gate -= 0.15
+    if not structure_dir_ok:
+        ev_gate -= 0.10
 
     # -----------------------------------------------------------------
     # 9) 構造ゲート（最優先）
@@ -1712,6 +1696,9 @@ def get_ai_order_strategy(
         "cont_p_dn": float(p_dn),
         "hh_hl_ok": bool(hhhl_ok),
         "ll_lh_ok": bool(lllh_ok),
+        "structure_long": bool(structure_long),
+        "structure_short": bool(structure_short),
+        "structure_dir_ok": bool(structure_dir_ok),
         "breakout_ok": bool(breakout_ok),
         "breakout_strength": float(breakout_strength),
         "breakout_pass": bool(breakout_pass),
