@@ -2514,6 +2514,27 @@ def fetch_price_history(pair_label: str, symbol: str, period: str, interval: str
 
     return pd.DataFrame(), meta
 
+
+@st.cache_data(ttl=60 * 10)
+def fetch_daytrade_subframes(pair_label: str, symbol: str) -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any]]:
+    """Fetch auxiliary intraday frames for DAYTRADE.
+    - 15m: setup / short-term structure
+    - 5m : execution / near-current price proxy
+    Never raises.
+    """
+    bundle: Dict[str, pd.DataFrame] = {"15m": pd.DataFrame(), "5m": pd.DataFrame()}
+    meta: Dict[str, Any] = {}
+    specs = [("15m", "60d"), ("5m", "5d")]
+    for iv, pd_period in specs:
+        try:
+            df_i, meta_i = fetch_price_history(pair_label, symbol, period=pd_period, interval=iv, prefer_stooq=False)
+            bundle[iv] = df_i if isinstance(df_i, pd.DataFrame) else pd.DataFrame()
+            meta[iv] = meta_i if isinstance(meta_i, dict) else {"ok": False, "error": "bad_meta"}
+        except Exception as e:
+            bundle[iv] = pd.DataFrame()
+            meta[iv] = {"ok": False, "error": f"{type(e).__name__}:{e}"}
+    return bundle, meta
+
 @st.cache_data(ttl=60 * 20)
 def fetch_external(pair_label: str, keys: Dict[str, str]) -> Tuple[Dict[str, float], Dict[str, Any]]:
     """
@@ -2709,7 +2730,7 @@ def _style_defaults(style_name: str) -> Dict[str, Any]:
     return {"min_expected_R": 0.07, "horizon_days": 7}  # 標準
 
 def _build_ctx(pair_label: str, df: pd.DataFrame, feats: Dict[str, float], horizon_days: int, min_expected_R: float, style_name: str,
-               governor_cfg: Dict[str, Any], interval: str = "1d", timeframe_mode: str = "") -> Dict[str, Any]:
+               governor_cfg: Dict[str, Any], interval: str = "1d", timeframe_mode: str = "", mtf_bundle: Optional[Dict[str, pd.DataFrame]] = None) -> Dict[str, Any]:
     indicators = _compute_indicators_compat(df)
     ctx: Dict[str, Any] = {}
     ctx.update(indicators)
@@ -2733,6 +2754,33 @@ def _build_ctx(pair_label: str, df: pd.DataFrame, feats: Dict[str, float], horiz
         ctx["p_cont_dn"] = float(cont.get("p_dn", float("nan")))
         # stash patterns for UI
         ctx["_similar_patterns_df"] = patt
+
+        if interval_s == "1h" and isinstance(mtf_bundle, dict):
+            fast_df = mtf_bundle.get("15m")
+            micro_df = mtf_bundle.get("5m")
+
+            if isinstance(fast_df, pd.DataFrame) and not fast_df.empty:
+                try:
+                    fast_phase = _phase_classify(fast_df)
+                    fast_horizon = max(6, min(32, int(max(6, model_horizon_bars * 2))))
+                    fast_cont = _predict_continuation(pair_label, "15m", fast_df, horizon=fast_horizon)
+                    ctx["fast_phase"] = fast_phase.get("phase", "UNKNOWN")
+                    ctx["fast_trend_strength"] = float(fast_phase.get("trend_strength", 0.0) or 0.0)
+                    ctx["fast_p_cont_up"] = float(fast_cont.get("p_up", float("nan")))
+                    ctx["fast_p_cont_dn"] = float(fast_cont.get("p_dn", float("nan")))
+                    ctx["price_fast_15m"] = float(fast_df["Close"].iloc[-1])
+                    ctx["_df_fast_15m"] = fast_df.tail(320).copy()
+                except Exception:
+                    pass
+
+            if isinstance(micro_df, pd.DataFrame) and not micro_df.empty:
+                try:
+                    micro_close = micro_df["Close"].astype(float)
+                    ctx["price_now"] = float(micro_close.iloc[-1])
+                    ctx["micro_momentum"] = float(((micro_close.iloc[-1] / max(1e-9, micro_close.iloc[-4])) - 1.0) if len(micro_close) >= 4 else 0.0)
+                    ctx["_df_micro_5m"] = micro_df.tail(320).copy()
+                except Exception:
+                    pass
     except Exception:
         ctx["phase"] = "UNKNOWN"
         ctx["trend_strength"] = 0.0
@@ -2740,7 +2788,7 @@ def _build_ctx(pair_label: str, df: pd.DataFrame, feats: Dict[str, float], horiz
         ctx["p_cont_dn"] = float("nan")
     ctx["pair_label"] = pair_label
     ctx["pair_symbol"] = _pair_label_to_symbol(pair_label)
-    ctx["price"] = float(df["Close"].iloc[-1])
+    ctx["price"] = float(ctx.get("price_now", df["Close"].iloc[-1]))
     ctx["price_interval"] = str(interval or "1d")
     ctx["timeframe_mode"] = str(timeframe_mode or "")
     ctx["trade_profile"] = ("DAYTRADE" if str(interval or "").lower() == "1h" else ("POSITION" if str(interval or "").lower() == "1wk" else "SWING"))
@@ -3475,7 +3523,16 @@ with tabs[0]:
                 continue
 
             feats, ext_meta = feats_global, ext_meta_global
-            ctx = _build_ctx(p, df, feats, horizon_days=int(horizon_days), min_expected_R=float(min_expected_R), style_name=style_name, governor_cfg=governor_cfg, interval=interval, timeframe_mode=trade_axis)
+            mtf_bundle = None
+            mtf_meta = None
+            if str(interval) == "1h":
+                try:
+                    mtf_bundle, mtf_meta = fetch_daytrade_subframes(p, sym)
+                except Exception:
+                    mtf_bundle, mtf_meta = None, {"ok": False, "error": "mtf_fetch_failed"}
+            ctx = _build_ctx(p, df, feats, horizon_days=int(horizon_days), min_expected_R=float(min_expected_R), style_name=style_name, governor_cfg=governor_cfg, interval=interval, timeframe_mode=trade_axis, mtf_bundle=mtf_bundle)
+            if isinstance(mtf_meta, dict):
+                ctx["_mtf_meta"] = mtf_meta
             # Event guard settings (passed to logic)
             try:
                 ctx.update({
@@ -3662,13 +3719,15 @@ with tabs[0]:
         trade_ranked = [r for r in ranked if str(r.get("decision", "")) == "TRADE"]
         trade_ranked.sort(key=lambda r: float(r.get("score", 0.0)), reverse=True)
 
+        panel_trade_label = "今回の実行ペア" if "デイトレ" in str(trade_axis) else "本日の実行ペア"
+        panel_skip_label = "今回は **見送り**" if "デイトレ" in str(trade_axis) else "本日は **見送り**"
         if trade_ranked:
             best = trade_ranked[0]
-            st.markdown(f"## 🧠 AI選択：本日の実行ペア  **{best['pair']}**")
+            st.markdown(f"## 🧠 AI選択：{panel_trade_label}  **{best['pair']}**")
         else:
             best = ranked[0]
-            st.markdown("## 🧠 AI選択：本日は **見送り**（トレード候補なし）")
-            st.caption("※ SBI最小1建ガード・イベント近接・閾値条件により、相場全体で見ても全ペアが見送り判定です。")
+            st.markdown(f"## 🧠 AI選択：{panel_skip_label}（トレード候補なし）")
+            st.caption("※ SBI最小1建ガード・イベント近接・閾値条件により、現時点の全ペアで見ても見送り判定です。")
 
         plan = best["_plan"]
         plan_ui_best = best.get("_plan_ui", plan)
@@ -3782,7 +3841,16 @@ with tabs[0]:
             st.stop()
 
         feats, ext_meta = fetch_external(pair_label, keys=keys)
-        ctx = _build_ctx(pair_label, df, feats, horizon_days=int(horizon_days), min_expected_R=float(min_expected_R), style_name=style_name, governor_cfg=governor_cfg, interval=interval, timeframe_mode=trade_axis)
+        mtf_bundle = None
+        mtf_meta = None
+        if str(interval) == "1h":
+            try:
+                mtf_bundle, mtf_meta = fetch_daytrade_subframes(pair_label, symbol)
+            except Exception:
+                mtf_bundle, mtf_meta = None, {"ok": False, "error": "mtf_fetch_failed"}
+        ctx = _build_ctx(pair_label, df, feats, horizon_days=int(horizon_days), min_expected_R=float(min_expected_R), style_name=style_name, governor_cfg=governor_cfg, interval=interval, timeframe_mode=trade_axis, mtf_bundle=mtf_bundle)
+        if isinstance(mtf_meta, dict):
+            ctx["_mtf_meta"] = mtf_meta
         # Event guard settings (passed to logic)
         try:
             ctx.update({
