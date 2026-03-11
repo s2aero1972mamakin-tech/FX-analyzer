@@ -2709,7 +2709,7 @@ def _style_defaults(style_name: str) -> Dict[str, Any]:
     return {"min_expected_R": 0.07, "horizon_days": 7}  # 標準
 
 def _build_ctx(pair_label: str, df: pd.DataFrame, feats: Dict[str, float], horizon_days: int, min_expected_R: float, style_name: str,
-               governor_cfg: Dict[str, Any]) -> Dict[str, Any]:
+               governor_cfg: Dict[str, Any], interval: str = "1d", timeframe_mode: str = "") -> Dict[str, Any]:
     indicators = _compute_indicators_compat(df)
     ctx: Dict[str, Any] = {}
     ctx.update(indicators)
@@ -2717,8 +2717,15 @@ def _build_ctx(pair_label: str, df: pd.DataFrame, feats: Dict[str, float], horiz
     # --- AI Trend Engine features (phase / continuation / similar patterns) ---
     try:
         phase_info = _phase_classify(df)
-        cont = _predict_continuation(pair_label, "1d", df, horizon=max(3, int(horizon_days)))
-        patt = _similar_pattern_search(df, window=30, horizon=max(3, int(horizon_days)), topk=5)
+        interval_s = str(interval or "1d")
+        if interval_s == "1h":
+            model_horizon_bars = max(4, min(24, int(max(1, int(horizon_days)) * 8)))
+        elif interval_s == "1wk":
+            model_horizon_bars = max(3, min(12, int(max(1, int(horizon_days / 5 if horizon_days > 5 else 4)))))
+        else:
+            model_horizon_bars = max(3, int(horizon_days))
+        cont = _predict_continuation(pair_label, interval_s, df, horizon=model_horizon_bars)
+        patt = _similar_pattern_search(df, window=30, horizon=model_horizon_bars, topk=5)
         ctx["phase"] = phase_info.get("phase", "UNKNOWN")
         ctx["trend_strength"] = float(phase_info.get("trend_strength", 0.0) or 0.0)
         ctx["adx14"] = float(phase_info.get("adx", float("nan")))
@@ -2734,6 +2741,11 @@ def _build_ctx(pair_label: str, df: pd.DataFrame, feats: Dict[str, float], horiz
     ctx["pair_label"] = pair_label
     ctx["pair_symbol"] = _pair_label_to_symbol(pair_label)
     ctx["price"] = float(df["Close"].iloc[-1])
+    ctx["price_interval"] = str(interval or "1d")
+    ctx["timeframe_mode"] = str(timeframe_mode or "")
+    ctx["trade_profile"] = ("DAYTRADE" if str(interval or "").lower() == "1h" else ("POSITION" if str(interval or "").lower() == "1wk" else "SWING"))
+    ctx["is_intraday"] = bool(str(interval or "").lower() == "1h")
+    ctx["model_horizon_bars"] = int(locals().get("model_horizon_bars", max(3, int(horizon_days))))
     ctx["horizon_days"] = int(horizon_days)
     ctx["min_expected_R"] = float(min_expected_R)
     ctx["style_name"] = style_name
@@ -3257,19 +3269,25 @@ with st.sidebar:
     st.caption("普段は上から順に。『安全/診断/詳細』は折りたたんであります。")
 
     mode = st.selectbox("モード", ["相場全体から最適ペアを自動抽出（推奨）", "単一ペア最適化（徹底）"], index=0)
-    trade_axis = st.selectbox("時間軸（保有期間）", ["スイング（1週〜1ヶ月）", "中長期（1〜3ヶ月）"], index=0)
+    trade_axis = st.selectbox("時間軸（保有期間）", ["デイトレ（当日）", "スイング（1週〜1ヶ月）", "中長期（1〜3ヶ月）"], index=1)
     style_name = st.selectbox("運用スタイル（見送りライン）", ["標準", "保守", "攻撃"], index=0)
     priority = st.selectbox("優先度", ["バランス（推奨）", "勝率優先（見送り増）"], index=0)
     st.session_state["trend_assist_enable"] = st.checkbox("🤖 トレンド捕獲アシスト（実験）", value=False, help="強いトレンド局面では期待値に小さな加点を入れて、取り逃しを減らします。")
     st.session_state['priority_mode'] = priority
+    st.session_state['timeframe_mode'] = trade_axis
 
     # 時間軸プリセット（詳細設定で上書き可）
-    # ※「ポジショントレード」はUI名ではなく“保有期間”の呼び方です。1ヶ月寄りなら「中長期」や interval=1wk を推奨。
+    # ※ UIとしては「保有期間」ですが、内部では continuation / TP / time-stop もこの設定に合わせます。
     if "中長期" in trade_axis:
         period = "max"
         interval = "1wk"
         horizon_mode = "月（推奨）"
         horizon_days = 30
+    elif "デイトレ" in trade_axis:
+        period = "6mo"
+        interval = "1h"
+        horizon_mode = "当日（推奨）"
+        horizon_days = 1
     else:  # スイング（1週〜1ヶ月）
         period = "10y"
         interval = "1d"
@@ -3384,8 +3402,12 @@ with st.sidebar:
 
     with st.expander("🔧 詳細/診断（普段は不要）", expanded=False):
         # プリセットの上書き
-        period = st.selectbox("価格期間（上書き）", ["1y", "2y", "5y", "10y"], index=["1y","2y","5y","10y"].index(period))
-        interval = st.selectbox("価格間隔（上書き）", ["1d", "1wk", "1h"], index=["1d","1wk","1h"].index(interval))
+        period_opts = ["3mo", "6mo", "1y", "2y", "5y", "10y", "max"]
+        interval_opts = ["1h", "1d", "1wk"]
+        if period not in period_opts:
+            period_opts.append(period)
+        period = st.selectbox("価格期間（上書き）", period_opts, index=period_opts.index(period))
+        interval = st.selectbox("価格間隔（上書き）", interval_opts, index=interval_opts.index(interval))
         show_meta = st.checkbox("取得メタ表示（検証用）", value=False)
         show_debug = st.checkbox("デバッグ表示（検証用）", value=False)
         allow_override = st.checkbox("EV閾値/想定期間を手動上書き", value=False)
@@ -3453,7 +3475,7 @@ with tabs[0]:
                 continue
 
             feats, ext_meta = feats_global, ext_meta_global
-            ctx = _build_ctx(p, df, feats, horizon_days=int(horizon_days), min_expected_R=float(min_expected_R), style_name=style_name, governor_cfg=governor_cfg)
+            ctx = _build_ctx(p, df, feats, horizon_days=int(horizon_days), min_expected_R=float(min_expected_R), style_name=style_name, governor_cfg=governor_cfg, interval=interval, timeframe_mode=trade_axis)
             # Event guard settings (passed to logic)
             try:
                 ctx.update({
@@ -3760,7 +3782,7 @@ with tabs[0]:
             st.stop()
 
         feats, ext_meta = fetch_external(pair_label, keys=keys)
-        ctx = _build_ctx(pair_label, df, feats, horizon_days=int(horizon_days), min_expected_R=float(min_expected_R), style_name=style_name, governor_cfg=governor_cfg)
+        ctx = _build_ctx(pair_label, df, feats, horizon_days=int(horizon_days), min_expected_R=float(min_expected_R), style_name=style_name, governor_cfg=governor_cfg, interval=interval, timeframe_mode=trade_axis)
         # Event guard settings (passed to logic)
         try:
             ctx.update({
