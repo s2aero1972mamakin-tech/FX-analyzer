@@ -183,7 +183,7 @@ def _resolve_trade_profile(ctx_in: Dict[str, Any]) -> Dict[str, Any]:
             "event_preblock_hours": float(_clamp(_safe_float((ctx_in or {}).get("event_preblock_hours", 6.0), 6.0), 2.0, 24.0)),
             "event_market_ban_hours": float(_clamp(_safe_float((ctx_in or {}).get("event_market_ban_hours", 4.0), 4.0), 1.0, 12.0)),
             "threshold_bias": 0.015,
-            "rr_floor": max(1.15, float(_safe_float((ctx_in or {}).get("rr_min_floor", 1.0), 1.0))),
+            "rr_floor": max(1.05, float(_safe_float((ctx_in or {}).get("rr_min_floor", 1.0), 1.0))),
             "partial_r": 0.60,
             "trail_trigger_r": 0.90,
             "be_trigger_r": 0.40,
@@ -290,6 +290,117 @@ def _compute_profile_partial_tp(entry: float, sl: float, tp: float, direction: s
         return float(tp1)
     except Exception:
         return _compute_partial_tp(entry, sl, tp, direction)
+
+
+def _ctx_dataframe(ctx_in: Dict[str, Any], *keys: str) -> Optional[pd.DataFrame]:
+    for k in keys:
+        try:
+            df = (ctx_in or {}).get(k)
+        except Exception:
+            df = None
+        if isinstance(df, pd.DataFrame) and (not df.empty):
+            cols = set(df.columns)
+            if {"Open", "High", "Low", "Close"}.issubset(cols):
+                return df.copy()
+    return None
+
+
+def _probe_intraday_frame(df: Optional[pd.DataFrame], direction: str, lookback: int = 16) -> Dict[str, Any]:
+    try:
+        if df is None or (not isinstance(df, pd.DataFrame)) or df.empty or len(df) < max(24, lookback + 6):
+            return {}
+        d = df.copy().tail(max(lookback + 30, 60))
+        o = d["Open"].astype(float)
+        h = d["High"].astype(float)
+        l = d["Low"].astype(float)
+        c = d["Close"].astype(float)
+        atr = float(_atr(d, 14).iloc[-1])
+        atr = max(atr, 1e-9)
+        ema8 = c.ewm(span=8, adjust=False).mean()
+        ema21 = c.ewm(span=21, adjust=False).mean()
+        last_close = float(c.iloc[-1])
+        recent_low = float(l.tail(lookback).min())
+        recent_high = float(h.tail(lookback).max())
+        breakout_ok, breakout_strength = _breakout_strength(d, max(10, min(lookback, 18)))
+        hhhl_ok = _hh_hl_ok(d, max(12, min(lookback + 6, 24)))
+        lllh_ok = _ll_lh_ok(d, max(12, min(lookback + 6, 24)))
+        mom_r = float((c.iloc[-1] - c.iloc[-4]) / atr) if len(c) >= 4 else 0.0
+        candle_r = float((c.iloc[-1] - o.iloc[-1]) / atr)
+        long_ok = bool((ema8.iloc[-1] >= ema21.iloc[-1]) and (mom_r >= -0.20) and (last_close >= float(ema8.iloc[-1]) or breakout_ok or hhhl_ok))
+        short_ok = bool((ema8.iloc[-1] <= ema21.iloc[-1]) and (mom_r <= 0.20) and (last_close <= float(ema8.iloc[-1]) or breakout_ok or lllh_ok))
+        dir_ok = long_ok if str(direction).upper() == "LONG" else short_ok
+        score = 0.0
+        score += 0.55 if dir_ok else -0.70
+        score += 0.18 if breakout_ok else 0.0
+        if str(direction).upper() == "LONG":
+            score += 0.12 if hhhl_ok else -0.05
+            score += 0.10 if candle_r > 0 else -0.08
+            score += 0.10 if mom_r > 0 else -0.08
+        else:
+            score += 0.12 if lllh_ok else -0.05
+            score += 0.10 if candle_r < 0 else -0.08
+            score += 0.10 if mom_r < 0 else -0.08
+        score = float(_clamp(score, -1.0, 1.0))
+        return {
+            "last_close": float(last_close),
+            "atr14": float(atr),
+            "recent_low": float(recent_low),
+            "recent_high": float(recent_high),
+            "breakout_ok": bool(breakout_ok),
+            "breakout_strength": float(breakout_strength),
+            "hhhl_ok": bool(hhhl_ok),
+            "lllh_ok": bool(lllh_ok),
+            "mom_r": float(mom_r),
+            "candle_r": float(candle_r),
+            "dir_ok": bool(dir_ok),
+            "score": float(score),
+        }
+    except Exception:
+        return {}
+
+
+def _daytrade_refine_levels(entry: float, sl: float, tp: float, direction: str, trade_profile: Dict[str, Any], atr14: float,
+                            recent_low: float, recent_high: float, liq_lookback: int,
+                            fast_df: Optional[pd.DataFrame], fast_probe: Dict[str, Any],
+                            micro_df: Optional[pd.DataFrame], micro_probe: Dict[str, Any]) -> Tuple[float, float, float, float, float, Optional[float]]:
+    try:
+        entry = float(entry)
+        sl = float(sl)
+        tp = float(tp)
+        risk0 = abs(entry - sl)
+        fast_atr = max(float((fast_probe or {}).get("atr14") or atr14), 1e-9)
+        ref_entry = float((micro_probe or {}).get("last_close") or (fast_probe or {}).get("last_close") or entry)
+        fast_low = float((fast_probe or {}).get("recent_low") or recent_low)
+        fast_high = float((fast_probe or {}).get("recent_high") or recent_high)
+        if str(direction).upper() == "LONG":
+            sl_fast = min(ref_entry - max(0.85 * fast_atr, 0.55 * atr14), fast_low - 0.08 * fast_atr)
+            fast_tp_base = ref_entry + max(float(trade_profile.get("tp_trend", 1.55) or 1.55) * fast_atr, 1.25 * abs(ref_entry - sl_fast))
+            liq_tp = None
+            if isinstance(fast_df, pd.DataFrame) and (not fast_df.empty):
+                liq_tp = _liquidity_pool_tp(fast_df.tail(max(12, min(len(fast_df), liq_lookback + 6))), "LONG", lookback=max(12, min(liq_lookback, max(12, len(fast_df) - 2))))
+            tp_fast = max(fast_tp_base, liq_tp) if liq_tp is not None else fast_tp_base
+            sl_new = min(sl, sl_fast)
+            tp_new = max(tp_fast, ref_entry + 1.05 * abs(ref_entry - sl_new))
+        else:
+            sl_fast = max(ref_entry + max(0.85 * fast_atr, 0.55 * atr14), fast_high + 0.08 * fast_atr)
+            fast_tp_base = ref_entry - max(float(trade_profile.get("tp_trend", 1.55) or 1.55) * fast_atr, 1.25 * abs(ref_entry - sl_fast))
+            liq_tp = None
+            if isinstance(fast_df, pd.DataFrame) and (not fast_df.empty):
+                liq_tp = _liquidity_pool_tp(fast_df.tail(max(12, min(len(fast_df), liq_lookback + 6))), "SHORT", lookback=max(12, min(liq_lookback, max(12, len(fast_df) - 2))))
+            tp_fast = min(fast_tp_base, liq_tp) if liq_tp is not None else fast_tp_base
+            sl_new = max(sl, sl_fast)
+            tp_new = min(tp_fast, ref_entry - 1.05 * abs(ref_entry - sl_new))
+        entry_new = float(ref_entry)
+        risk = abs(entry_new - sl_new)
+        reward = abs(tp_new - entry_new)
+        if risk <= 1e-9:
+            risk = max(risk0, fast_atr)
+        rr = reward / max(risk, 1e-9)
+        return float(entry_new), float(sl_new), float(tp_new), float(risk), float(rr), (float(liq_tp) if liq_tp is not None else None)
+    except Exception:
+        risk = abs(float(entry) - float(sl))
+        rr = abs(float(tp) - float(entry)) / max(risk, 1e-9)
+        return float(entry), float(sl), float(tp), float(risk), float(rr), None
 
 
 def _parse_utc_like(ts: Any) -> Optional[datetime]:
@@ -1474,7 +1585,28 @@ def get_ai_order_strategy(
     if risk <= 1e-9:
         risk = atr14
     rr = reward / risk
+    liq_tp_intraday = None
+    mtf_fast = {}
+    mtf_micro = {}
+    mtf_alignment_score = 0.0
+    if bool(trade_profile.get("is_intraday")):
+        fast_df = _ctx_dataframe(ctx_in, "_df_fast_15m", "df_fast_15m", "_df_15m")
+        micro_df = _ctx_dataframe(ctx_in, "_df_micro_5m", "df_micro_5m", "_df_5m")
+        mtf_fast = _probe_intraday_frame(fast_df, direction, lookback=max(12, lookback))
+        mtf_micro = _probe_intraday_frame(micro_df, direction, lookback=12)
+        if mtf_fast:
+            mtf_alignment_score += 0.65 * float(mtf_fast.get("score", 0.0) or 0.0)
+        if mtf_micro:
+            mtf_alignment_score += 0.35 * float(mtf_micro.get("score", 0.0) or 0.0)
+        entry, sl, tp, risk, rr, liq_tp_intraday = _daytrade_refine_levels(
+            entry, sl, tp, direction, trade_profile, atr14, recent_low, recent_high, liq_lookback,
+            fast_df if isinstance(fast_df, pd.DataFrame) else None, mtf_fast,
+            micro_df if isinstance(micro_df, pd.DataFrame) else None, mtf_micro,
+        )
+        reward = abs(tp - entry)
     rr_min = float(trade_profile.get("rr_floor", ctx_in.get("rr_min_floor", 1.0)) or 1.0)
+    if bool(trade_profile.get("is_intraday")) and mtf_alignment_score >= 0.35:
+        rr_min = max(0.95, rr_min - 0.10)
     rr_floor_fail = bool(rr < rr_min)
     partial_tp = _compute_profile_partial_tp(entry, sl, tp, direction, trade_profile, phase_label, strength)
     tp1 = partial_tp if partial_tp is not None else tp
@@ -1489,6 +1621,8 @@ def get_ai_order_strategy(
     else:
         p_win_model = 0.46 + 0.42 * _clamp((float(p_dn) - 0.5) * 2.0, -1.0, 1.0) + 0.10 * (float(strength) - 0.5)
     p_win_model = float(_clamp(p_win_model - _failure_features(df), 0.20, 0.80))
+    if bool(trade_profile.get("is_intraday")):
+        p_win_model = float(_clamp(p_win_model + 0.10 * float(mtf_alignment_score or 0.0), 0.20, 0.85))
 
     # 信頼度（0..1）
     structure_ok_dir = (breakout_ok or (hhhl_ok if direction == "LONG" else lllh_ok))
@@ -1504,10 +1638,14 @@ def get_ai_order_strategy(
     # Direction/structure alignment penalty
     if not structure_dir_ok:
         confidence = float(_clamp(confidence * 0.70, 0.0, 1.0))
+    if bool(trade_profile.get("is_intraday")):
+        confidence = float(_clamp(confidence + 0.14 * float(mtf_alignment_score or 0.0), 0.0, 1.0))
 
     # p_eff: confidenceが低いほど0.5に寄せる（整合崩れ対策）
     conf_k = float(_clamp(confidence / 0.75, 0.0, 1.0))
     p_eff = float(_clamp(0.5 + (p_win_model - 0.5) * conf_k, 0.20, 0.80))
+    if bool(trade_profile.get("is_intraday")):
+        p_eff = float(_clamp(p_eff + 0.08 * float(mtf_alignment_score or 0.0), 0.20, 0.82))
 
     # EV (R): EV = p*RR - (1-p)*1
     ev_raw = float(p_eff * float(rr) - (1.0 - p_eff) * 1.0)
@@ -1621,6 +1759,8 @@ def get_ai_order_strategy(
     # macro bias is weak
     dynamic_threshold = float(_clamp(dynamic_threshold + 0.03 * float(macro_risk), 0.02, 0.30))
     dynamic_threshold = float(_clamp(dynamic_threshold + float(trade_profile.get("threshold_bias", 0.0) or 0.0), 0.02, 0.30))
+    if bool(trade_profile.get("is_intraday")):
+        dynamic_threshold = float(_clamp(dynamic_threshold - 0.015 * max(0.0, float(mtf_alignment_score or 0.0)) + 0.020 * max(0.0, -float(mtf_alignment_score or 0.0)), 0.02, 0.30))
 
     # upcoming event / weekend / weekcross: threshold add (but do not cause perpetual NO)
     try:
@@ -1740,6 +1880,8 @@ def get_ai_order_strategy(
     # POST_BREAKOUTはブレイク根拠必須（取り逃がし防止と事故回避を両立）
     if event_mode == "POST_BREAKOUT":
         structure_ok = bool(breakout_ok or (hhhl_ok if direction == "LONG" else lllh_ok))
+    if bool(trade_profile.get("is_intraday")) and float(mtf_alignment_score or 0.0) <= -0.20:
+        structure_ok = False
 
     # -----------------------------------------------------------------
     # 10) veto/decision（veto乱立を抑える）
@@ -1938,6 +2080,11 @@ def get_ai_order_strategy(
         "liquidity_tp": (float(liq_tp) if liq_tp is not None else None),
         "tp1": (float(tp1) if tp1 is not None else None),
         "tp2": float(tp2),
+        "mtf_alignment_score": float(mtf_alignment_score),
+        "fast_tf_dir_ok": bool(mtf_fast.get("dir_ok", False)) if isinstance(mtf_fast, dict) and mtf_fast else None,
+        "micro_tf_dir_ok": bool(mtf_micro.get("dir_ok", False)) if isinstance(mtf_micro, dict) and mtf_micro else None,
+        "price_now": float((mtf_micro.get("last_close") if isinstance(mtf_micro, dict) and mtf_micro else entry)),
+        "liquidity_tp_intraday": (float(liq_tp_intraday) if liq_tp_intraday is not None else None),
         "max_hold_hours": float(trade_profile.get("max_hold_hours", 0.0) or 0.0),
         "stale_after_hours": float(trade_profile.get("stale_after_hours", 0.0) or 0.0),
         "be_trigger_r": float(trade_profile.get("be_trigger_r", 0.0) or 0.0),
@@ -2113,6 +2260,7 @@ def get_ai_order_strategy(
         "tp1": (float(tp1) if tp1 is not None else float(tp)),
         "tp2": float(tp2),
         "partial_tp_enabled": True,
+        "price_now": float((mtf_micro.get("last_close") if isinstance(mtf_micro, dict) and mtf_micro else entry)),
         "trade_profile": str(trade_profile.get("name", "SWING")),
         "price_interval": str(trade_profile.get("interval", ctx_in.get("price_interval", "1d"))),
         "max_hold_hours": float(trade_profile.get("max_hold_hours", 0.0) or 0.0),
