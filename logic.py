@@ -153,6 +153,160 @@ def _regime_tp_multiple(phase_label: str) -> float:
     except Exception:
         return 2.0
 
+def _resolve_trade_profile(ctx_in: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        interval = str((ctx_in or {}).get("price_interval") or (ctx_in or {}).get("interval") or "").strip().lower()
+    except Exception:
+        interval = ""
+    try:
+        tf_label = str((ctx_in or {}).get("timeframe_mode") or (ctx_in or {}).get("trade_profile") or "")
+    except Exception:
+        tf_label = ""
+    horizon_days = max(1, int(_safe_float((ctx_in or {}).get("horizon_days", 5), 5)))
+
+    is_intraday = bool(interval in ("1h", "60m", "30m", "15m") or ("デイトレ" in tf_label) or str((ctx_in or {}).get("is_intraday", False)).lower() in ("1", "true", "yes"))
+    is_position = bool(interval == "1wk" or ("中長期" in tf_label) or horizon_days >= 21)
+
+    if is_intraday:
+        profile = {
+            "name": "DAYTRADE",
+            "interval": interval or "1h",
+            "is_intraday": True,
+            "lookback": 12,
+            "liquidity_lookback": 18,
+            "sl_atr_mult": 0.95,
+            "sl_buffer_atr": 0.10,
+            "tp_breakout": 1.85,
+            "tp_trend": 1.55,
+            "tp_transition": 1.30,
+            "tp_range": 1.05,
+            "event_preblock_hours": float(_clamp(_safe_float((ctx_in or {}).get("event_preblock_hours", 6.0), 6.0), 2.0, 24.0)),
+            "event_market_ban_hours": float(_clamp(_safe_float((ctx_in or {}).get("event_market_ban_hours", 4.0), 4.0), 1.0, 12.0)),
+            "threshold_bias": 0.015,
+            "rr_floor": max(1.15, float(_safe_float((ctx_in or {}).get("rr_min_floor", 1.0), 1.0))),
+            "partial_r": 0.60,
+            "trail_trigger_r": 0.90,
+            "be_trigger_r": 0.40,
+            "max_hold_hours": float(_clamp(_safe_float((ctx_in or {}).get("max_hold_hours", 12.0), 12.0), 4.0, 36.0)),
+            "stale_after_hours": float(_clamp(_safe_float((ctx_in or {}).get("stale_after_hours", 4.0), 4.0), 1.0, 12.0)),
+        }
+        profile["max_hold_bars"] = int(max(4, round(profile["max_hold_hours"])))
+        return profile
+
+    if is_position:
+        return {
+            "name": "POSITION",
+            "interval": interval or "1wk",
+            "is_intraday": False,
+            "lookback": 26,
+            "liquidity_lookback": 52,
+            "sl_atr_mult": 1.35,
+            "sl_buffer_atr": 0.18,
+            "tp_breakout": 3.20,
+            "tp_trend": 2.80,
+            "tp_transition": 2.10,
+            "tp_range": 1.40,
+            "event_preblock_hours": float(_clamp(_safe_float((ctx_in or {}).get("event_preblock_hours", 36.0), 36.0), 6.0, 96.0)),
+            "event_market_ban_hours": float(_clamp(_safe_float((ctx_in or {}).get("event_market_ban_hours", 18.0), 18.0), 6.0, 48.0)),
+            "threshold_bias": -0.005,
+            "rr_floor": max(1.00, float(_safe_float((ctx_in or {}).get("rr_min_floor", 1.0), 1.0))),
+            "partial_r": 0.80,
+            "trail_trigger_r": 1.30,
+            "be_trigger_r": 0.55,
+            "max_hold_hours": float(_clamp(_safe_float((ctx_in or {}).get("max_hold_hours", 24.0 * 20.0), 24.0 * 20.0), 24.0 * 5.0, 24.0 * 90.0)),
+            "stale_after_hours": float(_clamp(_safe_float((ctx_in or {}).get("stale_after_hours", 24.0 * 5.0), 24.0 * 5.0), 24.0, 24.0 * 20.0)),
+            "max_hold_bars": int(max(4, round(max(5.0, horizon_days / 5.0)))),
+        }
+
+    return {
+        "name": "SWING",
+        "interval": interval or "1d",
+        "is_intraday": False,
+        "lookback": 20,
+        "liquidity_lookback": 40,
+        "sl_atr_mult": 1.20,
+        "sl_buffer_atr": 0.15,
+        "tp_breakout": 3.00,
+        "tp_trend": 2.50,
+        "tp_transition": 1.80,
+        "tp_range": 1.30,
+        "event_preblock_hours": float(_clamp(_safe_float((ctx_in or {}).get("event_preblock_hours", 24.0), 24.0), 6.0, 72.0)),
+        "event_market_ban_hours": float(_clamp(_safe_float((ctx_in or {}).get("event_market_ban_hours", 12.0), 12.0), 3.0, 24.0)),
+        "threshold_bias": 0.0,
+        "rr_floor": max(1.00, float(_safe_float((ctx_in or {}).get("rr_min_floor", 1.0), 1.0))),
+        "partial_r": 0.70,
+        "trail_trigger_r": 1.10,
+        "be_trigger_r": 0.50,
+        "max_hold_hours": float(_clamp(_safe_float((ctx_in or {}).get("max_hold_hours", 24.0 * 20.0), 24.0 * 20.0), 24.0 * 3.0, 24.0 * 60.0)),
+        "stale_after_hours": float(_clamp(_safe_float((ctx_in or {}).get("stale_after_hours", 24.0 * 3.0), 24.0 * 3.0), 12.0, 24.0 * 14.0)),
+        "max_hold_bars": int(max(4, horizon_days)),
+    }
+
+
+def _profile_tp_multiple(profile: Dict[str, Any], phase_label: str, breakout_ok: bool, strength: float) -> float:
+    try:
+        p = str((profile or {}).get("name") or "SWING")
+        phase = str(phase_label or "")
+        if breakout_ok or phase.startswith("BREAKOUT"):
+            mult = float((profile or {}).get("tp_breakout", _regime_tp_multiple(phase_label)))
+        elif phase in ("UP_TREND", "DOWN_TREND"):
+            mult = float((profile or {}).get("tp_trend", _regime_tp_multiple(phase_label)))
+        elif "TRANSITION" in phase:
+            mult = float((profile or {}).get("tp_transition", _regime_tp_multiple(phase_label)))
+        elif phase == "RANGE":
+            mult = float((profile or {}).get("tp_range", _regime_tp_multiple(phase_label)))
+        else:
+            mult = float(_regime_tp_multiple(phase_label))
+        if p == "DAYTRADE":
+            mult += 0.15 * float(_clamp(strength - 0.55, -0.30, 0.40))
+        return float(_clamp(mult, 0.90, 4.20))
+    except Exception:
+        return float(_regime_tp_multiple(phase_label))
+
+
+def _compute_profile_partial_tp(entry: float, sl: float, tp: float, direction: str, profile: Dict[str, Any], phase_label: str, strength: float) -> Optional[float]:
+    try:
+        entry = float(entry)
+        sl = float(sl)
+        tp = float(tp)
+        risk = abs(entry - sl)
+        if risk <= 1e-9:
+            return None
+        trigger_r = float((profile or {}).get("partial_r", 0.70) or 0.70)
+        if str((profile or {}).get("name") or "") == "DAYTRADE":
+            if str(phase_label).startswith("BREAKOUT") or str(phase_label) in ("UP_TREND", "DOWN_TREND"):
+                trigger_r = min(0.75, trigger_r + 0.05 * float(_clamp(strength, 0.0, 1.0)))
+            elif str(phase_label) == "RANGE":
+                trigger_r = max(0.45, trigger_r - 0.10)
+        trigger_r = float(_clamp(trigger_r, 0.40, 1.20))
+        if str(direction).upper() == "LONG":
+            tp1 = entry + trigger_r * risk
+            if tp1 >= tp:
+                tp1 = entry + 0.50 * (tp - entry)
+        else:
+            tp1 = entry - trigger_r * risk
+            if tp1 <= tp:
+                tp1 = entry - 0.50 * (entry - tp)
+        return float(tp1)
+    except Exception:
+        return _compute_partial_tp(entry, sl, tp, direction)
+
+
+def _parse_utc_like(ts: Any) -> Optional[datetime]:
+    try:
+        if ts is None:
+            return None
+        s = str(ts).strip()
+        if not s:
+            return None
+        s = s.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
 
 def _compute_partial_tp(entry: float, sl: float, tp: float, direction: str):
     try:
@@ -746,12 +900,18 @@ def _hold_manage_reco(
         event_factor = float(ev_meta.get("factor", 0.0) or 0.0)
         window_high = bool(ev_meta.get("window_high", False))
 
-        # ---- Mandatory swing holding rules (not optional) ----
+        trade_profile = _resolve_trade_profile(ctx_in or {})
+        # ---- Mandatory holding rules (swing/daytrade hybrid) ----
         # Base thresholds (hours)
         no_add_h = float(ctx_in.get("hold_no_add_hours", 48.0) or 48.0)
         reduce_h = float(ctx_in.get("hold_reduce_hours", 18.0) or 18.0)
         be_h = float(ctx_in.get("hold_breakeven_hours", 12.0) or 12.0)
         partial_h = float(ctx_in.get("hold_partial_tp_hours", 18.0) or 18.0)
+        if str(trade_profile.get("name")) == "DAYTRADE":
+            no_add_h = float(ctx_in.get("hold_no_add_hours", 6.0) or 6.0)
+            reduce_h = float(ctx_in.get("hold_reduce_hours", 3.0) or 3.0)
+            be_h = float(ctx_in.get("hold_breakeven_hours", 2.0) or 2.0)
+            partial_h = float(ctx_in.get("hold_partial_tp_hours", 3.0) or 3.0)
 
         # Guardrails
         no_add_h = max(6.0, min(168.0, no_add_h))
@@ -821,6 +981,34 @@ def _hold_manage_reco(
                 actions.append("MOVE_SL_TO_BE")
             notes.append("週末前 → 建値/浅い利確で防御を推奨")
 
+        # Daytrade-specific time/precision management
+        time_in_trade_h = None
+        try:
+            opened_at = _parse_utc_like(pos.get("opened_at_utc") or pos.get("opened_at") or ctx_in.get("opened_at_utc"))
+            if opened_at is not None:
+                time_in_trade_h = max(0.0, (datetime.now(timezone.utc) - opened_at).total_seconds() / 3600.0)
+        except Exception:
+            time_in_trade_h = None
+
+        if str(trade_profile.get("name")) == "DAYTRADE":
+            max_hold_h = float(trade_profile.get("max_hold_hours", 12.0) or 12.0)
+            stale_after_h = float(trade_profile.get("stale_after_hours", 4.0) or 4.0)
+            if (time_in_trade_h is not None) and (time_in_trade_h >= stale_after_h) and (unrealized_R < 0.25):
+                reduce_mult = min(reduce_mult, 0.70)
+                if "REDUCE_SIZE" not in actions:
+                    actions.append("REDUCE_SIZE")
+                notes.append(f"デイトレで{time_in_trade_h:.1f}h経過して伸びが弱い → 建玉縮小を推奨")
+            if (time_in_trade_h is not None) and (time_in_trade_h >= max_hold_h) and (unrealized_R < 0.80):
+                partial_tp = max(partial_tp, 0.50 if unrealized_R > 0 else 0.0)
+                actions.append("TIME_EXIT")
+                notes.append(f"デイトレの想定保有時間 {max_hold_h:.1f}h を超過 → 利確/撤退を優先")
+            if unrealized_R >= 0.40:
+                move_be = True
+                new_sl = float(entry) if new_sl is None else max(float(new_sl), float(entry)) if side == "BUY" else min(float(new_sl), float(entry))
+                if "MOVE_SL_TO_BE" not in actions:
+                    actions.append("MOVE_SL_TO_BE")
+                notes.append("デイトレで0.4R超 → 建値防御を優先")
+
         # Round new SL to pip
         try:
             if new_sl is not None:
@@ -830,7 +1018,8 @@ def _hold_manage_reco(
 
         # Compose
         out = {
-            "version": "swing_hold_v1",
+            "version": "hybrid_hold_v2",
+            "trade_profile": str(trade_profile.get("name", "SWING")),
             "pair": str(pair),
             "side": side,
             "entry": float(entry),
@@ -844,6 +1033,7 @@ def _hold_manage_reco(
             "event_risk_factor": float(event_factor),
             "weekend_risk": float(weekend_risk or 0.0),
             "weekcross_risk": float(weekcross_risk or 0.0),
+            "time_in_trade_hours": (float(time_in_trade_h) if time_in_trade_h is not None else None),
             "no_add": bool(no_add),
             "reduce_size_mult": float(_clamp(reduce_mult, 0.20, 1.00)),
             "partial_tp_ratio": float(_clamp(partial_tp, 0.0, 1.0)),
@@ -1208,12 +1398,17 @@ def get_ai_order_strategy(
     # 2) 内部特徴量（ctx依存排除）
     # -----------------------------------------------------------------
     phase, strength, mom = _phase_label(df)
+    trade_profile = _resolve_trade_profile(ctx_in or {})
     horizon = int(_safe_float(ctx_in.get("horizon_days", 5), 5))
-    p_up, p_dn = _continuation_prob(df, horizon=max(3, horizon))
+    model_horizon = int(_safe_float(ctx_in.get("model_horizon_bars", max(3, horizon)), max(3, horizon)))
+    if bool(trade_profile.get("is_intraday")):
+        model_horizon = max(4, min(24, model_horizon))
+    p_up, p_dn = _continuation_prob(df, horizon=max(3, model_horizon))
 
-    breakout_ok, breakout_strength = _breakout_strength(df, 20)
-    hhhl_ok = _hh_hl_ok(df, 30)
-    lllh_ok = _ll_lh_ok(df, 30)
+    lookback = int(max(10, _safe_float(trade_profile.get("lookback", 20), 20)))
+    breakout_ok, breakout_strength = _breakout_strength(df, lookback)
+    hhhl_ok = _hh_hl_ok(df, max(20, int(lookback * 1.5)))
+    lllh_ok = _ll_lh_ok(df, max(20, int(lookback * 1.5)))
     structure_long = bool(hhhl_ok or breakout_ok)
     structure_short = bool(lllh_ok or breakout_ok)
 
@@ -1239,7 +1434,6 @@ def get_ai_order_strategy(
         direction = "SHORT"
 
     # RANGEは“端”なら逆張り優先（ただし厳格条件）
-    lookback = 20
     recent_low = float(df["Low"].astype(float).tail(lookback).min())
     recent_high = float(df["High"].astype(float).tail(lookback).max())
     span = float(max(1e-9, recent_high - recent_low))
@@ -1258,18 +1452,20 @@ def get_ai_order_strategy(
     # -----------------------------------------------------------------
     atr14 = float(_atr(df, 14).iloc[-1])
     atr14 = max(atr14, 1e-6)
+    sl_atr_mult = float(trade_profile.get("sl_atr_mult", 1.2) or 1.2)
+    sl_buffer_atr = float(trade_profile.get("sl_buffer_atr", 0.15) or 0.15)
+    regime_mult = _profile_tp_multiple(trade_profile, phase_label, breakout_ok, strength)
+    liq_lookback = int(max(10, _safe_float(trade_profile.get("liquidity_lookback", lookback * 2), lookback * 2)))
 
     if direction == "LONG":
-        sl = min(last - 1.2 * atr14, recent_low - 0.15 * atr14)
-        regime_mult = _regime_tp_multiple(phase_label)
+        sl = min(last - sl_atr_mult * atr14, recent_low - sl_buffer_atr * atr14)
         atr_tp = last + regime_mult * atr14
-        liq_tp = _liquidity_pool_tp(df, "LONG")
+        liq_tp = _liquidity_pool_tp(df.tail(max(liq_lookback + 2, 12)), "LONG", lookback=liq_lookback)
         tp = max(atr_tp, liq_tp) if liq_tp is not None else atr_tp
     else:
-        sl = max(last + 1.2 * atr14, recent_high + 0.15 * atr14)
-        regime_mult = _regime_tp_multiple(phase_label)
+        sl = max(last + sl_atr_mult * atr14, recent_high + sl_buffer_atr * atr14)
         atr_tp = last - regime_mult * atr14
-        liq_tp = _liquidity_pool_tp(df, "SHORT")
+        liq_tp = _liquidity_pool_tp(df.tail(max(liq_lookback + 2, 12)), "SHORT", lookback=liq_lookback)
         tp = min(atr_tp, liq_tp) if liq_tp is not None else atr_tp
 
     entry = last
@@ -1278,9 +1474,9 @@ def get_ai_order_strategy(
     if risk <= 1e-9:
         risk = atr14
     rr = reward / risk
-    rr_min = float(ctx_in.get("rr_min_floor", 1.0) or 1.0)
+    rr_min = float(trade_profile.get("rr_floor", ctx_in.get("rr_min_floor", 1.0)) or 1.0)
     rr_floor_fail = bool(rr < rr_min)
-    partial_tp = _compute_partial_tp(entry, sl, tp, direction)
+    partial_tp = _compute_profile_partial_tp(entry, sl, tp, direction, trade_profile, phase_label, strength)
     tp1 = partial_tp if partial_tp is not None else tp
     tp2 = tp
 
@@ -1382,8 +1578,11 @@ def get_ai_order_strategy(
     try:
         next_high = ev_meta.get("next_high_hours", None)
         last_high = ev_meta.get("last_high_hours", None)
-        pre_h = float(ctx_in.get("event_preblock_hours", 24.0) or 24.0)
-        pre_h = float(_clamp(pre_h, 6.0, 72.0))
+        pre_h = float(ctx_in.get("event_preblock_hours", trade_profile.get("event_preblock_hours", 24.0)) or trade_profile.get("event_preblock_hours", 24.0))
+        if bool(trade_profile.get("is_intraday")):
+            pre_h = float(_clamp(pre_h, 2.0, 24.0))
+        else:
+            pre_h = float(_clamp(pre_h, 6.0, 72.0))
     except Exception:
         next_high = None
         last_high = None
@@ -1421,6 +1620,7 @@ def get_ai_order_strategy(
 
     # macro bias is weak
     dynamic_threshold = float(_clamp(dynamic_threshold + 0.03 * float(macro_risk), 0.02, 0.30))
+    dynamic_threshold = float(_clamp(dynamic_threshold + float(trade_profile.get("threshold_bias", 0.0) or 0.0), 0.02, 0.30))
 
     # upcoming event / weekend / weekcross: threshold add (but do not cause perpetual NO)
     try:
@@ -1682,6 +1882,9 @@ def get_ai_order_strategy(
     # -----------------------------------------------------------------
     ctx_out = {
         "pair": pair,
+        "trade_profile": str(trade_profile.get("name", "SWING")),
+        "price_interval": str(trade_profile.get("interval", ctx_in.get("price_interval", "1d"))),
+        "model_horizon_bars": int(model_horizon),
         "phase_label": phase_label,
         "trend_strength": float(strength),
         "momentum_score": float(mom),
@@ -1735,6 +1938,10 @@ def get_ai_order_strategy(
         "liquidity_tp": (float(liq_tp) if liq_tp is not None else None),
         "tp1": (float(tp1) if tp1 is not None else None),
         "tp2": float(tp2),
+        "max_hold_hours": float(trade_profile.get("max_hold_hours", 0.0) or 0.0),
+        "stale_after_hours": float(trade_profile.get("stale_after_hours", 0.0) or 0.0),
+        "be_trigger_r": float(trade_profile.get("be_trigger_r", 0.0) or 0.0),
+        "trail_trigger_r": float(trade_profile.get("trail_trigger_r", 0.0) or 0.0),
     }
 
     # -----------------------------------------------------------------
@@ -1796,7 +2003,7 @@ def get_ai_order_strategy(
 
     # High-impact is close enough → ban MARKET entry (直前:成行禁止)
     event_market_ban_active = False
-    event_market_ban_hours = float(ctx_in.get("event_market_ban_hours", 12.0) or 12.0)
+    event_market_ban_hours = float(ctx_in.get("event_market_ban_hours", trade_profile.get("event_market_ban_hours", 12.0)) or trade_profile.get("event_market_ban_hours", 12.0))
     if float(weekcross_risk or 0.0) > 0.0:
         event_market_ban_hours = max(event_market_ban_hours, float(ctx_in.get("weekcross_market_ban_hours", 18.0) or 18.0))
     try:
@@ -1906,6 +2113,12 @@ def get_ai_order_strategy(
         "tp1": (float(tp1) if tp1 is not None else float(tp)),
         "tp2": float(tp2),
         "partial_tp_enabled": True,
+        "trade_profile": str(trade_profile.get("name", "SWING")),
+        "price_interval": str(trade_profile.get("interval", ctx_in.get("price_interval", "1d"))),
+        "max_hold_hours": float(trade_profile.get("max_hold_hours", 0.0) or 0.0),
+        "stale_after_hours": float(trade_profile.get("stale_after_hours", 0.0) or 0.0),
+        "be_trigger_r": float(trade_profile.get("be_trigger_r", 0.0) or 0.0),
+        "trail_trigger_r": float(trade_profile.get("trail_trigger_r", 0.0) or 0.0),
 
         "trail_sl": float(trail_sl),
         "extend_factor": 1.0,
