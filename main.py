@@ -1444,9 +1444,9 @@ st.json(reco.get("q", {}))
 
 
 def _render_hold_manage_panel(pair_label: str, ctx_in: Dict[str, Any], plan_ui: Dict[str, Any], feats: Dict[str, Any], keys: Dict[str, str]):
-    """保有中のイベント接近対応（縮退/一部利確/建値移動/新規追加禁止）を表示。
+    """保有中のイベント接近対応とデイトレ失速撤退を表示。
     - 実際の建玉をアプリが自動で把握することはできないので、運用者が「保有開始/解除」を押して管理します。
-    - ルール自体は logic.py 側に統合済み（swing_hold_v1）。
+    - ルール自体は logic.py 側に統合済み（swing_hold_v1 / daytrade_hold_v1）。
     """
     try:
         st.markdown("### 📌 保有ポジション管理（イベント接近時の対応）")
@@ -1554,6 +1554,8 @@ def _render_hold_manage_panel(pair_label: str, ctx_in: Dict[str, Any], plan_ui: 
             rec_lines.append(f"- ✅ **一部利確**：{pt*100:.0f}% を目安")
         if bool(hold.get("move_sl_to_be")) and hold.get("new_sl_reco") is not None:
             rec_lines.append(f"- ✅ **建値移動/防御**：SL を {float(hold.get('new_sl_reco')):.3f} 付近へ（BE）")
+        if "TIME_EXIT" in actions:
+            rec_lines.append("- ✅ **時間撤退/クローズ優先**：デイトレの失速条件に該当")
         if not rec_lines:
             rec_lines.append("- （特別な推奨はありません）")
 
