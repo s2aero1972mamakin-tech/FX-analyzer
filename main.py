@@ -1444,7 +1444,7 @@ st.json(reco.get("q", {}))
 
 
 def _render_hold_manage_panel(pair_label: str, ctx_in: Dict[str, Any], plan_ui: Dict[str, Any], feats: Dict[str, Any], keys: Dict[str, str]):
-    """保有中のイベント接近対応とデイトレ失速撤退を表示。
+    """保有中のイベント接近対応（縮退/一部利確/建値移動/新規追加禁止）を表示。
     - 実際の建玉をアプリが自動で把握することはできないので、運用者が「保有開始/解除」を押して管理します。
     - ルール自体は logic.py 側に統合済み（swing_hold_v1 / daytrade_hold_v1）。
     """
@@ -1555,7 +1555,9 @@ def _render_hold_manage_panel(pair_label: str, ctx_in: Dict[str, Any], plan_ui: 
         if bool(hold.get("move_sl_to_be")) and hold.get("new_sl_reco") is not None:
             rec_lines.append(f"- ✅ **建値移動/防御**：SL を {float(hold.get('new_sl_reco')):.3f} 付近へ（BE）")
         if "TIME_EXIT" in actions:
-            rec_lines.append("- ✅ **時間撤退/クローズ優先**：デイトレの失速条件に該当")
+            stage = hold.get("time_exit_stage")
+            stage_txt = f"（{stage}判定）" if stage else ""
+            rec_lines.append(f"- ✅ **時間撤退/失速撤退**{stage_txt}：当該ポジションは手仕舞い優先")
         if not rec_lines:
             rec_lines.append("- （特別な推奨はありません）")
 
@@ -1565,6 +1567,21 @@ def _render_hold_manage_panel(pair_label: str, ctx_in: Dict[str, Any], plan_ui: 
             with st.expander("根拠（メモ）", expanded=False):
                 for n in notes:
                     st.write("- " + str(n))
+
+        if str(hold.get("trade_profile") or ctx_in.get("trade_profile") or "") == "DAYTRADE":
+            with st.expander("デイトレ撤退ルールの自己確認", expanded=False):
+                if st.button("30分/60分/120分撤退ルールを確認", key=f"daytrade_hold_selfcheck_{pair_label}"):
+                    try:
+                        chk = getattr(logic, "daytrade_hold_selfcheck", lambda: {"ok": False, "error": "not_available"})()
+                        if chk.get("ok") and chk.get("passed_all"):
+                            st.success("30分/60分/120分の TIME_EXIT 自己確認に成功しました。")
+                        elif chk.get("ok"):
+                            st.warning("自己確認は実行できましたが、一部シナリオは未達です。")
+                        else:
+                            st.error(f"自己確認エラー: {chk.get('error')}")
+                        st.json(chk)
+                    except Exception as e:
+                        st.error(f"自己確認でエラー: {e}")
 
     except Exception:
         # Never break the main screen because of this optional panel
