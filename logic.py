@@ -1614,6 +1614,221 @@ def _build_shadow_candidate(
             "rr_gap": 0.0,
         }
 
+
+
+def _select_shadow_best(*metas: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        valid = [dict(m) for m in metas if isinstance(m, dict) and bool(m.get("enabled", False))]
+        if not valid:
+            return {}
+        valid.sort(
+            key=lambda m: (
+                1 if bool(m.get("candidate", False)) else 0,
+                float(m.get("score", 0.0) or 0.0),
+                float(m.get("gate_gap", -999.0) or -999.0),
+            ),
+            reverse=True,
+        )
+        best = dict(valid[0])
+        best.setdefault("source", "PRIMARY")
+        best.setdefault("source_label", "主判定側SHADOW")
+        best["candidate_count"] = int(sum(1 for m in valid if bool(m.get("candidate", False))))
+        best["enabled_count"] = int(len(valid))
+        return best
+    except Exception:
+        return dict(metas[0]) if metas and isinstance(metas[0], dict) else {}
+
+
+def _build_structure_veto_opposite_shadow(
+    *,
+    decision: str,
+    gate_mode: str,
+    trade_profile: Dict[str, Any],
+    pair: str,
+    direction: str,
+    entry: float,
+    atr14: float,
+    recent_low: float,
+    recent_high: float,
+    phase_label: str,
+    breakout_ok: bool,
+    strength: float,
+    lookback: int,
+    liq_lookback: int,
+    sl_atr_mult: float,
+    sl_buffer_atr: float,
+    rr_min: float,
+    dynamic_threshold: float,
+    confidence: float,
+    execution_score: float,
+    p_eff: float,
+    veto: List[str],
+    event_mode: str,
+    ctx_in: Dict[str, Any],
+    structure_long: bool,
+    structure_short: bool,
+) -> Dict[str, Any]:
+    try:
+        if str((trade_profile or {}).get("name") or "") != "DAYTRADE":
+            return {"enabled": False, "candidate": False, "mode": "OFF", "reason": "not_daytrade"}
+        if str(decision or "") == "TRADE" or str(gate_mode or "") != "structure_veto":
+            return {"enabled": True, "candidate": False, "mode": "OFF", "reason": "not_structure_veto", "source": "OPPOSITE", "source_label": "逆方向SHADOW"}
+
+        opp_direction = "SHORT" if str(direction).upper() == "LONG" else "LONG"
+        opp_side = "SELL" if opp_direction == "SHORT" else "BUY"
+        opp_structure_ok = bool(structure_short if opp_direction == "SHORT" else structure_long)
+
+        fast_df = _ctx_dataframe(ctx_in, "_df_fast_15m", "df_fast_15m", "_df_15m")
+        micro_df = _ctx_dataframe(ctx_in, "_df_micro_5m", "df_micro_5m", "_df_5m")
+        fast_probe = _probe_intraday_frame(fast_df, opp_direction, lookback=max(12, int(lookback or 12)))
+        micro_probe = _probe_intraday_frame(micro_df, opp_direction, lookback=12)
+        mtf_alignment = 0.0
+        if fast_probe:
+            mtf_alignment += 0.65 * float(fast_probe.get("score", 0.0) or 0.0)
+        if micro_probe:
+            mtf_alignment += 0.35 * float(micro_probe.get("score", 0.0) or 0.0)
+
+        entry2 = float((micro_probe.get("last_close") if isinstance(micro_probe, dict) and micro_probe else None) or (fast_probe.get("last_close") if isinstance(fast_probe, dict) and fast_probe else None) or entry)
+        regime_mult = _profile_tp_multiple(trade_profile, phase_label, breakout_ok, strength)
+        if opp_direction == "LONG":
+            sl2 = min(entry2 - float(sl_atr_mult) * float(atr14), float(recent_low) - float(sl_buffer_atr) * float(atr14))
+            atr_tp2 = entry2 + float(regime_mult) * float(atr14)
+            liq_tp2 = _liquidity_pool_tp((fast_df if isinstance(fast_df, pd.DataFrame) and not fast_df.empty else None) or fast_df, "LONG", lookback=max(12, int(liq_lookback or 12))) if isinstance(fast_df, pd.DataFrame) and not fast_df.empty else _liquidity_pool_tp(pd.DataFrame({"High": [recent_high], "Low": [recent_low]}), "LONG", lookback=1)
+            tp2 = max(atr_tp2, float(liq_tp2)) if liq_tp2 is not None else atr_tp2
+        else:
+            sl2 = max(entry2 + float(sl_atr_mult) * float(atr14), float(recent_high) + float(sl_buffer_atr) * float(atr14))
+            atr_tp2 = entry2 - float(regime_mult) * float(atr14)
+            liq_tp2 = _liquidity_pool_tp((fast_df if isinstance(fast_df, pd.DataFrame) and not fast_df.empty else None) or fast_df, "SHORT", lookback=max(12, int(liq_lookback or 12))) if isinstance(fast_df, pd.DataFrame) and not fast_df.empty else _liquidity_pool_tp(pd.DataFrame({"High": [recent_high], "Low": [recent_low]}), "SHORT", lookback=1)
+            tp2 = min(atr_tp2, float(liq_tp2)) if liq_tp2 is not None else atr_tp2
+
+        entry2, sl2, tp2, risk2, rr2, liq_tp_intraday2 = _daytrade_refine_levels(
+            entry2,
+            sl2,
+            tp2,
+            opp_direction,
+            trade_profile,
+            atr14,
+            recent_low,
+            recent_high,
+            liq_lookback,
+            fast_df if isinstance(fast_df, pd.DataFrame) else None,
+            fast_probe if isinstance(fast_probe, dict) else {},
+            micro_df if isinstance(micro_df, pd.DataFrame) else None,
+            micro_probe if isinstance(micro_probe, dict) else {},
+        )
+        tp2, tp2_compress_factor, tp2_compressed, tp2_hard_capped, tp2_cap_reason = _compress_daytrade_tp2(
+            entry2,
+            sl2,
+            tp2,
+            opp_direction,
+            float(mtf_alignment or 0.0),
+            (bool(fast_probe.get("dir_ok")) if fast_probe else None),
+            (bool(micro_probe.get("dir_ok")) if micro_probe else None),
+            fast_df if isinstance(fast_df, pd.DataFrame) else None,
+            liq_tp_intraday2,
+        )
+        rr2 = abs(float(tp2) - float(entry2)) / max(abs(float(entry2) - float(sl2)), 1e-9)
+        tp1_2 = _compute_profile_partial_tp(
+            entry2,
+            sl2,
+            tp2,
+            opp_direction,
+            trade_profile,
+            phase_label,
+            strength,
+            fast_df=(fast_df if isinstance(fast_df, pd.DataFrame) else None),
+            fast_probe=(fast_probe if isinstance(fast_probe, dict) else None),
+            liq_tp=liq_tp_intraday2,
+        )
+        tp1_2, tp1_cap2 = _cap_daytrade_tp1_to_liquidity(entry2, tp1_2, tp2, opp_direction, liq_tp_intraday2)
+
+        fast_ok = bool((fast_probe or {}).get("dir_ok", False))
+        micro_ok = bool((micro_probe or {}).get("dir_ok", False))
+        alt_execution = float(_clamp(
+            max(float(execution_score or 0.0), 0.44)
+            + (0.10 if fast_ok else -0.04)
+            + (0.08 if micro_ok else -0.04)
+            + (0.08 if opp_structure_ok else -0.05),
+            0.0,
+            1.0,
+        ))
+        alt_conf = float(_clamp(
+            max(float(confidence or 0.0), 0.24)
+            + (0.08 if opp_structure_ok else -0.04)
+            + 0.06 * float(_clamp(mtf_alignment, -0.40, 0.80))
+            + (0.04 if fast_ok else -0.02)
+            + (0.03 if micro_ok else -0.02),
+            0.0,
+            1.0,
+        ))
+        alt_p_eff = float(_clamp(
+            max(float(p_eff or 0.0), 0.28)
+            + (0.07 if opp_structure_ok else -0.03)
+            + 0.05 * float(_clamp(mtf_alignment, -0.40, 0.80))
+            + (0.03 if fast_ok else -0.01)
+            + (0.02 if micro_ok else -0.01),
+            0.0,
+            1.0,
+        ))
+        alt_ev_gate = float(dynamic_threshold) - 0.06
+        alt_ev_gate += 0.12 if opp_structure_ok else -0.05
+        alt_ev_gate += 0.05 if fast_ok else -0.03
+        alt_ev_gate += 0.04 if micro_ok else -0.03
+        alt_ev_gate += 0.06 * float(_clamp(rr2 - float(rr_min), -0.50, 0.80))
+        alt_ev_gate += 0.04 * float(_clamp(mtf_alignment, -0.50, 0.90))
+        if str(event_mode or "") in ("EVENT_WINDOW", "POST_WAIT"):
+            alt_ev_gate -= 0.12
+
+        shadow = _build_shadow_candidate(
+            decision=str(decision),
+            trade_profile=trade_profile,
+            pair=str(pair),
+            direction=str(opp_direction),
+            side=str(opp_side),
+            entry=float(entry2),
+            sl=float(sl2),
+            tp1=(float(tp1_2) if tp1_2 is not None else None),
+            tp2=float(tp2),
+            order_type="MARKET",
+            entry_type="MARKET_NOW",
+            rr=float(rr2),
+            rr_min=float(rr_min),
+            ev_gate=float(alt_ev_gate),
+            dynamic_threshold=float(dynamic_threshold),
+            confidence=float(alt_conf),
+            execution_score=float(alt_execution),
+            p_eff=float(alt_p_eff),
+            mtf_alignment_score=float(mtf_alignment),
+            fast_tf_dir_ok=(bool(fast_probe.get("dir_ok")) if fast_probe else None),
+            micro_tf_dir_ok=(bool(micro_probe.get("dir_ok")) if micro_probe else None),
+            structure_ok=bool(opp_structure_ok),
+            breakout_pass=bool(breakout_ok),
+            event_mode=str(event_mode),
+            veto=list(veto),
+        )
+        shadow["source"] = "OPPOSITE_STRUCTURE_VETO"
+        shadow["source_label"] = "逆方向SHADOW"
+        shadow["tp1_liquidity_capped"] = bool(tp1_cap2)
+        shadow["tp2_compress_factor"] = float(tp2_compress_factor)
+        shadow["tp2_compressed"] = bool(tp2_compressed)
+        shadow["tp2_hard_capped"] = bool(tp2_hard_capped)
+        shadow["tp2_cap_reason"] = str(tp2_cap_reason)
+        if not opp_structure_ok and not bool(shadow.get("candidate", False)):
+            shadow["reason"] = str(shadow.get("reason") or "") + " / 逆方向も構造未達"
+        return shadow
+    except Exception as e:
+        return {
+            "enabled": True,
+            "candidate": False,
+            "mode": "ERROR",
+            "reason": f"opposite_shadow_error:{type(e).__name__}",
+            "score": 0.0,
+            "gate_gap": 0.0,
+            "rr_gap": 0.0,
+            "source": "OPPOSITE_STRUCTURE_VETO",
+            "source_label": "逆方向SHADOW",
+        }
+
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
@@ -2729,8 +2944,43 @@ def get_ai_order_strategy(
         event_mode=str(event_mode),
         veto=list(veto),
     )
+    if isinstance(shadow_meta, dict):
+        shadow_meta.setdefault("source", "PRIMARY")
+        shadow_meta.setdefault("source_label", "主判定側SHADOW")
+    shadow_opposite_meta = _build_structure_veto_opposite_shadow(
+        decision=str(decision),
+        gate_mode=str(gate_mode),
+        trade_profile=trade_profile,
+        pair=str(pair),
+        direction=str(direction),
+        entry=float(entry),
+        atr14=float(atr14),
+        recent_low=float(recent_low),
+        recent_high=float(recent_high),
+        phase_label=str(phase_label),
+        breakout_ok=bool(breakout_ok),
+        strength=float(strength),
+        lookback=int(lookback),
+        liq_lookback=int(liq_lookback),
+        sl_atr_mult=float(sl_atr_mult),
+        sl_buffer_atr=float(sl_buffer_atr),
+        rr_min=float(rr_min),
+        dynamic_threshold=float(dynamic_threshold),
+        confidence=float(confidence),
+        execution_score=float(execution_score),
+        p_eff=float(p_eff),
+        veto=list(veto),
+        event_mode=str(event_mode),
+        ctx_in=ctx_in,
+        structure_long=bool(structure_long),
+        structure_short=bool(structure_short),
+    )
+    shadow_best = _select_shadow_best(shadow_meta, shadow_opposite_meta)
     try:
-        ctx_out["shadow"] = dict(shadow_meta)
+        ctx_out["shadow_primary"] = dict(shadow_meta) if isinstance(shadow_meta, dict) else {}
+        ctx_out["shadow_opposite"] = dict(shadow_opposite_meta) if isinstance(shadow_opposite_meta, dict) else {}
+        ctx_out["shadow_best"] = dict(shadow_best) if isinstance(shadow_best, dict) else {}
+        ctx_out["shadow"] = dict(shadow_best or shadow_meta)
     except Exception:
         pass
 
@@ -2828,10 +3078,13 @@ def get_ai_order_strategy(
         "state_probs": state_probs,
         "ev_contribs": ev_contribs,
 
-        "shadow": (dict(shadow_meta) if isinstance(shadow_meta, dict) else {}),
-        "shadow_candidate": bool((shadow_meta or {}).get("candidate", False)) if isinstance(shadow_meta, dict) else False,
-        "shadow_reason": (str((shadow_meta or {}).get("reason", "")) if isinstance(shadow_meta, dict) else ""),
-        "shadow_score": float((shadow_meta or {}).get("score", 0.0) or 0.0) if isinstance(shadow_meta, dict) else 0.0,
+        "shadow": (dict(shadow_best or shadow_meta) if isinstance((shadow_best or shadow_meta), dict) else {}),
+        "shadow_primary": (dict(shadow_meta) if isinstance(shadow_meta, dict) else {}),
+        "shadow_opposite": (dict(shadow_opposite_meta) if isinstance(shadow_opposite_meta, dict) else {}),
+        "shadow_best": (dict(shadow_best) if isinstance(shadow_best, dict) else {}),
+        "shadow_candidate": bool((shadow_best or {}).get("candidate", False)) if isinstance((shadow_best or {}), dict) else False,
+        "shadow_reason": (str((shadow_best or {}).get("reason", "")) if isinstance((shadow_best or {}), dict) else ""),
+        "shadow_score": float((shadow_best or {}).get("score", 0.0) or 0.0) if isinstance((shadow_best or {}), dict) else 0.0,
         "hold_manage": (hold_manage if isinstance(hold_manage, dict) else {}),
         "_ctx": ctx_out,
     }
