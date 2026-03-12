@@ -3249,3 +3249,513 @@ def _apply_quality_filter(ev_gate, strength, confidence, breakout_ok, hhhl_ok):
         return float(ev_gate) * quality
     except Exception:
         return ev_gate
+
+
+# ===============================
+# DAYTRADE VALIDATION ENGINE (v8)
+# Purpose: validate TP1/TP2/TIME_EXIT/BE/MFE/MAE on forward bars
+# ===============================
+
+def _dtv_safe_float(v, default=0.0):
+    try:
+        if v is None:
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _dtv_safe_bool(v, default=False):
+    try:
+        return bool(v)
+    except Exception:
+        return bool(default)
+
+
+def _dtv_parse_ts(ts_val):
+    try:
+        if ts_val is None:
+            return None
+        if isinstance(ts_val, pd.Timestamp):
+            ts = ts_val
+        else:
+            s = str(ts_val).strip().replace("Z", "+00:00")
+            ts = pd.to_datetime(s, utc=True, errors="coerce")
+        if pd.isna(ts):
+            return None
+        return ts
+    except Exception:
+        return None
+
+
+def _dtv_prepare_bars(bars: Optional[pd.DataFrame]) -> pd.DataFrame:
+    try:
+        if bars is None or (not isinstance(bars, pd.DataFrame)) or bars.empty:
+            return pd.DataFrame()
+        d = bars.copy()
+        if isinstance(d.columns, pd.MultiIndex):
+            d.columns = [c[0] for c in d.columns]
+        for c in ["Open", "High", "Low", "Close"]:
+            if c not in d.columns:
+                return pd.DataFrame()
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+        d = d.dropna(subset=["Open", "High", "Low", "Close"]).copy()
+        if not isinstance(d.index, pd.DatetimeIndex):
+            try:
+                d.index = pd.to_datetime(d.index, utc=True, errors="coerce")
+            except Exception:
+                return pd.DataFrame()
+        else:
+            try:
+                d.index = d.index.tz_convert("UTC") if d.index.tz is not None else d.index.tz_localize("UTC")
+            except Exception:
+                pass
+        d = d[~d.index.isna()].sort_index()
+        return d
+    except Exception:
+        return pd.DataFrame()
+
+
+def _dtv_event_order_long(bar_open, bar_high, bar_low, stop_px, tp1_px, tp2_px, partial_hit):
+    events = []
+    try:
+        bo = _dtv_safe_float(bar_open)
+        bh = _dtv_safe_float(bar_high)
+        bl = _dtv_safe_float(bar_low)
+        sp = _dtv_safe_float(stop_px, None)
+        t1 = _dtv_safe_float(tp1_px, None) if tp1_px is not None else None
+        t2 = _dtv_safe_float(tp2_px, None) if tp2_px is not None else None
+        if sp is not None and bl <= sp:
+            events.append((abs(bo - sp), "STOP", sp))
+        if (not partial_hit) and (t1 is not None) and bh >= t1:
+            events.append((abs(bo - t1), "TP1", t1))
+        if (t2 is not None) and bh >= t2:
+            events.append((abs(bo - t2), "TP2", t2))
+        if not events:
+            return []
+        rank = {"STOP": 0, "TP1": 1, "TP2": 2}
+        events.sort(key=lambda x: (x[0], rank.get(x[1], 99)))
+        return [(e[1], e[2]) for e in events]
+    except Exception:
+        return []
+
+
+def _dtv_event_order_short(bar_open, bar_high, bar_low, stop_px, tp1_px, tp2_px, partial_hit):
+    events = []
+    try:
+        bo = _dtv_safe_float(bar_open)
+        bh = _dtv_safe_float(bar_high)
+        bl = _dtv_safe_float(bar_low)
+        sp = _dtv_safe_float(stop_px, None)
+        t1 = _dtv_safe_float(tp1_px, None) if tp1_px is not None else None
+        t2 = _dtv_safe_float(tp2_px, None) if tp2_px is not None else None
+        if sp is not None and bh >= sp:
+            events.append((abs(bo - sp), "STOP", sp))
+        if (not partial_hit) and (t1 is not None) and bl <= t1:
+            events.append((abs(bo - t1), "TP1", t1))
+        if (t2 is not None) and bl <= t2:
+            events.append((abs(bo - t2), "TP2", t2))
+        if not events:
+            return []
+        rank = {"STOP": 0, "TP1": 1, "TP2": 2}
+        events.sort(key=lambda x: (x[0], rank.get(x[1], 99)))
+        return [(e[1], e[2]) for e in events]
+    except Exception:
+        return []
+
+
+def evaluate_daytrade_validation_case(case: Dict[str, Any], bars: Optional[pd.DataFrame], bar_minutes: int = 15) -> Dict[str, Any]:
+    """Forward-validate one daytrade case on intraday OHLC bars.
+    Conservative intrabar rule: when stop and target both touch in the same bar,
+    whichever is closer to bar open is assumed first; ties go to STOP.
+    """
+    out = {
+        "ok": False,
+        "case_id": str((case or {}).get("case_id", "")),
+        "pair": str((case or {}).get("pair", "")),
+        "symbol": str((case or {}).get("symbol", "")),
+        "source": str((case or {}).get("source", "LIVE")),
+        "direction": str((case or {}).get("direction", "LONG")).upper(),
+        "entry_type": str((case or {}).get("entry_type", "MARKET_NOW")),
+        "triggered": False,
+        "trigger_bar": None,
+        "exit_reason": "NO_DATA",
+        "tp1_hit": False,
+        "tp2_hit": False,
+        "time_exit": False,
+        "be_exit": False,
+        "sl_hit": False,
+        "partial_exit": False,
+        "final_r": 0.0,
+        "mfe_r": 0.0,
+        "mae_r": 0.0,
+        "bars_held": 0,
+        "entry_ts": None,
+        "exit_ts": None,
+        "partial_realized_r": 0.0,
+        "remaining_size": 1.0,
+    }
+    try:
+        d = _dtv_prepare_bars(bars)
+        if d.empty:
+            out["error"] = "empty_bars"
+            return out
+        ts_open = _dtv_parse_ts((case or {}).get("ts_utc") or (case or {}).get("entry_ts"))
+        if ts_open is None:
+            ts_open = d.index[0]
+        d = d.loc[d.index >= ts_open].copy()
+        if d.empty:
+            out["error"] = "no_forward_bars"
+            return out
+
+        direction = str((case or {}).get("direction", "LONG")).upper()
+        entry_type = str((case or {}).get("entry_type", "MARKET_NOW")).upper()
+        entry = _dtv_safe_float((case or {}).get("entry"))
+        sl = _dtv_safe_float((case or {}).get("sl"))
+        tp1 = (None if (case or {}).get("tp1") in (None, "", "nan") else _dtv_safe_float((case or {}).get("tp1")))
+        tp2 = _dtv_safe_float((case or {}).get("tp2"))
+        be_trigger_r = _dtv_safe_float((case or {}).get("be_trigger_r"), 0.40)
+        trail_trigger_r = _dtv_safe_float((case or {}).get("trail_trigger_r"), 0.90)
+        max_hold_hours = _dtv_safe_float((case or {}).get("max_hold_hours"), 12.0)
+        stale_after_hours = _dtv_safe_float((case or {}).get("stale_after_hours"), 4.0)
+        partial_fraction = min(0.9, max(0.1, _dtv_safe_float((case or {}).get("partial_fraction"), 0.5)))
+        max_hold_bars = max(1, int(round(max_hold_hours * 60.0 / max(float(bar_minutes), 1.0))))
+        stale_after_bars = max(1, int(round(stale_after_hours * 60.0 / max(float(bar_minutes), 1.0))))
+        risk = abs(entry - sl)
+        if risk <= 1e-9:
+            out["error"] = "zero_risk"
+            return out
+
+        # Trigger phase
+        triggered = False
+        entry_ts = None
+        entry_i = None
+        actual_entry = entry
+        for i, (idx, row) in enumerate(d.iloc[:max(max_hold_bars, 8)].iterrows()):
+            o = _dtv_safe_float(row["Open"])
+            h = _dtv_safe_float(row["High"])
+            l = _dtv_safe_float(row["Low"])
+            c = _dtv_safe_float(row["Close"])
+            if entry_type in ("MARKET_NOW", "MARKET"):
+                triggered = True
+                entry_ts = idx
+                entry_i = i
+                actual_entry = entry if abs(entry) > 0 else c
+                break
+            if entry_type.startswith("STOP"):
+                if direction == "LONG" and h >= entry:
+                    triggered = True
+                    entry_ts = idx
+                    entry_i = i
+                    actual_entry = entry
+                    break
+                if direction == "SHORT" and l <= entry:
+                    triggered = True
+                    entry_ts = idx
+                    entry_i = i
+                    actual_entry = entry
+                    break
+            if entry_type.startswith("LIMIT"):
+                if direction == "LONG" and l <= entry:
+                    triggered = True
+                    entry_ts = idx
+                    entry_i = i
+                    actual_entry = entry
+                    break
+                if direction == "SHORT" and h >= entry:
+                    triggered = True
+                    entry_ts = idx
+                    entry_i = i
+                    actual_entry = entry
+                    break
+        if not triggered:
+            out.update({"ok": True, "triggered": False, "exit_reason": "NOT_TRIGGERED"})
+            return out
+
+        out["triggered"] = True
+        out["trigger_bar"] = int(entry_i)
+        out["entry_ts"] = entry_ts.isoformat() if hasattr(entry_ts, "isoformat") else str(entry_ts)
+        stop_px = sl
+        partial_hit = False
+        tp2_hit = False
+        realized_partial_r = 0.0
+        remaining_size = 1.0
+        mfe_r = 0.0
+        mae_r = 0.0
+        best_price = actual_entry
+        worst_price = actual_entry
+        exit_price = None
+        exit_reason = None
+        exit_ts = None
+        time_exit_stage = None
+        move_stop_to_be = False
+        trailing_active = False
+
+        fwd = d.iloc[entry_i: entry_i + max_hold_bars].copy()
+        for j, (idx, row) in enumerate(fwd.iterrows()):
+            o = _dtv_safe_float(row["Open"])
+            h = _dtv_safe_float(row["High"])
+            l = _dtv_safe_float(row["Low"])
+            c = _dtv_safe_float(row["Close"])
+            if direction == "LONG":
+                best_price = max(best_price, h)
+                worst_price = min(worst_price, l)
+                mfe_r = max(mfe_r, (best_price - actual_entry) / risk)
+                mae_r = min(mae_r, (worst_price - actual_entry) / risk)
+                if (not move_stop_to_be) and ((best_price - actual_entry) / risk >= be_trigger_r):
+                    stop_px = max(stop_px, actual_entry)
+                    move_stop_to_be = True
+                if (not trailing_active) and ((best_price - actual_entry) / risk >= trail_trigger_r):
+                    trailing_active = True
+                if trailing_active:
+                    lock_r = max(0.15, 0.25 * ((best_price - actual_entry) / risk))
+                    stop_px = max(stop_px, actual_entry + lock_r * risk)
+                events = _dtv_event_order_long(o, h, l, stop_px, tp1, tp2, partial_hit)
+            else:
+                best_price = min(best_price, l)
+                worst_price = max(worst_price, h)
+                mfe_r = max(mfe_r, (actual_entry - best_price) / risk)
+                mae_r = min(mae_r, (actual_entry - worst_price) / risk)
+                if (not move_stop_to_be) and ((actual_entry - best_price) / risk >= be_trigger_r):
+                    stop_px = min(stop_px, actual_entry)
+                    move_stop_to_be = True
+                if (not trailing_active) and ((actual_entry - best_price) / risk >= trail_trigger_r):
+                    trailing_active = True
+                if trailing_active:
+                    lock_r = max(0.15, 0.25 * ((actual_entry - best_price) / risk))
+                    stop_px = min(stop_px, actual_entry - lock_r * risk)
+                events = _dtv_event_order_short(o, h, l, stop_px, tp1, tp2, partial_hit)
+
+            for ev_name, ev_px in events:
+                if ev_name == "TP1" and (not partial_hit):
+                    partial_hit = True
+                    out["tp1_hit"] = True
+                    out["partial_exit"] = True
+                    tp1_r = abs(ev_px - actual_entry) / risk
+                    realized_partial_r += partial_fraction * tp1_r
+                    remaining_size = max(0.0, 1.0 - partial_fraction)
+                    if direction == "LONG":
+                        stop_px = max(stop_px, actual_entry)
+                    else:
+                        stop_px = min(stop_px, actual_entry)
+                    continue
+                if ev_name == "TP2":
+                    tp2_hit = True
+                    out["tp2_hit"] = True
+                    exit_price = ev_px
+                    exit_reason = "TP2"
+                    exit_ts = idx
+                    break
+                if ev_name == "STOP":
+                    exit_price = ev_px
+                    exit_reason = "BE_EXIT" if abs(ev_px - actual_entry) <= 1e-9 and (partial_hit or move_stop_to_be) else "SL"
+                    exit_ts = idx
+                    break
+            if exit_reason is not None:
+                break
+
+            bars_held = j + 1
+            cur_r = ((c - actual_entry) / risk) if direction == "LONG" else ((actual_entry - c) / risk)
+            if (bars_held >= stale_after_bars) and (not partial_hit) and (cur_r <= 0.15):
+                exit_price = c
+                exit_reason = "TIME_EXIT"
+                time_exit_stage = "stale"
+                exit_ts = idx
+                break
+            if bars_held >= max_hold_bars:
+                exit_price = c
+                exit_reason = "TIME_EXIT"
+                time_exit_stage = "max_hold"
+                exit_ts = idx
+                break
+
+        if exit_reason is None:
+            last_idx = fwd.index[-1]
+            last_close = _dtv_safe_float(fwd.iloc[-1]["Close"])
+            exit_price = last_close
+            exit_reason = "TIME_EXIT"
+            time_exit_stage = "fallback"
+            exit_ts = last_idx
+
+        if direction == "LONG":
+            rem_r = ((exit_price - actual_entry) / risk) * remaining_size
+        else:
+            rem_r = ((actual_entry - exit_price) / risk) * remaining_size
+        final_r = realized_partial_r + rem_r
+
+        out.update({
+            "ok": True,
+            "triggered": True,
+            "exit_reason": str(exit_reason),
+            "time_exit": bool(str(exit_reason).startswith("TIME_EXIT")),
+            "time_exit_stage": time_exit_stage,
+            "be_exit": bool(str(exit_reason) == "BE_EXIT"),
+            "sl_hit": bool(str(exit_reason) == "SL"),
+            "final_r": float(final_r),
+            "mfe_r": float(mfe_r),
+            "mae_r": float(mae_r),
+            "bars_held": int(len(fwd.loc[:exit_ts])) if exit_ts is not None else int(len(fwd)),
+            "exit_ts": exit_ts.isoformat() if hasattr(exit_ts, "isoformat") else str(exit_ts),
+            "partial_realized_r": float(realized_partial_r),
+            "remaining_size": float(remaining_size),
+        })
+        return out
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}: {e}"
+        return out
+
+
+def build_daytrade_validation_summary(results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    try:
+        rows = [r for r in (results or []) if isinstance(r, dict)]
+        triggered = [r for r in rows if r.get("triggered")]
+        realized = [r for r in triggered if r.get("ok")]
+        n_all = len(rows)
+        n_trg = len(triggered)
+        def _rate(key, base):
+            if base <= 0:
+                return 0.0
+            return float(sum(1 for r in realized if bool(r.get(key))) / base)
+        final_rs = [float(r.get("final_r", 0.0) or 0.0) for r in realized]
+        mfe_rs = [float(r.get("mfe_r", 0.0) or 0.0) for r in realized]
+        mae_rs = [float(r.get("mae_r", 0.0) or 0.0) for r in realized]
+        out = {
+            "cases_total": int(n_all),
+            "cases_triggered": int(n_trg),
+            "trigger_rate": float(n_trg / n_all) if n_all > 0 else 0.0,
+            "tp1_hit_rate": _rate("tp1_hit", n_trg),
+            "tp2_hit_rate": _rate("tp2_hit", n_trg),
+            "time_exit_rate": _rate("time_exit", n_trg),
+            "be_exit_rate": _rate("be_exit", n_trg),
+            "sl_hit_rate": _rate("sl_hit", n_trg),
+            "avg_final_r": float(sum(final_rs) / len(final_rs)) if final_rs else 0.0,
+            "median_final_r": float(pd.Series(final_rs).median()) if final_rs else 0.0,
+            "avg_mfe_r": float(sum(mfe_rs) / len(mfe_rs)) if mfe_rs else 0.0,
+            "avg_mae_r": float(sum(mae_rs) / len(mae_rs)) if mae_rs else 0.0,
+            "win_rate": float(sum(1 for v in final_rs if v > 0) / len(final_rs)) if final_rs else 0.0,
+            "passed": bool(n_trg > 0),
+        }
+        by_source = {}
+        for src in sorted({str(r.get("source", "LIVE")) for r in rows}):
+            subset = [r for r in rows if str(r.get("source", "LIVE")) == src and r.get("triggered")]
+            rs = [float(r.get("final_r", 0.0) or 0.0) for r in subset]
+            by_source[src] = {
+                "n": int(len(subset)),
+                "tp1_hit_rate": float(sum(1 for r in subset if r.get("tp1_hit")) / len(subset)) if subset else 0.0,
+                "tp2_hit_rate": float(sum(1 for r in subset if r.get("tp2_hit")) / len(subset)) if subset else 0.0,
+                "time_exit_rate": float(sum(1 for r in subset if r.get("time_exit")) / len(subset)) if subset else 0.0,
+                "avg_final_r": float(sum(rs) / len(rs)) if rs else 0.0,
+            }
+        out["by_source"] = by_source
+        return out
+    except Exception as e:
+        return {"cases_total": 0, "cases_triggered": 0, "passed": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def run_daytrade_validation_report(cases: List[Dict[str, Any]], bars_map: Dict[str, pd.DataFrame], bar_minutes: int = 15) -> Dict[str, Any]:
+    results = []
+    for case in (cases or []):
+        if not isinstance(case, dict):
+            continue
+        symbol = str(case.get("symbol") or "")
+        pair = str(case.get("pair") or "")
+        bars = bars_map.get(symbol) or bars_map.get(pair) or pd.DataFrame()
+        res = evaluate_daytrade_validation_case(case, bars, bar_minutes=bar_minutes)
+        merged = dict(case)
+        merged.update(res)
+        results.append(merged)
+    summary = build_daytrade_validation_summary(results)
+    return {"ok": True, "summary": summary, "results": results, "bar_minutes": int(bar_minutes)}
+
+
+def daytrade_validation_selfcheck() -> Dict[str, Any]:
+    """Synthetic self-check for validation engine itself (TP1/TP2/TIME_EXIT/BE)."""
+    try:
+        idx = pd.date_range("2026-03-12 00:00:00+00:00", periods=40, freq="15min")
+        def _mk_df(rows):
+            return pd.DataFrame(rows, index=idx[:len(rows)])
+        long_case = {
+            "case_id": "tp2_long",
+            "pair": "TEST/LONG",
+            "symbol": "TESTLONG",
+            "ts_utc": idx[0].isoformat(),
+            "direction": "LONG",
+            "entry_type": "MARKET_NOW",
+            "entry": 100.0,
+            "sl": 99.0,
+            "tp1": 100.6,
+            "tp2": 101.2,
+            "be_trigger_r": 0.4,
+            "trail_trigger_r": 0.9,
+            "max_hold_hours": 3,
+            "stale_after_hours": 1,
+        }
+        long_df = _mk_df([
+            {"Open":100.0,"High":100.3,"Low":99.9,"Close":100.2},
+            {"Open":100.2,"High":100.7,"Low":100.1,"Close":100.6},
+            {"Open":100.6,"High":101.25,"Low":100.5,"Close":101.1},
+        ])
+        be_case = dict(long_case)
+        be_case.update({"case_id":"be_exit_long","tp1":100.5,"tp2":101.5})
+        be_df = _mk_df([
+            {"Open":100.0,"High":100.55,"Low":99.95,"Close":100.4},
+            {"Open":100.4,"High":100.45,"Low":100.0,"Close":100.05},
+        ])
+        time_case = dict(long_case)
+        time_case.update({"case_id":"time_exit_long","tp1":101.5,"tp2":102.0,"max_hold_hours":1.0,"stale_after_hours":0.5})
+        time_df = _mk_df([
+            {"Open":100.0,"High":100.08,"Low":99.96,"Close":100.03},
+            {"Open":100.03,"High":100.07,"Low":99.98,"Close":100.01},
+            {"Open":100.01,"High":100.05,"Low":99.97,"Close":100.00},
+            {"Open":100.00,"High":100.04,"Low":99.96,"Close":99.99},
+        ])
+        short_case = {
+            "case_id": "tp2_short",
+            "pair": "TEST/SHORT",
+            "symbol": "TESTSHORT",
+            "ts_utc": idx[0].isoformat(),
+            "direction": "SHORT",
+            "entry_type": "MARKET_NOW",
+            "entry": 100.0,
+            "sl": 101.0,
+            "tp1": 99.4,
+            "tp2": 98.8,
+            "be_trigger_r": 0.4,
+            "trail_trigger_r": 0.9,
+            "max_hold_hours": 3,
+            "stale_after_hours": 1,
+        }
+        short_df = _mk_df([
+            {"Open":100.0,"High":100.1,"Low":99.7,"Close":99.8},
+            {"Open":99.8,"High":99.85,"Low":99.35,"Close":99.45},
+            {"Open":99.45,"High":99.5,"Low":98.75,"Close":98.9},
+        ])
+        cases = [
+            (long_case, long_df, "TP2"),
+            (be_case, be_df, "BE_EXIT"),
+            (time_case, time_df, "TIME_EXIT"),
+            (short_case, short_df, "TP2"),
+        ]
+        out = {"ok": True, "results": {}, "passed_all": True}
+        for case, bars, expected in cases:
+            res = evaluate_daytrade_validation_case(case, bars, bar_minutes=15)
+            passed = bool(res.get("ok")) and str(res.get("exit_reason", "")).startswith(expected)
+            out["results"][case["case_id"]] = {
+                "exit_reason": res.get("exit_reason"),
+                "tp1_hit": bool(res.get("tp1_hit")),
+                "tp2_hit": bool(res.get("tp2_hit")),
+                "time_exit": bool(res.get("time_exit")),
+                "be_exit": bool(res.get("be_exit")),
+                "final_r": float(res.get("final_r", 0.0) or 0.0),
+                "mfe_r": float(res.get("mfe_r", 0.0) or 0.0),
+                "mae_r": float(res.get("mae_r", 0.0) or 0.0),
+                "passed": passed,
+            }
+            out["passed_all"] = bool(out["passed_all"] and passed)
+        return out
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+# ===============================
+# END DAYTRADE VALIDATION ENGINE
+# ===============================
