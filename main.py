@@ -10,7 +10,7 @@ import uuid
 import math
 import json
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Tuple, Optional, List
 
 import streamlit as st
@@ -1212,6 +1212,64 @@ def _is_daytrade_signal_row(row: Dict[str, Any]) -> bool:
         return False
 
 
+
+_DAYTRADE_VALIDATION_PERIODS = {
+    "5m": ["5d", "10d", "1mo"],
+    "15m": ["10d", "1mo", "2mo"],
+    "1h": ["1mo", "3mo", "6mo", "1y"],
+}
+
+
+def _period_to_timedelta(period: str) -> Optional[timedelta]:
+    try:
+        p = str(period or "").strip().lower()
+        mp = {
+            "5d": timedelta(days=5),
+            "10d": timedelta(days=10),
+            "1mo": timedelta(days=30),
+            "2mo": timedelta(days=60),
+            "3mo": timedelta(days=90),
+            "6mo": timedelta(days=180),
+            "1y": timedelta(days=365),
+        }
+        return mp.get(p)
+    except Exception:
+        return None
+
+
+def _daytrade_validation_period_options(interval: str) -> List[str]:
+    iv = str(interval or "15m").strip().lower()
+    return list(_DAYTRADE_VALIDATION_PERIODS.get(iv, _DAYTRADE_VALIDATION_PERIODS["15m"]))
+
+
+def _daytrade_validation_default_period(interval: str) -> str:
+    opts = _daytrade_validation_period_options(interval)
+    preferred = "3mo" if str(interval).lower() == "1h" else "1mo"
+    return preferred if preferred in opts else opts[min(1, len(opts)-1)]
+
+
+def _filter_daytrade_validation_signals(df_signals: pd.DataFrame, report_period: str) -> pd.DataFrame:
+    if df_signals is None or df_signals.empty:
+        return pd.DataFrame()
+    delta = _period_to_timedelta(report_period)
+    if delta is None or "ts_utc" not in df_signals.columns:
+        return df_signals.copy()
+    d = df_signals.copy()
+    ts = pd.to_datetime(d["ts_utc"].astype(str).str.replace("Z", "+00:00", regex=False), utc=True, errors="coerce")
+    cutoff = pd.Timestamp.now(tz="UTC") - delta
+    d = d.loc[ts >= cutoff].copy()
+    return d
+
+
+def _daytrade_validation_help_text(interval: str, period: str) -> str:
+    iv = str(interval or "15m")
+    rp = str(period or "")
+    if iv == "1h":
+        return f"主判定に近い完成判定向けの組み合わせです（{rp}）。"
+    if iv == "15m":
+        return f"短期セットアップ確認向けの組み合わせです（{rp}）。"
+    return f"執行寄りの細かな検証向けの組み合わせです（{rp}）。"
+
 def _build_daytrade_validation_cases(df_signals: pd.DataFrame) -> List[Dict[str, Any]]:
     if df_signals is None or df_signals.empty:
         return []
@@ -1299,12 +1357,23 @@ def _fetch_daytrade_validation_bars(cases: List[Dict[str, Any]], interval: str =
     return bars_map
 
 
-def _run_daytrade_validation(df_signals: pd.DataFrame, bar_interval: str = "15m", period: str = "10d") -> Dict[str, Any]:
+def _run_daytrade_validation(df_signals: pd.DataFrame, bar_interval: str = "15m", report_period: str = "1mo") -> Dict[str, Any]:
     try:
-        cases = _build_daytrade_validation_cases(df_signals)
+        df_scope = _filter_daytrade_validation_signals(df_signals, report_period)
+        cases = _build_daytrade_validation_cases(df_scope)
         if not cases:
-            return {"ok": False, "error": "no_daytrade_cases", "cases": []}
-        bars_map = _fetch_daytrade_validation_bars(cases, interval=bar_interval, period=period)
+            return {
+                "ok": False,
+                "error": "no_daytrade_cases",
+                "cases": [],
+                "report_config": {
+                    "bar_interval": str(bar_interval),
+                    "report_period": str(report_period),
+                    "signals_total": int(len(df_signals)) if isinstance(df_signals, pd.DataFrame) else 0,
+                    "signals_in_scope": int(len(df_scope)) if isinstance(df_scope, pd.DataFrame) else 0,
+                },
+            }
+        bars_map = _fetch_daytrade_validation_bars(cases, interval=bar_interval, period=report_period)
         bar_minutes = 15 if str(bar_interval) == "15m" else (5 if str(bar_interval) == "5m" else 60)
         runner = getattr(logic, "run_daytrade_validation_report", None)
         if not callable(runner):
@@ -1314,8 +1383,15 @@ def _run_daytrade_validation(df_signals: pd.DataFrame, bar_interval: str = "15m"
             return {"ok": False, "error": "invalid_validation_report"}
         rep["cases"] = cases
         rep["bars_loaded"] = {k: int(len(v)) for k, v in bars_map.items() if isinstance(v, pd.DataFrame)}
-        rep["bar_interval"] = bar_interval
-        rep["period"] = period
+        rep["bar_interval"] = str(bar_interval)
+        rep["period"] = str(report_period)
+        rep["report_config"] = {
+            "bar_interval": str(bar_interval),
+            "report_period": str(report_period),
+            "signals_total": int(len(df_signals)) if isinstance(df_signals, pd.DataFrame) else 0,
+            "signals_in_scope": int(len(df_scope)) if isinstance(df_scope, pd.DataFrame) else 0,
+            "cases_built": int(len(cases)),
+        }
         return rep
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
@@ -1323,17 +1399,28 @@ def _run_daytrade_validation(df_signals: pd.DataFrame, bar_interval: str = "15m"
 
 def _render_daytrade_validation_panel(df_signals: pd.DataFrame):
     st.markdown("### デイトレ検証レポート")
-    st.caption("TP1到達率 / TP2到達率 / TIME_EXIT率 / 建値撤退率 / 最終実現R / MFE/MAE を、signals.csv の DAYTRADE 候補から前方バー検証します。")
-    c1, c2, c3 = st.columns([1,1,1])
+    st.caption("価格期間上書きとは別に、デイトレ検証レポート専用の足・期間で TP1 / TP2 / TIME_EXIT / 建値撤退 / 最終R / MFE / MAE を集計します。")
+
+    c1, c2, c3 = st.columns([1, 1, 1])
     interval = c1.selectbox("検証足", ["15m", "5m", "1h"], index=0, key="dt_val_interval")
-    period = c2.selectbox("取得期間", ["10d", "5d", "1mo"], index=0, key="dt_val_period")
+    period_opts = _daytrade_validation_period_options(interval)
+    default_period = _daytrade_validation_default_period(interval)
+    saved_period = str(st.session_state.get("dt_val_period", default_period))
+    if saved_period not in period_opts:
+        saved_period = default_period
+    period = c2.selectbox("レポート対象期間", period_opts, index=period_opts.index(saved_period), key="dt_val_period")
     include_auto = c3.checkbox("SHADOW候補も含める", value=True, key="dt_val_include_shadow")
+
+    st.info(_daytrade_validation_help_text(interval, period))
+    st.caption(f"対象シグナルは直近 {period} の DAYTRADE 候補に限定して集計します。")
+
     if st.button("デイトレ検証レポートを作成", key="run_daytrade_validation"):
         df_use = df_signals.copy()
         if not include_auto and "decision" in df_use.columns:
             df_use = df_use[df_use["decision"].astype(str).str.upper() == "TRADE"].copy()
-        rep = _run_daytrade_validation(df_use, bar_interval=interval, period=period)
+        rep = _run_daytrade_validation(df_use, bar_interval=interval, report_period=period)
         st.session_state["daytrade_validation_report"] = rep
+
     rep = st.session_state.get("daytrade_validation_report")
     if not isinstance(rep, dict):
         chk = getattr(logic, "daytrade_validation_selfcheck", lambda: {"ok": False, "error": "not_available"})()
@@ -1344,11 +1431,21 @@ def _render_daytrade_validation_panel(df_signals: pd.DataFrame):
         with st.expander("検証エンジン自己確認", expanded=False):
             st.json(chk)
         return
+
+    cfg = rep.get("report_config", {}) if isinstance(rep.get("report_config", {}), dict) else {}
+    if cfg:
+        x1, x2, x3, x4 = st.columns(4)
+        x1.metric("検証足", str(cfg.get("bar_interval") or rep.get("bar_interval") or "—"))
+        x2.metric("対象期間", str(cfg.get("report_period") or rep.get("period") or "—"))
+        x3.metric("対象signals件数", f"{int(cfg.get('signals_in_scope', 0))}")
+        x4.metric("構築case数", f"{int(cfg.get('cases_built', 0))}" if cfg.get("cases_built") is not None else "—")
+
     if not rep.get("ok"):
         st.warning(f"デイトレ検証を作成できませんでした: {rep.get('error','unknown')}")
         if rep.get("cases"):
             st.dataframe(pd.DataFrame(rep.get("cases", [])), use_container_width=True)
         return
+
     summary = rep.get("summary", {}) if isinstance(rep.get("summary", {}), dict) else {}
     k1, k2, k3, k4, k5, k6 = st.columns(6)
     k1.metric("対象件数", f"{int(summary.get('cases_total', 0))}")
@@ -1357,25 +1454,29 @@ def _render_daytrade_validation_panel(df_signals: pd.DataFrame):
     k4.metric("TP2到達率", f"{float(summary.get('tp2_hit_rate', 0.0))*100:.1f}%")
     k5.metric("TIME_EXIT率", f"{float(summary.get('time_exit_rate', 0.0))*100:.1f}%")
     k6.metric("建値撤退率", f"{float(summary.get('be_exit_rate', 0.0))*100:.1f}%")
+
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("平均最終R", f"{float(summary.get('avg_final_r', 0.0)):+.3f}")
     m2.metric("中央値R", f"{float(summary.get('median_final_r', 0.0)):+.3f}")
     m3.metric("平均MFE(R)", f"{float(summary.get('avg_mfe_r', 0.0)):+.3f}")
     m4.metric("平均MAE(R)", f"{float(summary.get('avg_mae_r', 0.0)):+.3f}")
+
     by_source = summary.get("by_source", {}) if isinstance(summary.get("by_source", {}), dict) else {}
     if by_source:
         st.markdown("#### ソース別")
         st.dataframe(pd.DataFrame([{"source": k, **v} for k, v in by_source.items()]), use_container_width=True)
+
     results = rep.get("results", []) if isinstance(rep.get("results", []), list) else []
     if results:
         df_r = pd.DataFrame(results)
-        show_cols = [c for c in ["case_id","source","pair","direction","entry_type","triggered","tp1_hit","tp2_hit","time_exit","be_exit","sl_hit","final_r","mfe_r","mae_r","bars_held","exit_reason","entry_ts","exit_ts"] if c in df_r.columns]
+        show_cols = [c for c in ["case_id", "source", "pair", "direction", "entry_type", "triggered", "tp1_hit", "tp2_hit", "time_exit", "be_exit", "sl_hit", "final_r", "mfe_r", "mae_r", "bars_held", "exit_reason", "entry_ts", "exit_ts"] if c in df_r.columns]
         st.dataframe(df_r[show_cols], use_container_width=True)
         try:
             st.download_button("daytrade_validation_detail.csv をダウンロード", data=df_r.to_csv(index=False).encode("utf-8"), file_name="daytrade_validation_detail.csv", mime="text/csv")
-            st.download_button("daytrade_validation_summary.json をダウンロード", data=_safe_json_dump(summary).encode("utf-8"), file_name="daytrade_validation_summary.json", mime="application/json")
+            st.download_button("daytrade_validation_summary.json をダウンロード", data=_safe_json_dump({"summary": summary, "report_config": cfg}).encode("utf-8"), file_name="daytrade_validation_summary.json", mime="application/json")
         except Exception:
             pass
+
     with st.expander("検証エンジン自己確認", expanded=False):
         chk = getattr(logic, "daytrade_validation_selfcheck", lambda: {"ok": False, "error": "not_available"})()
         st.json(chk)
