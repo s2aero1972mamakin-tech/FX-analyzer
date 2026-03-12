@@ -1491,6 +1491,20 @@ def _render_hold_manage_panel(pair_label: str, ctx_in: Dict[str, Any], plan_ui: 
                 st.rerun()
         with c3:
             st.caption("※実際にポジションを持った時だけ『保有開始』を押してください。解除を忘れると管理提案が残ります。")
+        if str(plan_ui.get("trade_profile") or ctx_in.get("trade_profile") or "") == "DAYTRADE":
+            with st.expander("デイトレ撤退ルールの自己確認", expanded=False):
+                if st.button("30分/60分/120分撤退ルールを確認", key=f"daytrade_hold_selfcheck_top_{pair_label}"):
+                    try:
+                        chk = getattr(logic, "daytrade_hold_selfcheck", lambda: {"ok": False, "error": "not_available"})()
+                        if chk.get("ok") and chk.get("passed_all"):
+                            st.success("30分/60分/120分の TIME_EXIT 自己確認に成功しました。")
+                        elif chk.get("ok"):
+                            st.warning("自己確認は実行できましたが、一部シナリオは未達です。")
+                        else:
+                            st.error(f"自己確認エラー: {chk.get('error')}")
+                        st.json(chk)
+                    except Exception as e:
+                        st.error(f"自己確認でエラー: {e}")
 
         # Only show when position exists and matches pair
         pos = st.session_state.get(pos_key, None)
@@ -1547,17 +1561,25 @@ def _render_hold_manage_panel(pair_label: str, ctx_in: Dict[str, Any], plan_ui: 
         if bool(hold.get("no_add")):
             rec_lines.append("- ✅ **新規追加は禁止**（イベント/週末/週跨ぎガード）")
         mult = float(hold.get("reduce_size_mult") or 1.0)
-        if mult < 0.999:
+        if bool(hold.get("close_now")):
+            rec_lines.append("- ✅ **全決済優先**：SBI最小1建のため、部分縮小ではなく手仕舞いを優先")
+        elif mult < 0.999:
             rec_lines.append(f"- ✅ **建玉縮退**：推奨サイズ係数 ×{mult:.2f}（例：半分利確/縮小）")
         pt = float(hold.get("partial_tp_ratio") or 0.0)
         if pt > 0.0:
-            rec_lines.append(f"- ✅ **一部利確**：{pt*100:.0f}% を目安")
+            if bool(hold.get("partial_tp_actionable", True)):
+                rec_lines.append(f"- ✅ **一部利確**：{pt*100:.0f}% を目安")
+            else:
+                rec_lines.append(f"- ℹ️ **一部利確目安**：{pt*100:.0f}%（ただしSBI最小1建では部分実行しづらいため、全決済優先）")
         if bool(hold.get("move_sl_to_be")) and hold.get("new_sl_reco") is not None:
             rec_lines.append(f"- ✅ **建値移動/防御**：SL を {float(hold.get('new_sl_reco')):.3f} 付近へ（BE）")
         if "TIME_EXIT" in actions:
             stage = hold.get("time_exit_stage")
             stage_txt = f"（{stage}判定）" if stage else ""
-            rec_lines.append(f"- ✅ **時間撤退/失速撤退**{stage_txt}：当該ポジションは手仕舞い優先")
+            if bool(hold.get("close_now")):
+                rec_lines.append(f"- ✅ **時間撤退/失速撤退**{stage_txt}：1建固定前提のため全決済優先")
+            else:
+                rec_lines.append(f"- ✅ **時間撤退/失速撤退**{stage_txt}：当該ポジションは手仕舞い優先")
         if not rec_lines:
             rec_lines.append("- （特別な推奨はありません）")
 
@@ -1859,6 +1881,20 @@ def _apply_sbi_minlot_guard(plan: dict, *, sbi_min_lot: int = 1) -> dict:
 
             # why も補足
             plan["why"] = " / ".join(reasons[:2])
+            shadow = plan.get("shadow", {}) if isinstance(plan.get("shadow", {}), dict) else {}
+            shadow = dict(shadow)
+            shadow["enabled"] = True
+            shadow["candidate"] = True
+            shadow["mode"] = "TRACK"
+            shadow["reason"] = "SBI最小1建ガードで実売買不可のためSHADOW追跡"
+            shadow["score"] = float(max(float(shadow.get("score", 0.0) or 0.0), 0.55))
+            shadow["gate_gap"] = float(shadow.get("gate_gap", ev - dyn) or (ev - dyn))
+            shadow["rr_gap"] = float(shadow.get("rr_gap", 0.0) or 0.0)
+            shadow["time_exit_focus"] = "30m/60m/120m"
+            plan["shadow"] = shadow
+            plan["shadow_candidate"] = True
+            plan["shadow_reason"] = str(shadow.get("reason") or "")
+            plan["shadow_score"] = float(shadow.get("score") or 0.0)
 
         return plan
     except Exception:
@@ -2989,6 +3025,36 @@ def _render_top_trade_panel(pair_label: str, plan: Dict[str, Any], current_price
 
 
 
+def _render_shadow_candidate_panel(pair_label: str, plan: Dict[str, Any], current_price: float):
+    try:
+        shadow = plan.get("shadow", {}) if isinstance(plan.get("shadow", {}), dict) else {}
+        if not bool(shadow.get("candidate", False)):
+            return
+        st.markdown("### 🛰 検証用 SHADOW候補")
+        st.caption("実売買ではなく、出口ロジックの検証対象として常時追跡する候補です。SBI最小1建制約があるため、ここでは仮想候補として扱います。")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("SHADOW評価", f"{float(shadow.get('score', 0.0) or 0.0):.2f}")
+        c2.metric("EV差", f"{float(shadow.get('gate_gap', 0.0) or 0.0):+.3f}")
+        c3.metric("RR差", f"{float(shadow.get('rr_gap', 0.0) or 0.0):+.2f}")
+        direction = str(shadow.get("direction") or plan.get("direction") or "")
+        entry = shadow.get("entry", plan.get("entry"))
+        sl = shadow.get("sl", plan.get("stop_loss"))
+        tp2 = shadow.get("tp2", plan.get("take_profit"))
+        entry_kind_src = str(shadow.get("entry_type") or shadow.get("order_type") or plan.get("entry_type") or plan.get("order_type") or "")
+        entry_kind = entry_kind_src if _jp_order_kind(entry_kind_src) != "—" else _infer_entry_order_kind(direction, float(entry or current_price), float(current_price))
+        st.markdown(f"""
+- **候補ペア**: {pair_label}
+- **売買候補**: {_jp_side(plan.get('side', shadow.get('side', '—')))}
+- **参考エントリー注文**: {_jp_order_kind(entry_kind)}
+- **参考エントリー価格**: {_fmt_price(entry)}
+- **参考損切り(SL)**: {_fmt_price(sl)}
+- **参考利確(TP2)**: {_fmt_price(tp2)}
+- **time-exit重点**: {shadow.get('time_exit_focus', '30m/60m/120m')}
+""")
+        st.info(str(shadow.get("reason") or "検証追跡用候補"))
+    except Exception:
+        return
+
 def _render_risk_dashboard(plan: Dict[str, Any], feats: Dict[str, float], ext_meta: Optional[Dict[str, Any]] = None):
     """
     運用者が「危険度」と「データ品質」を見て、実行/見送り/ロット縮小を判断できるパネル。
@@ -3567,6 +3633,8 @@ with tabs[0]:
                     "event_threshold_add": float(st.session_state.get("event_threshold_add", 0.12) or 0.12),
                     "event_preblock_range_enable": bool(st.session_state.get("event_preblock_range_enable", True)),
                     "event_preblock_hours": float(st.session_state.get("event_preblock_hours", 24.0) or 24.0),
+                    "sbi_minlot_fixed": True,
+                    "shadow_always_output": True,
 
                 })
             except Exception:
@@ -3719,6 +3787,8 @@ with tabs[0]:
                 "decision": decision,
                 "confidence": conf,
                 "dom_state": dom,
+                "shadow_candidate": bool(plan.get("shadow_candidate", False)),
+                "shadow_score": float(plan.get("shadow_score") or -1.0),
                 "_plan": plan,
                 "_plan_ui": plan_ui,
                 "_ctx": ctx,
@@ -3737,6 +3807,8 @@ with tabs[0]:
         # --- AI selection: pick ONE pair to act on (SBIガード込みのTRADE候補から) ---
         trade_ranked = [r for r in ranked if str(r.get("decision", "")) == "TRADE"]
         trade_ranked.sort(key=lambda r: float(r.get("score", 0.0)), reverse=True)
+        shadow_ranked = [r for r in ranked if bool(r.get("shadow_candidate", False))]
+        shadow_ranked.sort(key=lambda r: float(r.get("shadow_score", -1.0)), reverse=True)
 
         panel_trade_label = "今回の実行ペア" if "デイトレ" in str(trade_axis) else "本日の実行ペア"
         panel_skip_label = "今回は **見送り**" if "デイトレ" in str(trade_axis) else "本日は **見送り**"
@@ -3744,9 +3816,14 @@ with tabs[0]:
             best = trade_ranked[0]
             st.markdown(f"## 🧠 AI選択：{panel_trade_label}  **{best['pair']}**")
         else:
-            best = ranked[0]
-            st.markdown(f"## 🧠 AI選択：{panel_skip_label}（トレード候補なし）")
-            st.caption("※ SBI最小1建ガード・イベント近接・閾値条件により、現時点の全ペアで見ても見送り判定です。")
+            if shadow_ranked:
+                best = shadow_ranked[0]
+                st.markdown(f"## 🧠 AI選択：{panel_skip_label}（実売買なし / SHADOW候補 **{best['pair']}**）")
+                st.caption("※ 実売買は見送りですが、出口ロジック検証のため SHADOW候補を常時出力しています。")
+            else:
+                best = ranked[0]
+                st.markdown(f"## 🧠 AI選択：{panel_skip_label}（トレード候補なし）")
+                st.caption("※ SBI最小1建ガード・イベント近接・閾値条件により、現時点の全ペアで見ても見送り判定です。")
 
         plan = best["_plan"]
         plan_ui_best = best.get("_plan_ui", plan)
@@ -3759,6 +3836,7 @@ with tabs[0]:
         with details_box:
             # Top panel must show entry format + price (user request)
             _render_top_trade_panel(best["pair"], plan_ui_best, price)
+            _render_shadow_candidate_panel(best["pair"], plan_ui_best, price)
 
             # Risk dashboard (new)
             _render_risk_dashboard(plan_ui_best, feats, ext_meta=best.get("_ext_meta", {}))
@@ -3961,6 +4039,7 @@ with tabs[0]:
 
         price = float(ctx.get("price", 0.0))
         _render_top_trade_panel(pair_label, plan_ui, price)
+        _render_shadow_candidate_panel(pair_label, plan_ui, price)
         _render_risk_dashboard(plan_ui, feats, ext_meta=ext_meta)
 
         _render_ai_engine_panel(ctx, plan_ui)
