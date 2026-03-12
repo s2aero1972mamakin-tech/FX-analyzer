@@ -1113,6 +1113,25 @@ def _build_signal_row(pair_label: str, ctx: Dict[str, Any], feats: Dict[str, Any
         "external_meta": (json.dumps(ext_meta, ensure_ascii=False)[:2000] if isinstance(ext_meta, dict) else ""),
         "why": str(plan.get("why", ""))[:500],
         "veto_reasons": (json.dumps(plan.get("veto_reasons", []), ensure_ascii=False)[:500] if plan.get("veto_reasons") else ""),
+        "trade_profile": str(plan.get("trade_profile", "")),
+        "price_interval": str(plan.get("price_interval", "")),
+        "tp1_hint": _float_or_none(plan.get("tp1")),
+        "tp2_hint": _float_or_none(plan.get("tp2", plan.get("take_profit"))),
+        "partial_tp_enabled": bool(plan.get("partial_tp_enabled", False)),
+        "be_trigger_r": _float_or_none(plan.get("be_trigger_r")),
+        "trail_trigger_r": _float_or_none(plan.get("trail_trigger_r")),
+        "max_hold_hours": _float_or_none(plan.get("max_hold_hours")),
+        "stale_after_hours": _float_or_none(plan.get("stale_after_hours")),
+        "event_market_ban_active": bool((plan.get("_ctx", {}) or {}).get("event_market_ban_active", False)) if isinstance(plan.get("_ctx", {}), dict) else False,
+        "shadow_candidate": bool(plan.get("shadow_candidate", False)),
+        "shadow_direction": str((plan.get("shadow_best", {}) or {}).get("direction", "")) if isinstance(plan.get("shadow_best", {}), dict) else "",
+        "shadow_entry": _float_or_none((plan.get("shadow_best", {}) or {}).get("entry")) if isinstance(plan.get("shadow_best", {}), dict) else None,
+        "shadow_sl": _float_or_none((plan.get("shadow_best", {}) or {}).get("sl")) if isinstance(plan.get("shadow_best", {}), dict) else None,
+        "shadow_tp1": _float_or_none((plan.get("shadow_best", {}) or {}).get("tp1")) if isinstance(plan.get("shadow_best", {}), dict) else None,
+        "shadow_tp2": _float_or_none((plan.get("shadow_best", {}) or {}).get("tp2")) if isinstance(plan.get("shadow_best", {}), dict) else None,
+        "shadow_entry_type": str((plan.get("shadow_best", {}) or {}).get("entry_type", "")) if isinstance(plan.get("shadow_best", {}), dict) else "",
+        "shadow_source": str((plan.get("shadow_best", {}) or {}).get("source", "")) if isinstance(plan.get("shadow_best", {}), dict) else "",
+        "shadow_score": _float_or_none(plan.get("shadow_score")),
     }
 
 def _append_signal(row: Dict[str, Any]) -> bool:
@@ -1122,6 +1141,10 @@ def _append_signal(row: Dict[str, Any]) -> bool:
         "direction","entry_hint","sl_hint","tp_hint","trail_sl_hint","tp_extend_factor",
         "global_risk_index","war_probability","financial_stress","macro_risk_score","price_close",
         "why","veto_reasons","price_meta","external_meta",
+        "trade_profile","price_interval","tp1_hint","tp2_hint","partial_tp_enabled",
+        "be_trigger_r","trail_trigger_r","max_hold_hours","stale_after_hours","event_market_ban_active",
+        "shadow_candidate","shadow_direction","shadow_entry","shadow_sl","shadow_tp1","shadow_tp2",
+        "shadow_entry_type","shadow_source","shadow_score",
     ]
     return _append_csv_row(SIGNAL_LOG_PATH, fieldnames, row)
 
@@ -1160,6 +1183,202 @@ def _compute_trade_metrics(df_trades: pd.DataFrame) -> Dict[str, Any]:
         "sum_R": float(r.sum()),
     }
 
+
+
+
+def _safe_json_dump(obj: Any) -> str:
+    try:
+        return json.dumps(obj, ensure_ascii=False)
+    except Exception:
+        return "{}"
+
+
+def _safe_ts_parse(v: Any):
+    try:
+        if v is None:
+            return None
+        return pd.to_datetime(str(v).replace("Z", "+00:00"), utc=True, errors="coerce")
+    except Exception:
+        return None
+
+
+def _is_daytrade_signal_row(row: Dict[str, Any]) -> bool:
+    try:
+        trade_profile = str(row.get("trade_profile", "")).upper()
+        tf_mode = str(row.get("timeframe_mode", ""))
+        price_interval = str(row.get("price_interval", "")).lower()
+        return (trade_profile == "DAYTRADE") or ("デイトレ" in tf_mode) or (price_interval in ("1h", "60m", "30m", "15m", "5m"))
+    except Exception:
+        return False
+
+
+def _build_daytrade_validation_cases(df_signals: pd.DataFrame) -> List[Dict[str, Any]]:
+    if df_signals is None or df_signals.empty:
+        return []
+    cases: List[Dict[str, Any]] = []
+    seen = set()
+    for _, row in df_signals.copy().iterrows():
+        r = row.to_dict()
+        if not _is_daytrade_signal_row(r):
+            continue
+        pair = str(r.get("pair", ""))
+        symbol = str(r.get("symbol", "") or _pair_label_to_symbol(pair))
+        ts_utc = str(r.get("ts_utc", ""))
+        base = {
+            "pair": pair,
+            "symbol": symbol,
+            "ts_utc": ts_utc,
+            "be_trigger_r": _float_or_none(r.get("be_trigger_r")) or 0.40,
+            "trail_trigger_r": _float_or_none(r.get("trail_trigger_r")) or 0.90,
+            "max_hold_hours": _float_or_none(r.get("max_hold_hours")) or 12.0,
+            "stale_after_hours": _float_or_none(r.get("stale_after_hours")) or 4.0,
+            "trade_profile": str(r.get("trade_profile", "DAYTRADE") or "DAYTRADE"),
+            "time_exit_focus": "30m/60m/120m",
+        }
+        # LIVE case
+        if str(r.get("decision", "")).upper() == "TRADE":
+            entry = _float_or_none(r.get("entry_hint"))
+            sl = _float_or_none(r.get("sl_hint"))
+            tp2 = _float_or_none(r.get("tp2_hint") if pd.notna(r.get("tp2_hint")) else r.get("tp_hint"))
+            tp1 = _float_or_none(r.get("tp1_hint"))
+            direction = str(r.get("direction", ""))
+            if entry is not None and sl is not None and tp2 is not None and direction:
+                cid = f"LIVE|{r.get('signal_id','')}|{pair}|{direction}"
+                if cid not in seen:
+                    cases.append({
+                        **base,
+                        "case_id": cid,
+                        "source": "LIVE",
+                        "direction": direction,
+                        "side": str(r.get("direction", "")),
+                        "entry_type": "MARKET_NOW",
+                        "entry": entry,
+                        "sl": sl,
+                        "tp1": (tp1 if tp1 is not None else entry + 0.5 * (tp2 - entry) if str(direction).upper()=="LONG" else entry - 0.5 * (entry - tp2)),
+                        "tp2": tp2,
+                    })
+                    seen.add(cid)
+        # SHADOW case
+        if bool(r.get("shadow_candidate", False)):
+            entry = _float_or_none(r.get("shadow_entry"))
+            sl = _float_or_none(r.get("shadow_sl"))
+            tp2 = _float_or_none(r.get("shadow_tp2"))
+            tp1 = _float_or_none(r.get("shadow_tp1"))
+            direction = str(r.get("shadow_direction", ""))
+            entry_type = str(r.get("shadow_entry_type", "MARKET_NOW") or "MARKET_NOW")
+            if entry is not None and sl is not None and tp2 is not None and direction:
+                cid = f"SHADOW|{r.get('signal_id','')}|{pair}|{direction}|{r.get('shadow_source','')}"
+                if cid not in seen:
+                    cases.append({
+                        **base,
+                        "case_id": cid,
+                        "source": "SHADOW",
+                        "direction": direction,
+                        "side": direction,
+                        "entry_type": entry_type,
+                        "entry": entry,
+                        "sl": sl,
+                        "tp1": (tp1 if tp1 is not None else entry + 0.5 * (tp2 - entry) if str(direction).upper()=="LONG" else entry - 0.5 * (entry - tp2)),
+                        "tp2": tp2,
+                    })
+                    seen.add(cid)
+    return cases
+
+
+def _fetch_daytrade_validation_bars(cases: List[Dict[str, Any]], interval: str = "15m", period: str = "10d") -> Dict[str, pd.DataFrame]:
+    bars_map: Dict[str, pd.DataFrame] = {}
+    for case in cases:
+        pair = str(case.get("pair", ""))
+        symbol = str(case.get("symbol", "") or _pair_label_to_symbol(pair))
+        if symbol in bars_map:
+            continue
+        df_px, _meta = fetch_price_history(pair, symbol, period=period, interval=interval, prefer_stooq=False)
+        if isinstance(df_px, pd.DataFrame) and not df_px.empty:
+            bars_map[symbol] = df_px.copy()
+            bars_map[pair] = df_px.copy()
+    return bars_map
+
+
+def _run_daytrade_validation(df_signals: pd.DataFrame, bar_interval: str = "15m", period: str = "10d") -> Dict[str, Any]:
+    try:
+        cases = _build_daytrade_validation_cases(df_signals)
+        if not cases:
+            return {"ok": False, "error": "no_daytrade_cases", "cases": []}
+        bars_map = _fetch_daytrade_validation_bars(cases, interval=bar_interval, period=period)
+        bar_minutes = 15 if str(bar_interval) == "15m" else (5 if str(bar_interval) == "5m" else 60)
+        runner = getattr(logic, "run_daytrade_validation_report", None)
+        if not callable(runner):
+            return {"ok": False, "error": "validation_engine_not_available", "cases": cases}
+        rep = runner(cases, bars_map, bar_minutes=bar_minutes)
+        if not isinstance(rep, dict):
+            return {"ok": False, "error": "invalid_validation_report"}
+        rep["cases"] = cases
+        rep["bars_loaded"] = {k: int(len(v)) for k, v in bars_map.items() if isinstance(v, pd.DataFrame)}
+        rep["bar_interval"] = bar_interval
+        rep["period"] = period
+        return rep
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def _render_daytrade_validation_panel(df_signals: pd.DataFrame):
+    st.markdown("### デイトレ検証レポート")
+    st.caption("TP1到達率 / TP2到達率 / TIME_EXIT率 / 建値撤退率 / 最終実現R / MFE/MAE を、signals.csv の DAYTRADE 候補から前方バー検証します。")
+    c1, c2, c3 = st.columns([1,1,1])
+    interval = c1.selectbox("検証足", ["15m", "5m", "1h"], index=0, key="dt_val_interval")
+    period = c2.selectbox("取得期間", ["10d", "5d", "1mo"], index=0, key="dt_val_period")
+    include_auto = c3.checkbox("SHADOW候補も含める", value=True, key="dt_val_include_shadow")
+    if st.button("デイトレ検証レポートを作成", key="run_daytrade_validation"):
+        df_use = df_signals.copy()
+        if not include_auto and "decision" in df_use.columns:
+            df_use = df_use[df_use["decision"].astype(str).str.upper() == "TRADE"].copy()
+        rep = _run_daytrade_validation(df_use, bar_interval=interval, period=period)
+        st.session_state["daytrade_validation_report"] = rep
+    rep = st.session_state.get("daytrade_validation_report")
+    if not isinstance(rep, dict):
+        chk = getattr(logic, "daytrade_validation_selfcheck", lambda: {"ok": False, "error": "not_available"})()
+        if chk.get("ok"):
+            st.info("検証エンジンは待機中です。必要なら上のボタンで実データ検証、下で自己確認結果を見られます。")
+        else:
+            st.warning("検証エンジンの自己確認に失敗しています。")
+        with st.expander("検証エンジン自己確認", expanded=False):
+            st.json(chk)
+        return
+    if not rep.get("ok"):
+        st.warning(f"デイトレ検証を作成できませんでした: {rep.get('error','unknown')}")
+        if rep.get("cases"):
+            st.dataframe(pd.DataFrame(rep.get("cases", [])), use_container_width=True)
+        return
+    summary = rep.get("summary", {}) if isinstance(rep.get("summary", {}), dict) else {}
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    k1.metric("対象件数", f"{int(summary.get('cases_total', 0))}")
+    k2.metric("発火件数", f"{int(summary.get('cases_triggered', 0))}")
+    k3.metric("TP1到達率", f"{float(summary.get('tp1_hit_rate', 0.0))*100:.1f}%")
+    k4.metric("TP2到達率", f"{float(summary.get('tp2_hit_rate', 0.0))*100:.1f}%")
+    k5.metric("TIME_EXIT率", f"{float(summary.get('time_exit_rate', 0.0))*100:.1f}%")
+    k6.metric("建値撤退率", f"{float(summary.get('be_exit_rate', 0.0))*100:.1f}%")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("平均最終R", f"{float(summary.get('avg_final_r', 0.0)):+.3f}")
+    m2.metric("中央値R", f"{float(summary.get('median_final_r', 0.0)):+.3f}")
+    m3.metric("平均MFE(R)", f"{float(summary.get('avg_mfe_r', 0.0)):+.3f}")
+    m4.metric("平均MAE(R)", f"{float(summary.get('avg_mae_r', 0.0)):+.3f}")
+    by_source = summary.get("by_source", {}) if isinstance(summary.get("by_source", {}), dict) else {}
+    if by_source:
+        st.markdown("#### ソース別")
+        st.dataframe(pd.DataFrame([{"source": k, **v} for k, v in by_source.items()]), use_container_width=True)
+    results = rep.get("results", []) if isinstance(rep.get("results", []), list) else []
+    if results:
+        df_r = pd.DataFrame(results)
+        show_cols = [c for c in ["case_id","source","pair","direction","entry_type","triggered","tp1_hit","tp2_hit","time_exit","be_exit","sl_hit","final_r","mfe_r","mae_r","bars_held","exit_reason","entry_ts","exit_ts"] if c in df_r.columns]
+        st.dataframe(df_r[show_cols], use_container_width=True)
+        try:
+            st.download_button("daytrade_validation_detail.csv をダウンロード", data=df_r.to_csv(index=False).encode("utf-8"), file_name="daytrade_validation_detail.csv", mime="text/csv")
+            st.download_button("daytrade_validation_summary.json をダウンロード", data=_safe_json_dump(summary).encode("utf-8"), file_name="daytrade_validation_summary.json", mime="application/json")
+        except Exception:
+            pass
+    with st.expander("検証エンジン自己確認", expanded=False):
+        chk = getattr(logic, "daytrade_validation_selfcheck", lambda: {"ok": False, "error": "not_available"})()
+        st.json(chk)
 
 def _apply_trend_assist(plan_ui: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
     """Add AI engine fields + optional EV bonus for strong trend continuation."""
@@ -4272,6 +4491,9 @@ with tabs[2]:
     except Exception:
         pass
 
+
+    st.markdown("---")
+    _render_daytrade_validation_panel(df_s)
 
 # =========================
 # Tab 3: Guide
