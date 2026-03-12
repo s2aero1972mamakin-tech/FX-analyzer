@@ -323,12 +323,7 @@ def _compute_daytrade_tp1(
         if str(direction).upper() == "LONG":
             fallback_tp1 = entry + base_r * risk
             cap = entry + 0.88 * max(0.0, tp2 - entry)
-            candidates = [
-                struct.get("recent_high"),
-                struct.get("session_high"),
-                float(liq_tp) if liq_tp is not None else None,
-                fallback_tp1,
-            ]
+            candidates = [struct.get("recent_high"), struct.get("session_high"), float(liq_tp) if liq_tp is not None else None, fallback_tp1]
             valid = []
             for v in candidates:
                 if v is None:
@@ -336,21 +331,13 @@ def _compute_daytrade_tp1(
                 vv = float(v)
                 if vv >= entry + min_move and vv < tp2:
                     valid.append(vv)
-            if valid:
-                tp1 = min(valid)
-            else:
-                tp1 = min(fallback_tp1, cap)
+            tp1 = min(valid) if valid else min(fallback_tp1, cap)
             tp1 = min(tp1, cap)
             tp1 = max(tp1, entry + min_move)
         else:
             fallback_tp1 = entry - base_r * risk
             cap = entry - 0.88 * max(0.0, entry - tp2)
-            candidates = [
-                struct.get("recent_low"),
-                struct.get("session_low"),
-                float(liq_tp) if liq_tp is not None else None,
-                fallback_tp1,
-            ]
+            candidates = [struct.get("recent_low"), struct.get("session_low"), float(liq_tp) if liq_tp is not None else None, fallback_tp1]
             valid = []
             for v in candidates:
                 if v is None:
@@ -358,10 +345,7 @@ def _compute_daytrade_tp1(
                 vv = float(v)
                 if vv <= entry - min_move and vv > tp2:
                     valid.append(vv)
-            if valid:
-                tp1 = max(valid)
-            else:
-                tp1 = max(fallback_tp1, cap)
+            tp1 = max(valid) if valid else max(fallback_tp1, cap)
             tp1 = max(tp1, cap)
             tp1 = min(tp1, entry - min_move)
         if str(direction).upper() == "LONG" and tp1 >= tp2:
@@ -373,16 +357,23 @@ def _compute_daytrade_tp1(
         return None
 
 
-def _compress_daytrade_tp2(
-    entry: float,
-    sl: float,
-    tp2: float,
-    direction: str,
-    mtf_alignment_score: float,
-    micro_tf_dir_ok: Optional[bool],
-    fast_df: Optional[pd.DataFrame],
-    liq_tp: Optional[float],
-) -> Tuple[float, float, bool]:
+def _cap_daytrade_tp1_to_liquidity(entry: float, tp1: Optional[float], tp2: float, direction: str, liq_tp: Optional[float]) -> Tuple[Optional[float], bool]:
+    try:
+        if tp1 is None or liq_tp is None:
+            return (float(tp1) if tp1 is not None else None), False
+        tp1 = float(tp1)
+        tp2 = float(tp2)
+        liq_tp = float(liq_tp)
+        if str(direction).upper() == "LONG":
+            capped = min(tp1, liq_tp, tp2)
+            return float(capped), bool(capped < tp1 - 1e-12)
+        capped = max(tp1, liq_tp, tp2)
+        return float(capped), bool(capped > tp1 + 1e-12)
+    except Exception:
+        return (float(tp1) if tp1 is not None else None), False
+
+
+def _compress_daytrade_tp2(entry: float, sl: float, tp2: float, direction: str, mtf_alignment_score: float, fast_tf_dir_ok: Optional[bool], micro_tf_dir_ok: Optional[bool], fast_df: Optional[pd.DataFrame], liq_tp: Optional[float]) -> Tuple[float, float, bool, bool, str]:
     try:
         entry = float(entry)
         sl = float(sl)
@@ -390,22 +381,29 @@ def _compress_daytrade_tp2(
         risk = abs(entry - sl)
         dist = abs(tp2 - entry)
         if risk <= 1e-9 or dist <= 1e-9:
-            return float(tp2), 1.0, False
+            return float(tp2), 1.0, False, False, "none"
+        hard_cap = bool(float(mtf_alignment_score) <= -0.40 and fast_tf_dir_ok is False and micro_tf_dir_ok is False and liq_tp is not None)
+        if hard_cap:
+            liq = float(liq_tp)
+            capped = min(tp2, liq) if str(direction).upper() == "LONG" else max(tp2, liq)
+            return float(capped), float(abs(capped - entry) / max(dist, 1e-9)), True, True, "intraday_liquidity_cap"
         compress_needed = (micro_tf_dir_ok is False) or (float(mtf_alignment_score) < 0.35)
         if not compress_needed:
-            return float(tp2), 1.0, False
+            return float(tp2), 1.0, False, False, "none"
         factor = 1.0
         if micro_tf_dir_ok is False:
             factor -= 0.22
+        if fast_tf_dir_ok is False:
+            factor -= 0.10
         if float(mtf_alignment_score) < 0.35:
-            factor -= min(0.22, (0.35 - float(mtf_alignment_score)) * 0.55)
-        factor = float(_clamp(factor, 0.48, 0.90))
+            factor -= min(0.24, (0.35 - float(mtf_alignment_score)) * 0.28)
+        factor = float(_clamp(factor, 0.45, 0.90))
         struct = _session_structure_levels(fast_df, fallback_bars=24)
-        min_reward = max(0.90 * risk, 0.60 * dist)
+        min_reward = max(0.90 * risk, 0.58 * dist)
         if str(direction).upper() == "LONG":
             compressed = entry + max(min_reward, factor * dist)
             overheads = [struct.get("recent_high"), struct.get("session_high"), float(liq_tp) if liq_tp is not None else None]
-            overheads = [float(v) for v in overheads if v is not None and float(v) > entry + 0.85 * risk]
+            overheads = [float(v) for v in overheads if v is not None and float(v) > entry + 0.80 * risk]
             if overheads:
                 compressed = min(compressed, min(overheads))
             compressed = min(compressed, tp2)
@@ -413,28 +411,17 @@ def _compress_daytrade_tp2(
         else:
             compressed = entry - max(min_reward, factor * dist)
             supports = [struct.get("recent_low"), struct.get("session_low"), float(liq_tp) if liq_tp is not None else None]
-            supports = [float(v) for v in supports if v is not None and float(v) < entry - 0.85 * risk]
+            supports = [float(v) for v in supports if v is not None and float(v) < entry - 0.80 * risk]
             if supports:
                 compressed = max(compressed, max(supports))
             compressed = max(compressed, tp2)
             compressed = min(compressed, entry - 0.90 * risk)
-        return float(compressed), float(factor), True
+        return float(compressed), float(factor), True, False, "soft_compress"
     except Exception:
-        return float(tp2), 1.0, False
+        return float(tp2), 1.0, False, False, "none"
 
 
-def _compute_profile_partial_tp(
-    entry: float,
-    sl: float,
-    tp: float,
-    direction: str,
-    profile: Dict[str, Any],
-    phase_label: str,
-    strength: float,
-    fast_df: Optional[pd.DataFrame] = None,
-    fast_probe: Optional[Dict[str, Any]] = None,
-    liq_tp: Optional[float] = None,
-) -> Optional[float]:
+def _compute_profile_partial_tp(entry: float, sl: float, tp: float, direction: str, profile: Dict[str, Any], phase_label: str, strength: float, fast_df: Optional[pd.DataFrame] = None, fast_probe: Optional[Dict[str, Any]] = None, liq_tp: Optional[float] = None) -> Optional[float]:
     try:
         if str((profile or {}).get("name") or "") == "DAYTRADE":
             tp1 = _compute_daytrade_tp1(entry, sl, tp, direction, fast_df, fast_probe or {}, liq_tp, phase_label, strength)
@@ -1126,31 +1113,26 @@ def _compute_unrealized_R(side: str, entry: float, sl: float, price: float) -> f
         return 0.0
 
 
-def _daytrade_hold_v1(
+def _extract_hold_state(
     pair: str,
     df: pd.DataFrame,
     ctx_in: Dict[str, Any],
     plan_like: Dict[str, Any],
     ev_meta: Dict[str, Any],
-    weekend_risk: float,
-    weekcross_risk: float,
-) -> Dict[str, Any]:
+) -> Optional[Dict[str, Any]]:
     try:
         pos = ctx_in.get("position") or ctx_in.get("pos") or {}
         if not isinstance(pos, dict):
             pos = {}
         pos_open = bool(ctx_in.get("position_open", False) or pos.get("open") or pos.get("is_open") or (len(pos) > 0))
         if not pos_open:
-            return {}
-
+            return None
         side = str(pos.get("side") or pos.get("pos_side") or plan_like.get("side") or "").upper()
         if side not in ("BUY", "SELL"):
             side = str(plan_like.get("side") or "BUY").upper()
-        direction = "LONG" if side == "BUY" else "SHORT"
         entry = float(pos.get("entry") or pos.get("entry_price") or pos.get("pos_entry") or plan_like.get("entry") or plan_like.get("entry_price") or 0.0)
         sl = float(pos.get("sl") or pos.get("stop_loss") or pos.get("pos_sl") or plan_like.get("sl") or plan_like.get("stop_loss") or 0.0)
         tp = float(pos.get("tp") or pos.get("take_profit") or pos.get("pos_tp") or plan_like.get("tp") or plan_like.get("take_profit") or 0.0)
-
         price = None
         for k in ("current_price", "price", "last_price", "mark_price"):
             if k in pos and pos.get(k) is not None:
@@ -1164,35 +1146,19 @@ def _daytrade_hold_v1(
             except Exception:
                 price = float(entry)
         price = float(price)
-
         unrealized_R = pos.get("unrealized_R", None)
         if unrealized_R is None:
             unrealized_R = _compute_unrealized_R(side, entry, sl, price)
         else:
             unrealized_R = float(unrealized_R)
         dd_R = float(pos.get("dd_R") or pos.get("max_dd_R") or pos.get("drawdown_R") or 0.0)
-
+        peak_R = pos.get("peak_R") or pos.get("peak_unrealized_R") or pos.get("max_favorable_R")
+        peak_R = float(peak_R) if peak_R is not None else float(unrealized_R)
         nh = ev_meta.get("next_high_hours", None)
         try:
             nh_f = (float(nh) if nh is not None else None)
         except Exception:
             nh_f = None
-        event_factor = float(ev_meta.get("factor", 0.0) or 0.0)
-        window_high = bool(ev_meta.get("window_high", False))
-
-        trade_profile = _resolve_trade_profile(ctx_in or {})
-        fast_df = _ctx_dataframe(ctx_in, "_df_fast_15m", "df_fast_15m", "_df_15m")
-        micro_df = _ctx_dataframe(ctx_in, "_df_micro_5m", "df_micro_5m", "_df_5m")
-        fast_probe = _probe_intraday_frame(fast_df if isinstance(fast_df, pd.DataFrame) else None, direction, lookback=16)
-        micro_probe = _probe_intraday_frame(micro_df if isinstance(micro_df, pd.DataFrame) else None, direction, lookback=12)
-        fast_ok = bool(fast_probe.get("dir_ok", False)) if isinstance(fast_probe, dict) and fast_probe else None
-        micro_ok = bool(micro_probe.get("dir_ok", False)) if isinstance(micro_probe, dict) and micro_probe else None
-        mtf_alignment_score = 0.0
-        if isinstance(fast_probe, dict) and fast_probe:
-            mtf_alignment_score += 0.65 * float(fast_probe.get("score", 0.0) or 0.0)
-        if isinstance(micro_probe, dict) and micro_probe:
-            mtf_alignment_score += 0.35 * float(micro_probe.get("score", 0.0) or 0.0)
-
         time_in_trade_h = None
         try:
             opened_at = _parse_utc_like(pos.get("opened_at_utc") or pos.get("opened_at") or ctx_in.get("opened_at_utc"))
@@ -1200,208 +1166,52 @@ def _daytrade_hold_v1(
                 time_in_trade_h = max(0.0, (datetime.now(timezone.utc) - opened_at).total_seconds() / 3600.0)
         except Exception:
             time_in_trade_h = None
-
-        notes: List[str] = []
-        actions: List[str] = []
-        no_add = False
-        reduce_mult = 1.0
-        partial_tp = 0.0
-        move_be = False
-        new_sl = None
-
-        be_trigger_r = float(plan_like.get("be_trigger_r") or trade_profile.get("be_trigger_r", 0.40) or 0.40)
-        if unrealized_R >= be_trigger_r:
-            move_be = True
-            new_sl = float(entry)
-            actions.append("MOVE_SL_TO_BE")
-            notes.append(f"{be_trigger_r:.2f}R 以上の含み益 → 建値防御へ移行")
-
-        if (nh_f is not None) and (nh_f <= 1.5):
-            no_add = True
-            reduce_mult = min(reduce_mult, float(_clamp(1.0 - 0.65 * event_factor, 0.25, 1.0)))
-            if "REDUCE_SIZE" not in actions:
-                actions.append("REDUCE_SIZE")
-            notes.append(f"高インパクト指標が {nh_f:.1f}h 以内 → デイトレ保有を縮退")
-        if window_high:
-            no_add = True
-            if unrealized_R > 0.15:
-                partial_tp = max(partial_tp, 0.50)
-                if "PARTIAL_TP" not in actions:
-                    actions.append("PARTIAL_TP")
-            notes.append("高インパクト窓内 → 新規追加禁止 / 早利確優先")
-        if float(weekend_risk or 0.0) > 0.0 or float(weekcross_risk or 0.0) > 0.0:
-            no_add = True
-            reduce_mult = min(reduce_mult, 0.60)
-            if "REDUCE_SIZE" not in actions:
-                actions.append("REDUCE_SIZE")
-            notes.append("週末/週跨ぎリスク → デイトレ保有は軽くする")
-
-        if time_in_trade_h is not None:
-            stall_30m = time_in_trade_h >= 0.50
-            stall_60m = time_in_trade_h >= 1.00
-            stall_120m = time_in_trade_h >= 2.00
-
-            if stall_30m and unrealized_R <= 0.05 and micro_ok is False:
-                reduce_mult = min(reduce_mult, 0.60)
-                if "REDUCE_SIZE" not in actions:
-                    actions.append("REDUCE_SIZE")
-                notes.append("30分経過して5分足が逆向き・伸びなし → まず縮小")
-
-            if stall_60m and unrealized_R < 0.10 and ((micro_ok is False) or (fast_ok is False) or (mtf_alignment_score < 0.20)):
-                if unrealized_R > 0.0:
-                    partial_tp = max(partial_tp, 0.50)
-                    if "PARTIAL_TP" not in actions:
-                        actions.append("PARTIAL_TP")
-                if "TIME_EXIT" not in actions:
-                    actions.append("TIME_EXIT")
-                notes.append("60分経過して15分/5分の整合が弱い → 時間撤退を優先")
-
-            if stall_120m and unrealized_R < 0.20:
-                if unrealized_R > 0.0:
-                    partial_tp = max(partial_tp, 0.50)
-                    if "PARTIAL_TP" not in actions:
-                        actions.append("PARTIAL_TP")
-                if "TIME_EXIT" not in actions:
-                    actions.append("TIME_EXIT")
-                notes.append("120分経過して0.2R未満 → 失速とみなしクローズ優先")
-
-            stale_after_h = float(trade_profile.get("stale_after_hours", 4.0) or 4.0)
-            if time_in_trade_h >= stale_after_h and unrealized_R < 0.25:
-                reduce_mult = min(reduce_mult, 0.50)
-                if "TIME_EXIT" not in actions:
-                    actions.append("TIME_EXIT")
-                notes.append(f"{stale_after_h:.1f}h 以上伸びない → デイトレ時間切れ撤退")
-
-        if unrealized_R >= 0.55 and micro_ok is False:
-            partial_tp = max(partial_tp, 0.50)
-            if "PARTIAL_TP" not in actions:
-                actions.append("PARTIAL_TP")
-            notes.append("含み益ありだが5分足が逆向き → 利益保護の一部利確")
-
-        if move_be and new_sl is not None:
-            try:
-                new_sl = _round_to_pip(float(new_sl), pair)
-            except Exception:
-                pass
-
+        trade_profile = _resolve_trade_profile(ctx_in or {})
         return {
-            "version": "daytrade_hold_v1",
-            "trade_profile": "DAYTRADE",
             "pair": str(pair),
+            "pos": pos,
             "side": side,
             "entry": float(entry),
             "sl": float(sl),
             "tp": float(tp),
-            "current_price": float(price),
+            "price": float(price),
             "unrealized_R": float(unrealized_R),
             "dd_R": float(dd_R),
-            "event_next_high_hours": nh_f,
-            "event_window_high": bool(window_high),
-            "event_risk_factor": float(event_factor),
-            "weekend_risk": float(weekend_risk or 0.0),
-            "weekcross_risk": float(weekcross_risk or 0.0),
-            "time_in_trade_hours": (float(time_in_trade_h) if time_in_trade_h is not None else None),
-            "no_add": bool(no_add),
-            "reduce_size_mult": float(_clamp(reduce_mult, 0.20, 1.00)),
-            "partial_tp_ratio": float(_clamp(partial_tp, 0.0, 1.0)),
-            "move_sl_to_be": bool(move_be),
-            "new_sl_reco": (float(new_sl) if new_sl is not None else None),
-            "mtf_alignment_score": float(mtf_alignment_score),
-            "fast_tf_dir_ok": fast_ok,
-            "micro_tf_dir_ok": micro_ok,
-            "actions": list(dict.fromkeys(actions)),
-            "notes": notes,
+            "peak_R": float(peak_R),
+            "time_in_trade_h": (float(time_in_trade_h) if time_in_trade_h is not None else None),
+            "trade_profile": trade_profile,
+            "nh_f": nh_f,
+            "event_factor": float(ev_meta.get("factor", 0.0) or 0.0),
+            "window_high": bool(ev_meta.get("window_high", False)),
         }
     except Exception:
-        return {}
+        return None
 
 
-def _hold_manage_reco(
-    pair: str,
-    df: pd.DataFrame,
-    ctx_in: Dict[str, Any],
-    plan_like: Dict[str, Any],
-    ev_meta: Dict[str, Any],
-    weekend_risk: float,
-    weekcross_risk: float,
-) -> Dict[str, Any]:
-    """Position-holding management rules.
-    - swing_hold_v1: event/weekend centered
-    - daytrade_hold_v1: 30/60/120 minute stall exits
-    Returns recommendation dict; empty dict if no position info.
-    """
+def _swing_hold_v1(state: Dict[str, Any], ctx_in: Dict[str, Any], weekend_risk: float, weekcross_risk: float) -> Dict[str, Any]:
     try:
-        trade_profile_probe = _resolve_trade_profile(ctx_in or {})
-        if str(trade_profile_probe.get("name") or "") == "DAYTRADE":
-            return _daytrade_hold_v1(pair, df, ctx_in, plan_like, ev_meta, weekend_risk, weekcross_risk)
-        pos = ctx_in.get("position") or ctx_in.get("pos") or {}
-        if not isinstance(pos, dict):
-            pos = {}
-        pos_open = bool(ctx_in.get("position_open", False) or pos.get("open") or pos.get("is_open") or (len(pos) > 0))
-        if not pos_open:
-            return {}
-        # Get position params (fallback to plan)
-        side = str(pos.get("side") or pos.get("pos_side") or plan_like.get("side") or "").upper()
-        if side not in ("BUY", "SELL"):
-            side = str(plan_like.get("side") or "BUY").upper()
-        entry = float(pos.get("entry") or pos.get("entry_price") or pos.get("pos_entry") or plan_like.get("entry") or plan_like.get("entry_price") or 0.0)
-        sl = float(pos.get("sl") or pos.get("stop_loss") or pos.get("pos_sl") or plan_like.get("sl") or plan_like.get("stop_loss") or 0.0)
-        tp = float(pos.get("tp") or pos.get("take_profit") or pos.get("pos_tp") or plan_like.get("tp") or plan_like.get("take_profit") or 0.0)
-
-        # Current price (user can override; else latest close)
-        price = None
-        for k in ("current_price", "price", "last_price", "mark_price"):
-            if k in pos and pos.get(k) is not None:
-                price = pos.get(k)
-                break
-        if price is None:
-            price = ctx_in.get("pos_current_price", None)
-        if price is None:
-            try:
-                price = float(df["Close"].astype(float).iloc[-1]) if isinstance(df, pd.DataFrame) and (not df.empty) else float(entry)
-            except Exception:
-                price = float(entry)
-        price = float(price)
-
-        unrealized_R = pos.get("unrealized_R", None)
-        if unrealized_R is None:
-            unrealized_R = _compute_unrealized_R(side, entry, sl, price)
-        else:
-            unrealized_R = float(unrealized_R)
-
-        dd_R = float(pos.get("dd_R") or pos.get("max_dd_R") or pos.get("drawdown_R") or 0.0)
-
-        nh = ev_meta.get("next_high_hours", None)
-        try:
-            nh_f = (float(nh) if nh is not None else None)
-        except Exception:
-            nh_f = None
-
-        event_factor = float(ev_meta.get("factor", 0.0) or 0.0)
-        window_high = bool(ev_meta.get("window_high", False))
-
-        trade_profile = _resolve_trade_profile(ctx_in or {})
-        # ---- Mandatory holding rules (swing/daytrade hybrid) ----
-        # Base thresholds (hours)
+        side = str(state.get("side") or "BUY").upper()
+        entry = float(state.get("entry") or 0.0)
+        sl = float(state.get("sl") or 0.0)
+        tp = float(state.get("tp") or 0.0)
+        price = float(state.get("price") or entry)
+        unrealized_R = float(state.get("unrealized_R") or 0.0)
+        dd_R = float(state.get("dd_R") or 0.0)
+        nh_f = state.get("nh_f")
+        event_factor = float(state.get("event_factor") or 0.0)
+        window_high = bool(state.get("window_high", False))
+        time_in_trade_h = state.get("time_in_trade_h")
+        trade_profile = dict(state.get("trade_profile") or {})
         no_add_h = float(ctx_in.get("hold_no_add_hours", 48.0) or 48.0)
         reduce_h = float(ctx_in.get("hold_reduce_hours", 18.0) or 18.0)
         be_h = float(ctx_in.get("hold_breakeven_hours", 12.0) or 12.0)
         partial_h = float(ctx_in.get("hold_partial_tp_hours", 18.0) or 18.0)
-        if str(trade_profile.get("name")) == "DAYTRADE":
-            no_add_h = float(ctx_in.get("hold_no_add_hours", 6.0) or 6.0)
-            reduce_h = float(ctx_in.get("hold_reduce_hours", 3.0) or 3.0)
-            be_h = float(ctx_in.get("hold_breakeven_hours", 2.0) or 2.0)
-            partial_h = float(ctx_in.get("hold_partial_tp_hours", 3.0) or 3.0)
-
-        # Guardrails
         no_add_h = max(6.0, min(168.0, no_add_h))
         reduce_h = max(3.0, min(72.0, reduce_h))
         be_h = max(1.0, min(48.0, be_h))
         partial_h = max(1.0, min(72.0, partial_h))
-
         notes: List[str] = []
         actions: List[str] = []
-
         no_add = False
         if (nh_f is not None) and (nh_f <= no_add_h):
             no_add = True
@@ -1412,11 +1222,8 @@ def _hold_manage_reco(
         if float(weekcross_risk or 0.0) > 0.0:
             no_add = True
             notes.append("週跨ぎ（木金）リスク → 追加建て禁止")
-
-        # Size shrink recommendation (0.2..1.0)
         reduce_mult = 1.0
         if (nh_f is not None) and (nh_f <= reduce_h):
-            # base shrink by event factor
             reduce_mult = min(reduce_mult, float(_clamp(1.0 - 0.60 * event_factor, 0.20, 1.00)))
             if unrealized_R >= 0.20:
                 reduce_mult = min(reduce_mult, 0.50)
@@ -1426,14 +1233,11 @@ def _hold_manage_reco(
                 reduce_mult = min(reduce_mult, 0.70)
                 actions.append("REDUCE_SIZE")
                 notes.append("イベント接近 → 建玉縮退を推奨（リスク低減）")
-
         if float(weekend_risk or 0.0) > 0.0:
             reduce_mult = min(reduce_mult, 0.60)
             if "REDUCE_SIZE" not in actions:
                 actions.append("REDUCE_SIZE")
             notes.append("週末前 → 建玉縮退を推奨（ギャップ対策）")
-
-        # Partial take profit (0..1)
         partial_tp = 0.0
         if (nh_f is not None) and (nh_f <= partial_h) and (unrealized_R >= 0.60):
             partial_tp = max(partial_tp, 0.50)
@@ -1444,8 +1248,6 @@ def _hold_manage_reco(
             if "PARTIAL_TP" not in actions:
                 actions.append("PARTIAL_TP")
             notes.append("高インパクト窓内 → 半分利確を推奨（スリッページ/乱高下対策）")
-
-        # Move SL to breakeven / tighten
         move_be = False
         new_sl = None
         if (nh_f is not None) and (nh_f <= be_h) and (unrealized_R >= 0.15):
@@ -1460,47 +1262,15 @@ def _hold_manage_reco(
             if "MOVE_SL_TO_BE" not in actions:
                 actions.append("MOVE_SL_TO_BE")
             notes.append("週末前 → 建値/浅い利確で防御を推奨")
-
-        # Daytrade-specific time/precision management
-        time_in_trade_h = None
-        try:
-            opened_at = _parse_utc_like(pos.get("opened_at_utc") or pos.get("opened_at") or ctx_in.get("opened_at_utc"))
-            if opened_at is not None:
-                time_in_trade_h = max(0.0, (datetime.now(timezone.utc) - opened_at).total_seconds() / 3600.0)
-        except Exception:
-            time_in_trade_h = None
-
-        if str(trade_profile.get("name")) == "DAYTRADE":
-            max_hold_h = float(trade_profile.get("max_hold_hours", 12.0) or 12.0)
-            stale_after_h = float(trade_profile.get("stale_after_hours", 4.0) or 4.0)
-            if (time_in_trade_h is not None) and (time_in_trade_h >= stale_after_h) and (unrealized_R < 0.25):
-                reduce_mult = min(reduce_mult, 0.70)
-                if "REDUCE_SIZE" not in actions:
-                    actions.append("REDUCE_SIZE")
-                notes.append(f"デイトレで{time_in_trade_h:.1f}h経過して伸びが弱い → 建玉縮小を推奨")
-            if (time_in_trade_h is not None) and (time_in_trade_h >= max_hold_h) and (unrealized_R < 0.80):
-                partial_tp = max(partial_tp, 0.50 if unrealized_R > 0 else 0.0)
-                actions.append("TIME_EXIT")
-                notes.append(f"デイトレの想定保有時間 {max_hold_h:.1f}h を超過 → 利確/撤退を優先")
-            if unrealized_R >= 0.40:
-                move_be = True
-                new_sl = float(entry) if new_sl is None else max(float(new_sl), float(entry)) if side == "BUY" else min(float(new_sl), float(entry))
-                if "MOVE_SL_TO_BE" not in actions:
-                    actions.append("MOVE_SL_TO_BE")
-                notes.append("デイトレで0.4R超 → 建値防御を優先")
-
-        # Round new SL to pip
         try:
             if new_sl is not None:
-                new_sl = _round_to_pip(float(new_sl), pair)
+                new_sl = _round_to_pip(float(new_sl), state.get("pair", ""))
         except Exception:
             pass
-
-        # Compose
-        out = {
+        return {
             "version": "swing_hold_v1",
             "trade_profile": str(trade_profile.get("name", "SWING")),
-            "pair": str(pair),
+            "pair": str(state.get("pair", "")),
             "side": side,
             "entry": float(entry),
             "sl": float(sl),
@@ -1519,10 +1289,201 @@ def _hold_manage_reco(
             "partial_tp_ratio": float(_clamp(partial_tp, 0.0, 1.0)),
             "move_sl_to_be": bool(move_be),
             "new_sl_reco": (float(new_sl) if new_sl is not None else None),
-            "actions": list(dict.fromkeys(actions)),  # unique preserve order
+            "actions": list(dict.fromkeys(actions)),
             "notes": notes,
         }
+    except Exception:
+        return {}
+
+
+def daytrade_hold_v1(state: Dict[str, Any], ctx_in: Dict[str, Any], weekend_risk: float, weekcross_risk: float) -> Dict[str, Any]:
+    try:
+        side = str(state.get("side") or "BUY").upper()
+        entry = float(state.get("entry") or 0.0)
+        sl = float(state.get("sl") or 0.0)
+        tp = float(state.get("tp") or 0.0)
+        price = float(state.get("price") or entry)
+        unrealized_R = float(state.get("unrealized_R") or 0.0)
+        dd_R = float(state.get("dd_R") or 0.0)
+        peak_R = float(state.get("peak_R") or unrealized_R)
+        nh_f = state.get("nh_f")
+        event_factor = float(state.get("event_factor") or 0.0)
+        window_high = bool(state.get("window_high", False))
+        time_in_trade_h = state.get("time_in_trade_h")
+        trade_profile = dict(state.get("trade_profile") or {})
+        time_in_trade_m = (float(time_in_trade_h) * 60.0) if time_in_trade_h is not None else None
+        trail_trigger_r = float(trade_profile.get("trail_trigger_r", 0.90) or 0.90)
+        be_trigger_r = float(trade_profile.get("be_trigger_r", 0.40) or 0.40)
+        fast_df = _ctx_dataframe(ctx_in, "_df_fast_15m", "df_fast_15m", "_df_15m")
+        micro_df = _ctx_dataframe(ctx_in, "_df_micro_5m", "df_micro_5m", "_df_5m")
+        direction = "LONG" if side == "BUY" else "SHORT"
+        fast_probe = _probe_intraday_frame(fast_df, direction, lookback=16)
+        micro_probe = _probe_intraday_frame(micro_df, direction, lookback=12)
+        fast_bad = bool(fast_probe) and (fast_probe.get("dir_ok") is False)
+        micro_bad = bool(micro_probe) and (micro_probe.get("dir_ok") is False)
+        alignment = 0.0
+        if fast_probe:
+            alignment += 0.65 * float(fast_probe.get("score", 0.0) or 0.0)
+        if micro_probe:
+            alignment += 0.35 * float(micro_probe.get("score", 0.0) or 0.0)
+        fade_R = max(0.0, float(peak_R) - float(unrealized_R))
+        notes: List[str] = []
+        actions: List[str] = []
+        no_add = bool(float(weekend_risk or 0.0) > 0.0 or float(weekcross_risk or 0.0) > 0.0)
+        reduce_mult = 1.0
+        partial_tp = 0.0
+        move_be = False
+        new_sl = None
+        time_exit_stage = None
+        if unrealized_R >= be_trigger_r:
+            move_be = True
+            new_sl = float(entry)
+            actions.append("MOVE_SL_TO_BE")
+            notes.append("デイトレで0.4R超 → 建値防御を優先")
+        if unrealized_R >= trail_trigger_r:
+            partial_tp = max(partial_tp, 0.35)
+            if "PARTIAL_TP" not in actions:
+                actions.append("PARTIAL_TP")
+            notes.append("デイトレで0.9R超 → 一部利確で利益保護")
+        if (nh_f is not None) and (nh_f <= 3.0):
+            no_add = True
+            reduce_mult = min(reduce_mult, float(_clamp(1.0 - 0.55 * max(0.35, event_factor), 0.20, 1.0)))
+            if "REDUCE_SIZE" not in actions:
+                actions.append("REDUCE_SIZE")
+            notes.append(f"高インパクト指標が{nh_f:.1f}時間以内 → デイトレ建玉を軽くする")
+        if float(weekend_risk or 0.0) > 0.0:
+            reduce_mult = min(reduce_mult, 0.60)
+            if "REDUCE_SIZE" not in actions:
+                actions.append("REDUCE_SIZE")
+            notes.append("週末前 → デイトレでも建玉縮小")
+        if float(weekcross_risk or 0.0) > 0.0:
+            reduce_mult = min(reduce_mult, 0.75)
+            if "REDUCE_SIZE" not in actions:
+                actions.append("REDUCE_SIZE")
+            notes.append("週跨ぎ前 → 建玉縮小を優先")
+        def _stage_exit(stage_label: str, detail: str, reduce_to: float = 0.35):
+            nonlocal time_exit_stage, reduce_mult
+            time_exit_stage = stage_label
+            reduce_mult = min(reduce_mult, float(reduce_to))
+            if "TIME_EXIT" not in actions:
+                actions.append("TIME_EXIT")
+            notes.append(detail)
+        if time_in_trade_m is not None:
+            if time_in_trade_m >= 30.0:
+                if (unrealized_R <= 0.02 and micro_bad) or (fade_R >= 0.18 and micro_bad) or (alignment <= -0.25 and unrealized_R < 0.10):
+                    _stage_exit("30m", "30分経過でも伸びず、5分足が逆向き → 失速撤退を優先", reduce_to=0.50)
+            if time_in_trade_m >= 60.0:
+                if (unrealized_R < 0.10 and (micro_bad or fast_bad)) or (fade_R >= 0.22 and alignment <= -0.10):
+                    _stage_exit("60m", "60分経過で伸び不足/戻し発生 → デイトレ撤退を優先", reduce_to=0.35)
+            if time_in_trade_m >= 120.0:
+                if unrealized_R < 0.20 or alignment <= 0.0:
+                    _stage_exit("120m", "120分経過でも利が伸びないため、時間撤退を優先", reduce_to=0.20)
+        if window_high and unrealized_R >= 0.25:
+            partial_tp = max(partial_tp, 0.50)
+            if "PARTIAL_TP" not in actions:
+                actions.append("PARTIAL_TP")
+            notes.append("高インパクト窓内 → デイトレは半分利確を優先")
+        try:
+            if new_sl is not None:
+                new_sl = _round_to_pip(float(new_sl), state.get("pair", ""))
+        except Exception:
+            pass
+        return {
+            "version": "daytrade_hold_v1",
+            "trade_profile": str(trade_profile.get("name", "DAYTRADE")),
+            "pair": str(state.get("pair", "")),
+            "side": side,
+            "entry": float(entry),
+            "sl": float(sl),
+            "tp": float(tp),
+            "current_price": float(price),
+            "unrealized_R": float(unrealized_R),
+            "peak_R": float(peak_R),
+            "fade_R": float(fade_R),
+            "dd_R": float(dd_R),
+            "event_next_high_hours": nh_f,
+            "event_window_high": bool(window_high),
+            "event_risk_factor": float(event_factor),
+            "weekend_risk": float(weekend_risk or 0.0),
+            "weekcross_risk": float(weekcross_risk or 0.0),
+            "time_in_trade_hours": (float(time_in_trade_h) if time_in_trade_h is not None else None),
+            "time_in_trade_minutes": (float(time_in_trade_m) if time_in_trade_m is not None else None),
+            "time_exit_stage": time_exit_stage,
+            "mtf_alignment_score": float(alignment),
+            "fast_tf_dir_ok": (bool(fast_probe.get("dir_ok")) if fast_probe else None),
+            "micro_tf_dir_ok": (bool(micro_probe.get("dir_ok")) if micro_probe else None),
+            "no_add": bool(no_add),
+            "reduce_size_mult": float(_clamp(reduce_mult, 0.20, 1.00)),
+            "partial_tp_ratio": float(_clamp(partial_tp, 0.0, 1.0)),
+            "move_sl_to_be": bool(move_be),
+            "new_sl_reco": (float(new_sl) if new_sl is not None else None),
+            "actions": list(dict.fromkeys(actions)),
+            "notes": notes,
+        }
+    except Exception:
+        return {}
+
+
+def daytrade_hold_selfcheck() -> Dict[str, Any]:
+    try:
+        now = datetime.now(timezone.utc)
+        idx = pd.date_range(end=now, periods=120, freq="5min", tz="UTC")
+        base = np.linspace(100.0, 100.8, len(idx))
+        d = pd.DataFrame({"Open": base - 0.03, "High": base + 0.06, "Low": base - 0.06, "Close": base}, index=idx)
+        fast_df = d.resample("15min").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last"}).dropna()
+        scenarios = {
+            "30m": {"opened_at_utc": (now - timedelta(minutes=31)).strftime("%Y-%m-%dT%H:%M:%SZ"), "current_price": 100.01, "peak_R": 0.24},
+            "60m": {"opened_at_utc": (now - timedelta(minutes=61)).strftime("%Y-%m-%dT%H:%M:%SZ"), "current_price": 100.03, "peak_R": 0.34},
+            "120m": {"opened_at_utc": (now - timedelta(minutes=121)).strftime("%Y-%m-%dT%H:%M:%SZ"), "current_price": 100.05, "peak_R": 0.36},
+        }
+        out = {"ok": True, "results": {}}
+        for label, pos_extra in scenarios.items():
+            ctx = {"price_interval": "1h", "trade_profile": "DAYTRADE", "_df_fast_15m": fast_df.copy(), "_df_micro_5m": d.copy()}
+            ctx["_df_fast_15m"].iloc[-3:, ctx["_df_fast_15m"].columns.get_loc("Close")] = [100.12, 99.98, 99.90]
+            ctx["_df_fast_15m"].iloc[-3:, ctx["_df_fast_15m"].columns.get_loc("Open")] = [100.16, 100.05, 100.00]
+            ctx["_df_micro_5m"].iloc[-4:, ctx["_df_micro_5m"].columns.get_loc("Close")] = [100.14, 100.02, 99.96, 99.90]
+            ctx["_df_micro_5m"].iloc[-4:, ctx["_df_micro_5m"].columns.get_loc("Open")] = [100.18, 100.08, 100.00, 99.96]
+            state = {
+                "pair": "AUD/JPY",
+                "side": "BUY",
+                "entry": 100.00,
+                "sl": 99.50,
+                "tp": 100.80,
+                "price": float(pos_extra["current_price"]),
+                "unrealized_R": float((float(pos_extra["current_price"]) - 100.00) / 0.50),
+                "dd_R": 0.0,
+                "peak_R": float(pos_extra["peak_R"]),
+                "time_in_trade_h": (now - _parse_utc_like(pos_extra["opened_at_utc"])) .total_seconds() / 3600.0,
+                "trade_profile": _resolve_trade_profile(ctx),
+                "nh_f": None,
+                "event_factor": 0.0,
+                "window_high": False,
+            }
+            res = daytrade_hold_v1(state, ctx, 0.0, 0.0)
+            out["results"][label] = {"actions": res.get("actions", []), "time_exit_stage": res.get("time_exit_stage"), "passed": bool("TIME_EXIT" in (res.get("actions", []) or []) and str(res.get("time_exit_stage")) == label)}
+        out["passed_all"] = all(v.get("passed") for v in out["results"].values())
         return out
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def _hold_manage_reco(
+    pair: str,
+    df: pd.DataFrame,
+    ctx_in: Dict[str, Any],
+    plan_like: Dict[str, Any],
+    ev_meta: Dict[str, Any],
+    weekend_risk: float,
+    weekcross_risk: float,
+) -> Dict[str, Any]:
+    try:
+        state = _extract_hold_state(pair, df, ctx_in, plan_like, ev_meta)
+        if not isinstance(state, dict):
+            return {}
+        trade_profile = dict(state.get("trade_profile") or {})
+        if str(trade_profile.get("name")) == "DAYTRADE":
+            return daytrade_hold_v1(state, ctx_in, weekend_risk, weekcross_risk)
+        return _swing_hold_v1(state, ctx_in, weekend_risk, weekcross_risk)
     except Exception:
         return {}
 def _clamp(x: float, lo: float, hi: float) -> float:
@@ -1958,11 +1919,6 @@ def get_ai_order_strategy(
     mtf_fast = {}
     mtf_micro = {}
     mtf_alignment_score = 0.0
-    tp2_compress_factor = 1.0
-    tp2_compressed = False
-    tp1_basis = "profile_risk"
-    fast_df = None
-    micro_df = None
     if bool(trade_profile.get("is_intraday")):
         fast_df = _ctx_dataframe(ctx_in, "_df_fast_15m", "df_fast_15m", "_df_15m")
         micro_df = _ctx_dataframe(ctx_in, "_df_micro_5m", "df_micro_5m", "_df_5m")
@@ -1977,16 +1933,21 @@ def get_ai_order_strategy(
             fast_df if isinstance(fast_df, pd.DataFrame) else None, mtf_fast,
             micro_df if isinstance(micro_df, pd.DataFrame) else None, mtf_micro,
         )
-        tp, tp2_compress_factor, tp2_compressed = _compress_daytrade_tp2(
-            entry,
-            sl,
-            tp,
-            direction,
-            float(mtf_alignment_score or 0.0),
-            (bool(mtf_micro.get("dir_ok", False)) if isinstance(mtf_micro, dict) and mtf_micro else None),
+        reward = abs(tp - entry)
+    tp2 = tp
+    tp2_compress_factor = 1.0
+    tp2_compressed = False
+    tp2_hard_capped = False
+    tp2_cap_reason = "none"
+    if bool(trade_profile.get("is_intraday")):
+        tp2, tp2_compress_factor, tp2_compressed, tp2_hard_capped, tp2_cap_reason = _compress_daytrade_tp2(
+            entry, sl, tp2, direction, float(mtf_alignment_score or 0.0),
+            (bool(mtf_fast.get("dir_ok")) if mtf_fast else None),
+            (bool(mtf_micro.get("dir_ok")) if mtf_micro else None),
             fast_df if isinstance(fast_df, pd.DataFrame) else None,
-            (liq_tp_intraday if liq_tp_intraday is not None else liq_tp),
+            liq_tp_intraday,
         )
+        tp = float(tp2)
         reward = abs(tp - entry)
         rr = reward / max(risk, 1e-9)
     rr_min = float(trade_profile.get("rr_floor", ctx_in.get("rr_min_floor", 1.0)) or 1.0)
@@ -1994,21 +1955,15 @@ def get_ai_order_strategy(
         rr_min = max(0.95, rr_min - 0.10)
     rr_floor_fail = bool(rr < rr_min)
     partial_tp = _compute_profile_partial_tp(
-        entry,
-        sl,
-        tp,
-        direction,
-        trade_profile,
-        phase_label,
-        strength,
-        fast_df=fast_df if isinstance(fast_df, pd.DataFrame) else None,
-        fast_probe=mtf_fast,
-        liq_tp=(liq_tp_intraday if liq_tp_intraday is not None else liq_tp),
+        entry, sl, tp2, direction, trade_profile, phase_label, strength,
+        fast_df=(fast_df if 'fast_df' in locals() and isinstance(fast_df, pd.DataFrame) else None),
+        fast_probe=(mtf_fast if isinstance(mtf_fast, dict) else None),
+        liq_tp=liq_tp_intraday,
     )
+    tp1 = partial_tp if partial_tp is not None else tp2
+    tp1_liquidity_capped = False
     if bool(trade_profile.get("is_intraday")):
-        tp1_basis = "intraday_structure"
-    tp1 = partial_tp if partial_tp is not None else tp
-    tp2 = tp
+        tp1, tp1_liquidity_capped = _cap_daytrade_tp1_to_liquidity(entry, tp1, tp2, direction, liq_tp_intraday)
 
     # -----------------------------------------------------------------
     # 5) 勝率 proxy（モデル）→ confidenceで縮退（p_eff）
@@ -2478,14 +2433,17 @@ def get_ai_order_strategy(
         "liquidity_tp": (float(liq_tp) if liq_tp is not None else None),
         "tp1": (float(tp1) if tp1 is not None else None),
         "tp2": float(tp2),
-        "tp1_basis": str(tp1_basis),
-        "tp2_compress_factor": float(tp2_compress_factor),
-        "tp2_compressed": bool(tp2_compressed),
         "mtf_alignment_score": float(mtf_alignment_score),
         "fast_tf_dir_ok": bool(mtf_fast.get("dir_ok", False)) if isinstance(mtf_fast, dict) and mtf_fast else None,
         "micro_tf_dir_ok": bool(mtf_micro.get("dir_ok", False)) if isinstance(mtf_micro, dict) and mtf_micro else None,
         "price_now": float((mtf_micro.get("last_close") if isinstance(mtf_micro, dict) and mtf_micro else entry)),
         "liquidity_tp_intraday": (float(liq_tp_intraday) if liq_tp_intraday is not None else None),
+        "tp1_basis": ("intraday_structure" if bool(trade_profile.get("is_intraday")) else "risk_multiple"),
+        "tp1_liquidity_capped": bool(tp1_liquidity_capped),
+        "tp2_compress_factor": float(tp2_compress_factor),
+        "tp2_compressed": bool(tp2_compressed),
+        "tp2_hard_capped": bool(tp2_hard_capped),
+        "tp2_cap_reason": str(tp2_cap_reason),
         "max_hold_hours": float(trade_profile.get("max_hold_hours", 0.0) or 0.0),
         "stale_after_hours": float(trade_profile.get("stale_after_hours", 0.0) or 0.0),
         "be_trigger_r": float(trade_profile.get("be_trigger_r", 0.0) or 0.0),
@@ -2660,9 +2618,12 @@ def get_ai_order_strategy(
         "take_profit": float(tp),
         "tp1": (float(tp1) if tp1 is not None else float(tp)),
         "tp2": float(tp2),
-        "tp1_basis": str(tp1_basis),
+        "tp1_basis": ("intraday_structure" if bool(trade_profile.get("is_intraday")) else "risk_multiple"),
+        "tp1_liquidity_capped": bool(tp1_liquidity_capped),
         "tp2_compress_factor": float(tp2_compress_factor),
         "tp2_compressed": bool(tp2_compressed),
+        "tp2_hard_capped": bool(tp2_hard_capped),
+        "tp2_cap_reason": str(tp2_cap_reason),
         "partial_tp_enabled": True,
         "price_now": float((mtf_micro.get("last_close") if isinstance(mtf_micro, dict) and mtf_micro else entry)),
         "trade_profile": str(trade_profile.get("name", "SWING")),
