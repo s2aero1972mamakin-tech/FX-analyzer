@@ -1312,6 +1312,10 @@ def daytrade_hold_v1(state: Dict[str, Any], ctx_in: Dict[str, Any], weekend_risk
         time_in_trade_h = state.get("time_in_trade_h")
         trade_profile = dict(state.get("trade_profile") or {})
         time_in_trade_m = (float(time_in_trade_h) * 60.0) if time_in_trade_h is not None else None
+        sbi_minlot_fixed = bool(ctx_in.get("sbi_minlot_fixed", True))
+        close_now = False
+        close_reason = None
+        partial_tp_actionable = (not sbi_minlot_fixed)
         trail_trigger_r = float(trade_profile.get("trail_trigger_r", 0.90) or 0.90)
         be_trigger_r = float(trade_profile.get("be_trigger_r", 0.40) or 0.40)
         fast_df = _ctx_dataframe(ctx_in, "_df_fast_15m", "df_fast_15m", "_df_15m")
@@ -1362,21 +1366,32 @@ def daytrade_hold_v1(state: Dict[str, Any], ctx_in: Dict[str, Any], weekend_risk
                 actions.append("REDUCE_SIZE")
             notes.append("週跨ぎ前 → 建玉縮小を優先")
         def _stage_exit(stage_label: str, detail: str, reduce_to: float = 0.35):
-            nonlocal time_exit_stage, reduce_mult
+            nonlocal time_exit_stage, reduce_mult, close_now, close_reason, partial_tp
             time_exit_stage = stage_label
-            reduce_mult = min(reduce_mult, float(reduce_to))
-            if "TIME_EXIT" not in actions:
-                actions.append("TIME_EXIT")
-            notes.append(detail)
+            if sbi_minlot_fixed:
+                reduce_mult = 0.0
+                close_now = True
+                close_reason = str(detail)
+                partial_tp = 0.0
+                if "EXIT_NOW" not in actions:
+                    actions.append("EXIT_NOW")
+                if "TIME_EXIT" not in actions:
+                    actions.append("TIME_EXIT")
+                notes.append(detail + "（SBI最小1建前提のため全決済優先）")
+            else:
+                reduce_mult = min(reduce_mult, float(reduce_to))
+                if "TIME_EXIT" not in actions:
+                    actions.append("TIME_EXIT")
+                notes.append(detail)
         if time_in_trade_m is not None:
             if time_in_trade_m >= 30.0:
-                if (unrealized_R <= 0.02 and micro_bad) or (fade_R >= 0.18 and micro_bad) or (alignment <= -0.25 and unrealized_R < 0.10):
+                if (unrealized_R <= 0.05 and micro_bad) or (fade_R >= 0.12 and micro_bad) or (alignment <= -0.18 and unrealized_R < 0.15):
                     _stage_exit("30m", "30分経過でも伸びず、5分足が逆向き → 失速撤退を優先", reduce_to=0.50)
             if time_in_trade_m >= 60.0:
-                if (unrealized_R < 0.10 and (micro_bad or fast_bad)) or (fade_R >= 0.22 and alignment <= -0.10):
+                if (unrealized_R < 0.18 and (micro_bad or fast_bad)) or (fade_R >= 0.18 and alignment <= 0.0) or (peak_R >= 0.35 and unrealized_R <= 0.10):
                     _stage_exit("60m", "60分経過で伸び不足/戻し発生 → デイトレ撤退を優先", reduce_to=0.35)
             if time_in_trade_m >= 120.0:
-                if unrealized_R < 0.20 or alignment <= 0.0:
+                if unrealized_R < 0.35 or alignment <= 0.10 or (peak_R >= 0.50 and unrealized_R < 0.20):
                     _stage_exit("120m", "120分経過でも利が伸びないため、時間撤退を優先", reduce_to=0.20)
         if window_high and unrealized_R >= 0.25:
             partial_tp = max(partial_tp, 0.50)
@@ -1413,8 +1428,12 @@ def daytrade_hold_v1(state: Dict[str, Any], ctx_in: Dict[str, Any], weekend_risk
             "fast_tf_dir_ok": (bool(fast_probe.get("dir_ok")) if fast_probe else None),
             "micro_tf_dir_ok": (bool(micro_probe.get("dir_ok")) if micro_probe else None),
             "no_add": bool(no_add),
-            "reduce_size_mult": float(_clamp(reduce_mult, 0.20, 1.00)),
+            "sbi_minlot_fixed": bool(sbi_minlot_fixed),
+            "close_now": bool(close_now),
+            "close_reason": (str(close_reason) if close_reason else None),
+            "reduce_size_mult": (0.0 if bool(close_now) else float(_clamp(reduce_mult, 0.20, 1.00))),
             "partial_tp_ratio": float(_clamp(partial_tp, 0.0, 1.0)),
+            "partial_tp_actionable": bool(partial_tp_actionable),
             "move_sl_to_be": bool(move_be),
             "new_sl_reco": (float(new_sl) if new_sl is not None else None),
             "actions": list(dict.fromkeys(actions)),
@@ -1460,7 +1479,7 @@ def daytrade_hold_selfcheck() -> Dict[str, Any]:
                 "window_high": False,
             }
             res = daytrade_hold_v1(state, ctx, 0.0, 0.0)
-            out["results"][label] = {"actions": res.get("actions", []), "time_exit_stage": res.get("time_exit_stage"), "passed": bool("TIME_EXIT" in (res.get("actions", []) or []) and str(res.get("time_exit_stage")) == label)}
+            out["results"][label] = {"actions": res.get("actions", []), "time_exit_stage": res.get("time_exit_stage"), "close_now": bool(res.get("close_now", False)), "passed": bool("TIME_EXIT" in (res.get("actions", []) or []) and str(res.get("time_exit_stage")) == label and bool(res.get("close_now", False)))}
         out["passed_all"] = all(v.get("passed") for v in out["results"].values())
         return out
     except Exception as e:
@@ -1486,6 +1505,115 @@ def _hold_manage_reco(
         return _swing_hold_v1(state, ctx_in, weekend_risk, weekcross_risk)
     except Exception:
         return {}
+
+
+def _build_shadow_candidate(
+    *,
+    decision: str,
+    trade_profile: Dict[str, Any],
+    pair: str,
+    direction: str,
+    side: str,
+    entry: float,
+    sl: float,
+    tp1: Optional[float],
+    tp2: float,
+    order_type: str,
+    entry_type: str,
+    rr: float,
+    rr_min: float,
+    ev_gate: float,
+    dynamic_threshold: float,
+    confidence: float,
+    execution_score: float,
+    p_eff: float,
+    mtf_alignment_score: float,
+    fast_tf_dir_ok: Optional[bool],
+    micro_tf_dir_ok: Optional[bool],
+    structure_ok: bool,
+    breakout_pass: bool,
+    event_mode: str,
+    veto: List[str],
+) -> Dict[str, Any]:
+    try:
+        profile_name = str((trade_profile or {}).get("name") or "SWING")
+        gate_gap = float(ev_gate) - float(dynamic_threshold)
+        rr_gap = float(rr) - float(rr_min)
+        enabled = bool(profile_name == "DAYTRADE")
+        if not enabled:
+            return {
+                "enabled": False,
+                "candidate": False,
+                "mode": "OFF",
+                "reason": "not_daytrade",
+                "score": 0.0,
+                "gate_gap": float(gate_gap),
+                "rr_gap": float(rr_gap),
+            }
+
+        event_block = str(event_mode or "") in ("EVENT_WINDOW", "POST_WAIT")
+        catastrophic = bool(event_block or float(mtf_alignment_score) <= -1.05 or float(confidence) < 0.18 or float(execution_score) < 0.30)
+        near_rr = bool(float(rr) >= max(0.78, float(rr_min) - 0.22))
+        near_ev = bool(float(ev_gate) >= float(dynamic_threshold) - 0.18)
+        exec_ok = bool(float(execution_score) >= 0.46 and float(confidence) >= 0.26 and float(p_eff) >= 0.28)
+        mtf_ok = bool(float(mtf_alignment_score) >= -0.95)
+        structure_soft = bool(structure_ok or breakout_pass or (float(execution_score) >= 0.58 and float(mtf_alignment_score) >= -0.55))
+        candidate = bool(str(decision or "") != "TRADE" and (not catastrophic) and near_rr and near_ev and exec_ok and mtf_ok and structure_soft)
+
+        reason_bits: List[str] = []
+        if event_block:
+            reason_bits.append("イベント窓はSHADOW追跡のみ")
+        if rr_gap < 0:
+            reason_bits.append(f"RR差 {rr_gap:+.2f}")
+        if gate_gap < 0:
+            reason_bits.append(f"EV差 {gate_gap:+.3f}")
+        if fast_tf_dir_ok is False:
+            reason_bits.append("15分足逆向き")
+        if micro_tf_dir_ok is False:
+            reason_bits.append("5分足逆向き")
+        if not reason_bits:
+            reason_bits.append("検証追跡用")
+
+        score = (
+            0.42 * float(_clamp(execution_score, 0.0, 1.0))
+            + 0.22 * float(_clamp(confidence, 0.0, 1.0))
+            + 0.18 * float(_clamp(p_eff, 0.0, 1.0))
+            + 0.10 * float(_clamp((rr - max(0.75, rr_min - 0.25)) / 0.40, 0.0, 1.0))
+            + 0.08 * float(_clamp((ev_gate - (dynamic_threshold - 0.18)) / 0.18, 0.0, 1.0))
+        )
+        score = float(_clamp(score, 0.0, 1.0))
+        mode = "TRACK" if candidate else "OFF"
+        return {
+            "enabled": True,
+            "candidate": bool(candidate),
+            "mode": str(mode),
+            "reason": " / ".join(reason_bits),
+            "score": float(score),
+            "gate_gap": float(gate_gap),
+            "rr_gap": float(rr_gap),
+            "pair": str(pair),
+            "direction": str(direction),
+            "side": str(side),
+            "order_type": str(order_type),
+            "entry_type": str(entry_type),
+            "entry": float(entry),
+            "sl": float(sl),
+            "tp1": (float(tp1) if tp1 is not None else None),
+            "tp2": float(tp2),
+            "time_exit_focus": "30m/60m/120m",
+            "veto_snapshot": list(veto or []),
+        }
+    except Exception as e:
+        return {
+            "enabled": True,
+            "candidate": False,
+            "mode": "ERROR",
+            "reason": f"shadow_error:{type(e).__name__}",
+            "score": 0.0,
+            "gate_gap": 0.0,
+            "rr_gap": 0.0,
+        }
+
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
@@ -2574,6 +2702,38 @@ def get_ai_order_strategy(
     except Exception:
         pass
 
+    shadow_meta = _build_shadow_candidate(
+        decision=str(decision),
+        trade_profile=trade_profile,
+        pair=str(pair),
+        direction=str(direction),
+        side=str(side),
+        entry=float(entry),
+        sl=float(sl),
+        tp1=(float(tp1) if tp1 is not None else None),
+        tp2=float(tp2),
+        order_type=str(order_type),
+        entry_type=str(entry_type),
+        rr=float(rr),
+        rr_min=float(rr_min),
+        ev_gate=float(ev_gate),
+        dynamic_threshold=float(dynamic_threshold),
+        confidence=float(confidence),
+        execution_score=float(execution_score),
+        p_eff=float(p_eff),
+        mtf_alignment_score=float(mtf_alignment_score or 0.0),
+        fast_tf_dir_ok=(bool(mtf_fast.get("dir_ok")) if mtf_fast else None),
+        micro_tf_dir_ok=(bool(mtf_micro.get("dir_ok")) if mtf_micro else None),
+        structure_ok=bool(structure_ok),
+        breakout_pass=bool(breakout_pass),
+        event_mode=str(event_mode),
+        veto=list(veto),
+    )
+    try:
+        ctx_out["shadow"] = dict(shadow_meta)
+    except Exception:
+        pass
+
     # -----------------------------------------------------------------
     # 15) 保有中のイベント接近対応（縮退/一部利確/建値移動/追加禁止）
     # -----------------------------------------------------------------
@@ -2668,6 +2828,10 @@ def get_ai_order_strategy(
         "state_probs": state_probs,
         "ev_contribs": ev_contribs,
 
+        "shadow": (dict(shadow_meta) if isinstance(shadow_meta, dict) else {}),
+        "shadow_candidate": bool((shadow_meta or {}).get("candidate", False)) if isinstance(shadow_meta, dict) else False,
+        "shadow_reason": (str((shadow_meta or {}).get("reason", "")) if isinstance(shadow_meta, dict) else ""),
+        "shadow_score": float((shadow_meta or {}).get("score", 0.0) or 0.0) if isinstance(shadow_meta, dict) else 0.0,
         "hold_manage": (hold_manage if isinstance(hold_manage, dict) else {}),
         "_ctx": ctx_out,
     }
