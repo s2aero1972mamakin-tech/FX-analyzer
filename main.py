@@ -1892,6 +1892,7 @@ def _apply_sbi_minlot_guard(plan: dict, *, sbi_min_lot: int = 1) -> dict:
             shadow["rr_gap"] = float(shadow.get("rr_gap", 0.0) or 0.0)
             shadow["time_exit_focus"] = "30m/60m/120m"
             plan["shadow"] = shadow
+            plan["shadow_best"] = shadow
             plan["shadow_candidate"] = True
             plan["shadow_reason"] = str(shadow.get("reason") or "")
             plan["shadow_score"] = float(shadow.get("score") or 0.0)
@@ -3025,18 +3026,59 @@ def _render_top_trade_panel(pair_label: str, plan: Dict[str, Any], current_price
 
 
 
-def _render_shadow_candidate_panel(pair_label: str, plan: Dict[str, Any], current_price: float):
+
+
+def _shadow_from_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
     try:
-        shadow = plan.get("shadow", {}) if isinstance(plan.get("shadow", {}), dict) else {}
-        if not bool(shadow.get("candidate", False)):
+        for key in ("shadow_best", "shadow", "shadow_primary"):
+            meta = plan.get(key, {}) if isinstance(plan, dict) else {}
+            if isinstance(meta, dict) and meta:
+                return dict(meta)
+    except Exception:
+        pass
+    return {}
+
+
+def _pick_global_shadow_row(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    try:
+        pool: List[Dict[str, Any]] = []
+        for row in rows or []:
+            plan_any = row.get("_plan_ui") or row.get("_plan") or {}
+            shadow = _shadow_from_plan(plan_any)
+            if not shadow:
+                continue
+            score = float(shadow.get("score", -1.0) or -1.0)
+            candidate = bool(shadow.get("candidate", False))
+            pool.append({
+                "pair": row.get("pair"),
+                "shadow": shadow,
+                "score": score,
+                "candidate": candidate,
+                "row": row,
+            })
+        if not pool:
+            return None
+        pool.sort(key=lambda x: (1 if x.get("candidate") else 0, float(x.get("score", -1.0))), reverse=True)
+        return pool[0]
+    except Exception:
+        return None
+
+
+def _render_shadow_card(title: str, pair_label: str, plan: Dict[str, Any], current_price: float, empty_message: str = "SHADOW情報なし"):
+    try:
+        shadow = _shadow_from_plan(plan)
+        st.markdown(f"### 🛰 {title}")
+        if not shadow:
+            st.info(empty_message)
             return
-        st.markdown("### 🛰 検証用 SHADOW候補")
-        st.caption("実売買ではなく、出口ロジックの検証対象として常時追跡する候補です。SBI最小1建制約があるため、ここでは仮想候補として扱います。")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("SHADOW評価", f"{float(shadow.get('score', 0.0) or 0.0):.2f}")
-        c2.metric("EV差", f"{float(shadow.get('gate_gap', 0.0) or 0.0):+.3f}")
-        c3.metric("RR差", f"{float(shadow.get('rr_gap', 0.0) or 0.0):+.2f}")
+        c1, c2, c3, c4 = st.columns(4)
+        state_label = "TRACK" if bool(shadow.get("candidate", False)) else str(shadow.get("mode") or "OFF")
+        c1.metric("状態", state_label)
+        c2.metric("SHADOW評価", f"{float(shadow.get('score', 0.0) or 0.0):.2f}")
+        c3.metric("EV差", f"{float(shadow.get('gate_gap', 0.0) or 0.0):+.3f}")
+        c4.metric("RR差", f"{float(shadow.get('rr_gap', 0.0) or 0.0):+.2f}")
         direction = str(shadow.get("direction") or plan.get("direction") or "")
+        side_disp = shadow.get("side", plan.get("side", "—"))
         entry = shadow.get("entry", plan.get("entry"))
         sl = shadow.get("sl", plan.get("stop_loss"))
         tp2 = shadow.get("tp2", plan.get("take_profit"))
@@ -3044,16 +3086,54 @@ def _render_shadow_candidate_panel(pair_label: str, plan: Dict[str, Any], curren
         entry_kind = entry_kind_src if _jp_order_kind(entry_kind_src) != "—" else _infer_entry_order_kind(direction, float(entry or current_price), float(current_price))
         st.markdown(f"""
 - **候補ペア**: {pair_label}
-- **売買候補**: {_jp_side(plan.get('side', shadow.get('side', '—')))}
+- **売買候補**: {_jp_side(side_disp)}
 - **参考エントリー注文**: {_jp_order_kind(entry_kind)}
 - **参考エントリー価格**: {_fmt_price(entry)}
 - **参考損切り(SL)**: {_fmt_price(sl)}
 - **参考利確(TP2)**: {_fmt_price(tp2)}
 - **time-exit重点**: {shadow.get('time_exit_focus', '30m/60m/120m')}
+- **採点ソース**: {shadow.get('source_label', '主判定側SHADOW')}
 """)
         st.info(str(shadow.get("reason") or "検証追跡用候補"))
+        primary = plan.get("shadow_primary", {}) if isinstance(plan.get("shadow_primary", {}), dict) else {}
+        opposite = plan.get("shadow_opposite", {}) if isinstance(plan.get("shadow_opposite", {}), dict) else {}
+        if primary or opposite:
+            with st.expander("SHADOW内訳", expanded=False):
+                rows = []
+                for label, meta in (("主判定側", primary), ("逆方向", opposite)):
+                    if isinstance(meta, dict) and meta:
+                        rows.append({
+                            "区分": label,
+                            "状態": "TRACK" if bool(meta.get("candidate", False)) else str(meta.get("mode") or "OFF"),
+                            "方向": str(meta.get("direction") or "—"),
+                            "評価": float(meta.get("score", 0.0) or 0.0),
+                            "EV差": float(meta.get("gate_gap", 0.0) or 0.0),
+                            "RR差": float(meta.get("rr_gap", 0.0) or 0.0),
+                            "理由": str(meta.get("reason") or ""),
+                        })
+                if rows:
+                    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     except Exception:
         return
+
+
+def _render_shadow_dual_panel(current_pair: str, current_plan: Dict[str, Any], current_price: float, global_shadow_row: Optional[Dict[str, Any]] = None):
+    try:
+        col1, col2 = st.columns(2)
+        with col1:
+            _render_shadow_card("現在ペア SHADOW状態", current_pair, current_plan, current_price, empty_message="現在ペアにはSHADOW情報がありません。")
+        with col2:
+            if isinstance(global_shadow_row, dict) and global_shadow_row:
+                row = global_shadow_row.get("row", {}) if isinstance(global_shadow_row.get("row", {}), dict) else {}
+                pair = str(global_shadow_row.get("pair") or row.get("pair") or "—")
+                plan_g = row.get("_plan_ui") or row.get("_plan") or {}
+                price_g = float(((row.get("_ctx") or {}).get("price", 0.0)) or 0.0)
+                _render_shadow_card("全体最良 SHADOW候補", pair, plan_g, price_g, empty_message="全体最良SHADOW候補はありません。")
+            else:
+                _render_shadow_card("全体最良 SHADOW候補", "—", {}, 0.0, empty_message="全体最良SHADOW候補はありません。")
+    except Exception:
+        return
+
 
 def _render_risk_dashboard(plan: Dict[str, Any], feats: Dict[str, float], ext_meta: Optional[Dict[str, Any]] = None):
     """
@@ -3789,6 +3869,7 @@ with tabs[0]:
                 "dom_state": dom,
                 "shadow_candidate": bool(plan.get("shadow_candidate", False)),
                 "shadow_score": float(plan.get("shadow_score") or -1.0),
+                "shadow_enabled": bool(_shadow_from_plan(plan).get("enabled", False)) if isinstance(plan, dict) else False,
                 "_plan": plan,
                 "_plan_ui": plan_ui,
                 "_ctx": ctx,
@@ -3809,6 +3890,7 @@ with tabs[0]:
         trade_ranked.sort(key=lambda r: float(r.get("score", 0.0)), reverse=True)
         shadow_ranked = [r for r in ranked if bool(r.get("shadow_candidate", False))]
         shadow_ranked.sort(key=lambda r: float(r.get("shadow_score", -1.0)), reverse=True)
+        global_shadow_row = _pick_global_shadow_row(ranked)
 
         panel_trade_label = "今回の実行ペア" if "デイトレ" in str(trade_axis) else "本日の実行ペア"
         panel_skip_label = "今回は **見送り**" if "デイトレ" in str(trade_axis) else "本日は **見送り**"
@@ -3831,12 +3913,13 @@ with tabs[0]:
         feats = best["_feats"]
         price = float(best["_ctx"].get("price", 0.0))
 
+        _render_shadow_dual_panel(best["pair"], plan_ui_best, price, global_shadow_row)
+
         # 見送りの日は「詳細は必要なときだけ」開けるようにする
         details_box = st.container() if trade_ranked else st.expander("参考（最良候補の診断・ログ）", expanded=False)
         with details_box:
             # Top panel must show entry format + price (user request)
             _render_top_trade_panel(best["pair"], plan_ui_best, price)
-            _render_shadow_candidate_panel(best["pair"], plan_ui_best, price)
 
             # Risk dashboard (new)
             _render_risk_dashboard(plan_ui_best, feats, ext_meta=best.get("_ext_meta", {}))
@@ -4039,7 +4122,7 @@ with tabs[0]:
 
         price = float(ctx.get("price", 0.0))
         _render_top_trade_panel(pair_label, plan_ui, price)
-        _render_shadow_candidate_panel(pair_label, plan_ui, price)
+        _render_shadow_dual_panel(pair_label, plan_ui, price, None)
         _render_risk_dashboard(plan_ui, feats, ext_meta=ext_meta)
 
         _render_ai_engine_panel(ctx, plan_ui)
