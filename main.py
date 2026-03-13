@@ -1039,95 +1039,6 @@ def _load_csv_df(path: str) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
-
-def _boolish(v: Any) -> bool:
-    try:
-        if isinstance(v, bool):
-            return v
-        if v is None:
-            return False
-        s = str(v).strip().lower()
-        if s in ("", "0", "false", "no", "n", "off", "none", "null", "nan"):
-            return False
-        if s in ("1", "true", "yes", "y", "on", "t"):
-            return True
-        try:
-            return float(s) != 0.0
-        except Exception:
-            return bool(v)
-    except Exception:
-        return False
-
-
-def _set_daytrade_validation_signal_snapshot(rows: List[Dict[str, Any]], source: str = "AUTO_SESSION") -> None:
-    try:
-        cleaned: List[Dict[str, Any]] = []
-        for row in (rows or []):
-            if not isinstance(row, dict):
-                continue
-            r = dict(row)
-            r["validation_input_source"] = str(r.get("validation_input_source") or source)
-            sid = str(r.get("signal_id") or "").strip()
-            if not sid:
-                sym = re.sub(r"[^A-Z0-9_\-]", "", str(r.get("symbol") or r.get("pair") or "AUTO").upper()) or "AUTO"
-                ts_key = re.sub(r"[^0-9]", "", str(r.get("ts_utc") or _now_utc_iso()))[:14] or datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-                sid = f"AUTO_{sym}_{ts_key}"
-                r["signal_id"] = sid
-            cleaned.append(r)
-        cleaned.sort(key=lambda x: str(x.get("ts_utc") or ""), reverse=True)
-        st.session_state["daytrade_validation_signal_snapshot"] = cleaned[:200]
-    except Exception:
-        pass
-
-
-def _get_daytrade_validation_input_df(df_signals: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, int]]:
-    try:
-        frames: List[pd.DataFrame] = []
-        meta = {
-            "signals_log_csv": 0,
-            "signals_auto_session": 0,
-            "signals_merged": 0,
-        }
-
-        if isinstance(df_signals, pd.DataFrame) and not df_signals.empty:
-            df_log = df_signals.copy()
-            if "validation_input_source" not in df_log.columns:
-                df_log["validation_input_source"] = "LOG_CSV"
-            else:
-                df_log["validation_input_source"] = df_log["validation_input_source"].fillna("LOG_CSV")
-            meta["signals_log_csv"] = int(len(df_log))
-            frames.append(df_log)
-
-        snap_rows = st.session_state.get("daytrade_validation_signal_snapshot", [])
-        if isinstance(snap_rows, list) and snap_rows:
-            df_snap = pd.DataFrame([r for r in snap_rows if isinstance(r, dict)])
-            if not df_snap.empty:
-                if "validation_input_source" not in df_snap.columns:
-                    df_snap["validation_input_source"] = "AUTO_SESSION"
-                else:
-                    df_snap["validation_input_source"] = df_snap["validation_input_source"].fillna("AUTO_SESSION")
-                meta["signals_auto_session"] = int(len(df_snap))
-                frames.append(df_snap)
-
-        if not frames:
-            return pd.DataFrame(), meta
-
-        merged = pd.concat(frames, ignore_index=True, sort=False)
-        if "signal_id" in merged.columns:
-            merged["signal_id"] = merged["signal_id"].astype(str)
-            merged = merged.drop_duplicates(subset=["signal_id"], keep="last")
-        elif all(c in merged.columns for c in ["pair", "ts_utc", "direction", "decision"]):
-            merged = merged.drop_duplicates(subset=["pair", "ts_utc", "direction", "decision"], keep="last")
-        meta["signals_merged"] = int(len(merged))
-        return merged, meta
-    except Exception:
-        return (df_signals.copy() if isinstance(df_signals, pd.DataFrame) else pd.DataFrame()), {
-            "signals_log_csv": int(len(df_signals)) if isinstance(df_signals, pd.DataFrame) else 0,
-            "signals_auto_session": 0,
-            "signals_merged": int(len(df_signals)) if isinstance(df_signals, pd.DataFrame) else 0,
-        }
-
-
 def _make_signal_id(pair_symbol: str) -> str:
     ps = re.sub(r"[^A-Z0-9_\-]", "", (pair_symbol or "").upper())
     return f"{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}_{ps}_{uuid.uuid4().hex[:6]}"
@@ -1293,9 +1204,9 @@ def _safe_ts_parse(v: Any):
 
 def _is_daytrade_signal_row(row: Dict[str, Any]) -> bool:
     try:
-        trade_profile = str(row.get("trade_profile", "")).strip().upper()
-        tf_mode = str(row.get("timeframe_mode", "")).strip()
-        price_interval = str(row.get("price_interval", "")).strip().lower()
+        trade_profile = str(row.get("trade_profile", "")).upper()
+        tf_mode = str(row.get("timeframe_mode", ""))
+        price_interval = str(row.get("price_interval", "")).lower()
         return (trade_profile == "DAYTRADE") or ("デイトレ" in tf_mode) or (price_interval in ("1h", "60m", "30m", "15m", "5m"))
     except Exception:
         return False
@@ -1383,7 +1294,7 @@ def _build_daytrade_validation_cases(df_signals: pd.DataFrame) -> List[Dict[str,
             "time_exit_focus": "30m/60m/120m",
         }
         # LIVE case
-        if str(r.get("decision", "")).strip().upper() == "TRADE":
+        if str(r.get("decision", "")).upper() == "TRADE":
             entry = _float_or_none(r.get("entry_hint"))
             sl = _float_or_none(r.get("sl_hint"))
             tp2 = _float_or_none(r.get("tp2_hint") if pd.notna(r.get("tp2_hint")) else r.get("tp_hint"))
@@ -1406,7 +1317,7 @@ def _build_daytrade_validation_cases(df_signals: pd.DataFrame) -> List[Dict[str,
                     })
                     seen.add(cid)
         # SHADOW case
-        if _boolish(r.get("shadow_candidate", False)):
+        if bool(r.get("shadow_candidate", False)):
             entry = _float_or_none(r.get("shadow_entry"))
             sl = _float_or_none(r.get("shadow_sl"))
             tp2 = _float_or_none(r.get("shadow_tp2"))
@@ -1530,17 +1441,11 @@ def _run_daytrade_validation(df_signals: pd.DataFrame, bar_interval: str = "15m"
 
         df_scope = _filter_daytrade_validation_signals(df_signals, report_period)
         cases = _build_daytrade_validation_cases(df_scope)
-        source_counts: Dict[str, int] = {}
-        if isinstance(df_signals, pd.DataFrame) and (not df_signals.empty) and ("validation_input_source" in df_signals.columns):
-            for v in df_signals["validation_input_source"].fillna("UNKNOWN").astype(str):
-                source_counts[v] = int(source_counts.get(v, 0)) + 1
-
         base_config = {
             "bar_interval": str(bar_interval),
             "report_period": str(report_period),
             "signals_total": int(len(df_signals)) if isinstance(df_signals, pd.DataFrame) else 0,
             "signals_in_scope": int(len(df_scope)) if isinstance(df_scope, pd.DataFrame) else 0,
-            "signals_source_counts": source_counts,
             "cases_built": int(len(cases)),
             "cases_ready": 0,
             "bars_loaded": 0,
@@ -1673,19 +1578,11 @@ def _render_daytrade_validation_panel(df_signals: pd.DataFrame):
     st.info(_daytrade_validation_help_text(interval, period))
     st.caption(f"対象シグナルは直近 {period} の DAYTRADE 候補に限定して集計します。")
 
-    df_validation_input, validation_input_meta = _get_daytrade_validation_input_df(df_signals)
-    st.caption(
-        f"検証入力: merged={int(validation_input_meta.get('signals_merged', 0))} / "
-        f"log_csv={int(validation_input_meta.get('signals_log_csv', 0))} / "
-        f"auto_session={int(validation_input_meta.get('signals_auto_session', 0))}"
-    )
-
     if st.button("デイトレ検証レポートを作成", key="run_daytrade_validation"):
-        df_use = df_validation_input.copy()
+        df_use = df_signals.copy()
         if not include_auto and "decision" in df_use.columns:
-            df_use = df_use[df_use["decision"].astype(str).str.strip().str.upper() == "TRADE"].copy()
+            df_use = df_use[df_use["decision"].astype(str).str.upper() == "TRADE"].copy()
         rep = _run_daytrade_validation(df_use, bar_interval=interval, report_period=period)
-        rep["validation_input_meta"] = validation_input_meta
         st.session_state["daytrade_validation_report"] = rep
 
     rep = st.session_state.get("daytrade_validation_report")
@@ -1713,10 +1610,6 @@ def _render_daytrade_validation_panel(df_signals: pd.DataFrame):
         mid3.metric("cases_failed_fetch", f"{int(cfg.get('cases_failed_fetch', 0))}")
 
         st.caption(f"actual_interval_used: {str(cfg.get('actual_interval_used') or '—')}")
-        src_counts = cfg.get("signals_source_counts", {}) if isinstance(cfg.get("signals_source_counts", {}), dict) else {}
-        if src_counts:
-            src_text = ", ".join([f"{k}:{int(v)}" for k, v in sorted(src_counts.items())])
-            st.caption(f"signals_source_counts: {src_text}")
 
     if not rep.get("ok"):
         st.warning(f"デイトレ検証を作成できませんでした: {rep.get('error','unknown')}")
@@ -4622,23 +4515,6 @@ with tabs[0]:
 
         panel_trade_label = "今回の実行ペア" if "デイトレ" in str(trade_axis) else "本日の実行ペア"
         panel_skip_label = "今回は **見送り**" if "デイトレ" in str(trade_axis) else "本日は **見送り**"
-        try:
-            auto_snapshot_rows: List[Dict[str, Any]] = []
-            for r in ranked:
-                if not isinstance(r, dict):
-                    continue
-                auto_snapshot_rows.append(_build_signal_row(
-                    str(r.get("pair", "")),
-                    (r.get("_ctx", {}) if isinstance(r.get("_ctx", {}), dict) else {}),
-                    (r.get("_feats", {}) if isinstance(r.get("_feats", {}), dict) else {}),
-                    (r.get("_plan_ui") if isinstance(r.get("_plan_ui"), dict) else (r.get("_plan") if isinstance(r.get("_plan"), dict) else {})),
-                    price_meta=(r.get("_price_meta", {}) if isinstance(r.get("_price_meta", {}), dict) else {}),
-                    ext_meta=(r.get("_ext_meta", {}) if isinstance(r.get("_ext_meta", {}), dict) else {}),
-                ))
-            _set_daytrade_validation_signal_snapshot(auto_snapshot_rows, source="AUTO_SESSION")
-        except Exception:
-            pass
-
         if trade_ranked:
             best = trade_ranked[0]
             st.markdown(f"## 🧠 AI選択：{panel_trade_label}  **{best['pair']}**")
@@ -4794,13 +4670,6 @@ with tabs[0]:
             plan_ui = plan
 
         plan_ui = _apply_trend_assist(plan_ui, ctx)
-
-        try:
-            _set_daytrade_validation_signal_snapshot([
-                _build_signal_row(pair_label, ctx, feats, plan_ui, price_meta=price_meta, ext_meta=ext_meta)
-            ], source="AUTO_SESSION")
-        except Exception:
-            pass
 
         price = float(ctx.get("price", 0.0))
         _render_operational_three_blocks(
