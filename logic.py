@@ -2163,12 +2163,21 @@ def get_ai_order_strategy(
     ctx_in = context_data or {}
     ext = ext_features or {}
 
+    def _pick_dataframe(*values: Any) -> Optional[pd.DataFrame]:
+        for value in values:
+            if value is None:
+                continue
+            if isinstance(value, pd.DataFrame):
+                return value
+            return value
+        return None
+
     df = price_df
     if df is None:
-        df = kwargs.get("df") or kwargs.get("price_history") or kwargs.get("price_data")
+        df = _pick_dataframe(kwargs.get("df"), kwargs.get("price_history"), kwargs.get("price_data"))
 
     if df is None and isinstance(ctx_in, dict):
-        df = ctx_in.get("_df") or ctx_in.get("df") or ctx_in.get("price_df") or ctx_in.get("price_history")
+        df = _pick_dataframe(ctx_in.get("_df"), ctx_in.get("df"), ctx_in.get("price_df"), ctx_in.get("price_history"))
 
     if df is not None and not isinstance(df, pd.DataFrame):
         try:
@@ -3653,13 +3662,27 @@ def build_daytrade_validation_summary(results: List[Dict[str, Any]]) -> Dict[str
 
 
 def run_daytrade_validation_report(cases: List[Dict[str, Any]], bars_map: Dict[str, pd.DataFrame], bar_minutes: int = 15) -> Dict[str, Any]:
+    def _pick_bars(map_in: Any, symbol_key: str, pair_key: str) -> pd.DataFrame:
+        if not isinstance(map_in, dict):
+            return pd.DataFrame()
+        for key in [symbol_key, pair_key]:
+            if not key:
+                continue
+            try:
+                value = map_in.get(key)
+            except Exception:
+                value = None
+            if isinstance(value, pd.DataFrame):
+                return value
+        return pd.DataFrame()
+
     results = []
     for case in (cases or []):
         if not isinstance(case, dict):
             continue
         symbol = str(case.get("symbol") or "")
         pair = str(case.get("pair") or "")
-        bars = bars_map.get(symbol) or bars_map.get(pair) or pd.DataFrame()
+        bars = _pick_bars(bars_map, symbol, pair)
         res = evaluate_daytrade_validation_case(case, bars, bar_minutes=bar_minutes)
         merged = dict(case)
         merged.update(res)
