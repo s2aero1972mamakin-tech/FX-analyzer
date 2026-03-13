@@ -853,7 +853,7 @@ PAIR_LIST_DEFAULT = list(PAIR_LIST_CORE)
 # =========================
 # Build / Diagnostics
 # =========================
-APP_BUILD = "fixed28b_20260224"
+APP_BUILD = "fixed28b_dtvalmeta_20260312"
 # ---- EV audit (operator logs) ----
 EV_AUDIT_PATH = "logs/ev_audit.csv"
 
@@ -1343,59 +1343,223 @@ def _build_daytrade_validation_cases(df_signals: pd.DataFrame) -> List[Dict[str,
     return cases
 
 
-def _fetch_daytrade_validation_bars(cases: List[Dict[str, Any]], interval: str = "15m", period: str = "10d") -> Dict[str, pd.DataFrame]:
+def _fetch_daytrade_validation_bars(cases: List[Dict[str, Any]], interval: str = "15m", period: str = "10d") -> Tuple[Dict[str, pd.DataFrame], Dict[str, Dict[str, Any]]]:
     bars_map: Dict[str, pd.DataFrame] = {}
-    for case in cases:
-        pair = str(case.get("pair", ""))
-        symbol = str(case.get("symbol", "") or _pair_label_to_symbol(pair))
-        if symbol in bars_map:
-            continue
-        df_px, _meta = fetch_price_history(pair, symbol, period=period, interval=interval, prefer_stooq=False)
-        if isinstance(df_px, pd.DataFrame) and not df_px.empty:
-            bars_map[symbol] = df_px.copy()
-            bars_map[pair] = df_px.copy()
-    return bars_map
+    fetch_meta_map: Dict[str, Dict[str, Any]] = {}
 
+    def _norm_iv(v: Any) -> str:
+        s = str(v or "").strip().lower()
+        alias = {
+            "60m": "1h",
+            "60min": "1h",
+            "1hr": "1h",
+            "1hour": "1h",
+            "15min": "15m",
+            "5min": "5m",
+            "1d": "1d",
+        }
+        return alias.get(s, s)
+
+    requested_interval = _norm_iv(interval)
+    seen_symbols = set()
+    for case in (cases or []):
+        if not isinstance(case, dict):
+            continue
+        pair = str(case.get("pair", "") or "")
+        symbol = str(case.get("symbol", "") or _pair_label_to_symbol(pair) or "")
+        if not symbol or symbol in seen_symbols:
+            continue
+        seen_symbols.add(symbol)
+
+        df_px, raw_meta = fetch_price_history(pair, symbol, period=period, interval=interval, prefer_stooq=False)
+        meta_in = raw_meta if isinstance(raw_meta, dict) else {}
+        actual_interval_used = _norm_iv(meta_in.get("actual_interval_used") or meta_in.get("interval_used") or requested_interval)
+        fetch_source = str(meta_in.get("source") or "")
+        fetch_error = str(meta_in.get("error") or "")
+        fallback = meta_in.get("fallback")
+        bars_loaded = int(len(df_px)) if isinstance(df_px, pd.DataFrame) and not df_px.empty else 0
+        fetch_ok = bool(isinstance(df_px, pd.DataFrame) and not df_px.empty)
+        interval_mismatch = bool(actual_interval_used != requested_interval)
+        usable_for_validation = bool(fetch_ok)
+        if requested_interval == "1h" and interval_mismatch:
+            usable_for_validation = False
+
+        meta_item: Dict[str, Any] = {
+            "pair": pair,
+            "symbol": symbol,
+            "requested_interval": requested_interval,
+            "actual_interval_used": actual_interval_used,
+            "source": fetch_source,
+            "error": fetch_error,
+            "fallback": fallback,
+            "fetch_ok": fetch_ok,
+            "bars_loaded": bars_loaded,
+            "interval_mismatch": interval_mismatch,
+            "usable_for_validation": usable_for_validation,
+        }
+        fetch_meta_map[symbol] = meta_item
+
+        if usable_for_validation and fetch_ok:
+            bars_map[symbol] = df_px.copy()
+            if pair:
+                bars_map[pair] = df_px.copy()
+
+    return bars_map, fetch_meta_map
 
 def _run_daytrade_validation(df_signals: pd.DataFrame, bar_interval: str = "15m", report_period: str = "1mo") -> Dict[str, Any]:
     try:
+        def _interval_summary(fetch_meta_map: Dict[str, Dict[str, Any]]) -> str:
+            counts: Dict[str, int] = {}
+            for meta in (fetch_meta_map or {}).values():
+                if not isinstance(meta, dict):
+                    continue
+                iv = str(meta.get("actual_interval_used") or "?")
+                counts[iv] = int(counts.get(iv, 0)) + 1
+            if not counts:
+                return "—"
+            return ", ".join([f"{k}:{counts[k]}" for k in sorted(counts.keys())])
+
+        def _diag_case_row(case_item: Dict[str, Any], exit_reason: str) -> Dict[str, Any]:
+            row = dict(case_item or {})
+            row.update({
+                "ok": False,
+                "triggered": False,
+                "tp1_hit": False,
+                "tp2_hit": False,
+                "time_exit": False,
+                "be_exit": False,
+                "sl_hit": False,
+                "final_r": 0.0,
+                "mfe_r": 0.0,
+                "mae_r": 0.0,
+                "bars_held": 0,
+                "entry_ts": row.get("ts_utc"),
+                "exit_ts": None,
+                "exit_reason": exit_reason,
+            })
+            return row
+
         df_scope = _filter_daytrade_validation_signals(df_signals, report_period)
         cases = _build_daytrade_validation_cases(df_scope)
-        if not cases:
-            return {
-                "ok": False,
-                "error": "no_daytrade_cases",
-                "cases": [],
-                "report_config": {
-                    "bar_interval": str(bar_interval),
-                    "report_period": str(report_period),
-                    "signals_total": int(len(df_signals)) if isinstance(df_signals, pd.DataFrame) else 0,
-                    "signals_in_scope": int(len(df_scope)) if isinstance(df_scope, pd.DataFrame) else 0,
-                },
-            }
-        bars_map = _fetch_daytrade_validation_bars(cases, interval=bar_interval, period=report_period)
-        bar_minutes = 15 if str(bar_interval) == "15m" else (5 if str(bar_interval) == "5m" else 60)
-        runner = getattr(logic, "run_daytrade_validation_report", None)
-        if not callable(runner):
-            return {"ok": False, "error": "validation_engine_not_available", "cases": cases}
-        rep = runner(cases, bars_map, bar_minutes=bar_minutes)
-        if not isinstance(rep, dict):
-            return {"ok": False, "error": "invalid_validation_report"}
-        rep["cases"] = cases
-        rep["bars_loaded"] = {k: int(len(v)) for k, v in bars_map.items() if isinstance(v, pd.DataFrame)}
-        rep["bar_interval"] = str(bar_interval)
-        rep["period"] = str(report_period)
-        rep["report_config"] = {
+        base_config = {
             "bar_interval": str(bar_interval),
             "report_period": str(report_period),
             "signals_total": int(len(df_signals)) if isinstance(df_signals, pd.DataFrame) else 0,
             "signals_in_scope": int(len(df_scope)) if isinstance(df_scope, pd.DataFrame) else 0,
             "cases_built": int(len(cases)),
+            "cases_ready": 0,
+            "bars_loaded": 0,
+            "bars_loaded_symbols": 0,
+            "cases_skipped_interval_mismatch": 0,
+            "cases_failed_fetch": 0,
+            "actual_interval_used": "—",
         }
+        if not cases:
+            return {
+                "ok": False,
+                "error": "no_daytrade_cases",
+                "cases": [],
+                "results": [],
+                "fetch_meta_by_symbol": {},
+                "report_config": base_config,
+            }
+
+        bars_map, fetch_meta_by_symbol = _fetch_daytrade_validation_bars(cases, interval=bar_interval, period=report_period)
+        enriched_cases: List[Dict[str, Any]] = []
+        cases_ready: List[Dict[str, Any]] = []
+        diagnostic_rows: List[Dict[str, Any]] = []
+        cases_failed_fetch = 0
+        cases_skipped_interval_mismatch = 0
+
+        for case in cases:
+            pair = str(case.get("pair", "") or "")
+            symbol = str(case.get("symbol", "") or _pair_label_to_symbol(pair) or "")
+            meta = fetch_meta_by_symbol.get(symbol, {}) if isinstance(fetch_meta_by_symbol, dict) else {}
+            case_with_meta = dict(case)
+            case_with_meta.update({
+                "requested_interval": str(meta.get("requested_interval") or bar_interval),
+                "actual_interval_used": str(meta.get("actual_interval_used") or bar_interval),
+                "fetch_source": str(meta.get("source") or ""),
+                "fetch_error": str(meta.get("error") or ""),
+                "fetch_ok": bool(meta.get("fetch_ok", False)),
+                "interval_mismatch": bool(meta.get("interval_mismatch", False)),
+                "bars_loaded": int(meta.get("bars_loaded", 0) or 0),
+            })
+            enriched_cases.append(case_with_meta)
+
+            if not bool(meta.get("fetch_ok", False)):
+                cases_failed_fetch += 1
+                diagnostic_rows.append(_diag_case_row(case_with_meta, "FETCH_FAILED"))
+                continue
+
+            if str(bar_interval).strip().lower() == "1h" and bool(meta.get("interval_mismatch", False)):
+                cases_skipped_interval_mismatch += 1
+                diagnostic_rows.append(_diag_case_row(case_with_meta, "SKIPPED_INTERVAL_MISMATCH"))
+                continue
+
+            case_with_meta["case_status"] = "READY"
+            cases_ready.append(case_with_meta)
+
+        base_config.update({
+            "cases_ready": int(len(cases_ready)),
+            "bars_loaded": int(sum(int((meta or {}).get("bars_loaded", 0) or 0) for meta in (fetch_meta_by_symbol or {}).values() if isinstance(meta, dict) and bool(meta.get("usable_for_validation", False)))),
+            "bars_loaded_symbols": int(sum(1 for meta in (fetch_meta_by_symbol or {}).values() if isinstance(meta, dict) and bool(meta.get("usable_for_validation", False)))),
+            "cases_skipped_interval_mismatch": int(cases_skipped_interval_mismatch),
+            "cases_failed_fetch": int(cases_failed_fetch),
+            "actual_interval_used": _interval_summary(fetch_meta_by_symbol),
+        })
+
+        if not cases_ready:
+            return {
+                "ok": False,
+                "error": "no_usable_daytrade_cases",
+                "cases": enriched_cases,
+                "results": diagnostic_rows,
+                "fetch_meta_by_symbol": fetch_meta_by_symbol,
+                "bars_loaded": {k: int(v.get("bars_loaded", 0) or 0) for k, v in (fetch_meta_by_symbol or {}).items() if isinstance(v, dict)},
+                "bar_interval": str(bar_interval),
+                "period": str(report_period),
+                "report_config": base_config,
+            }
+
+        bar_minutes = 15 if str(bar_interval) == "15m" else (5 if str(bar_interval) == "5m" else 60)
+        runner = getattr(logic, "run_daytrade_validation_report", None)
+        if not callable(runner):
+            return {
+                "ok": False,
+                "error": "validation_engine_not_available",
+                "cases": enriched_cases,
+                "results": diagnostic_rows,
+                "fetch_meta_by_symbol": fetch_meta_by_symbol,
+                "bars_loaded": {k: int(v.get("bars_loaded", 0) or 0) for k, v in (fetch_meta_by_symbol or {}).items() if isinstance(v, dict)},
+                "bar_interval": str(bar_interval),
+                "period": str(report_period),
+                "report_config": base_config,
+            }
+        rep = runner(cases_ready, bars_map, bar_minutes=bar_minutes)
+        if not isinstance(rep, dict):
+            return {
+                "ok": False,
+                "error": "invalid_validation_report",
+                "cases": enriched_cases,
+                "results": diagnostic_rows,
+                "fetch_meta_by_symbol": fetch_meta_by_symbol,
+                "bars_loaded": {k: int(v.get("bars_loaded", 0) or 0) for k, v in (fetch_meta_by_symbol or {}).items() if isinstance(v, dict)},
+                "bar_interval": str(bar_interval),
+                "period": str(report_period),
+                "report_config": base_config,
+            }
+        rep["cases"] = enriched_cases
+        rep_results = rep.get("results", []) if isinstance(rep.get("results", []), list) else []
+        rep["results"] = list(rep_results) + diagnostic_rows
+        rep["fetch_meta_by_symbol"] = fetch_meta_by_symbol
+        rep["bars_loaded"] = {k: int(v.get("bars_loaded", 0) or 0) for k, v in (fetch_meta_by_symbol or {}).items() if isinstance(v, dict)}
+        rep["bar_interval"] = str(bar_interval)
+        rep["period"] = str(report_period)
+        rep["report_config"] = base_config
         return rep
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
-
 
 def _render_daytrade_validation_panel(df_signals: pd.DataFrame):
     st.markdown("### デイトレ検証レポート")
@@ -1434,15 +1598,28 @@ def _render_daytrade_validation_panel(df_signals: pd.DataFrame):
 
     cfg = rep.get("report_config", {}) if isinstance(rep.get("report_config", {}), dict) else {}
     if cfg:
-        x1, x2, x3, x4 = st.columns(4)
-        x1.metric("検証足", str(cfg.get("bar_interval") or rep.get("bar_interval") or "—"))
-        x2.metric("対象期間", str(cfg.get("report_period") or rep.get("period") or "—"))
-        x3.metric("対象signals件数", f"{int(cfg.get('signals_in_scope', 0))}")
-        x4.metric("構築case数", f"{int(cfg.get('cases_built', 0))}" if cfg.get("cases_built") is not None else "—")
+        top1, top2, top3, top4 = st.columns(4)
+        top1.metric("検証足", str(cfg.get("bar_interval") or rep.get("bar_interval") or "—"))
+        top2.metric("対象期間", str(cfg.get("report_period") or rep.get("period") or "—"))
+        top3.metric("signals_in_scope", f"{int(cfg.get('signals_in_scope', 0))}")
+        top4.metric("cases_built", f"{int(cfg.get('cases_built', 0))}")
+
+        mid1, mid2, mid3 = st.columns(3)
+        mid1.metric("bars_loaded", f"{int(cfg.get('bars_loaded', 0))}")
+        mid2.metric("cases_skipped_interval_mismatch", f"{int(cfg.get('cases_skipped_interval_mismatch', 0))}")
+        mid3.metric("cases_failed_fetch", f"{int(cfg.get('cases_failed_fetch', 0))}")
+
+        st.caption(f"actual_interval_used: {str(cfg.get('actual_interval_used') or '—')}")
 
     if not rep.get("ok"):
         st.warning(f"デイトレ検証を作成できませんでした: {rep.get('error','unknown')}")
-        if rep.get("cases"):
+        results = rep.get("results", []) if isinstance(rep.get("results", []), list) else []
+        if results:
+            df_fail = pd.DataFrame(results)
+            fail_cols = [c for c in ["case_id", "source", "pair", "direction", "requested_interval", "actual_interval_used", "fetch_source", "fetch_error", "bars_loaded", "exit_reason"] if c in df_fail.columns]
+            if fail_cols:
+                st.dataframe(df_fail[fail_cols], use_container_width=True)
+        elif rep.get("cases"):
             st.dataframe(pd.DataFrame(rep.get("cases", [])), use_container_width=True)
         return
 
@@ -1469,11 +1646,22 @@ def _render_daytrade_validation_panel(df_signals: pd.DataFrame):
     results = rep.get("results", []) if isinstance(rep.get("results", []), list) else []
     if results:
         df_r = pd.DataFrame(results)
-        show_cols = [c for c in ["case_id", "source", "pair", "direction", "entry_type", "triggered", "tp1_hit", "tp2_hit", "time_exit", "be_exit", "sl_hit", "final_r", "mfe_r", "mae_r", "bars_held", "exit_reason", "entry_ts", "exit_ts"] if c in df_r.columns]
+        show_cols = [
+            c for c in [
+                "case_id", "source", "pair", "direction", "entry_type", "requested_interval", "actual_interval_used",
+                "fetch_source", "fetch_error", "bars_loaded", "triggered", "tp1_hit", "tp2_hit", "time_exit",
+                "be_exit", "sl_hit", "final_r", "mfe_r", "mae_r", "bars_held", "exit_reason", "entry_ts", "exit_ts"
+            ] if c in df_r.columns
+        ]
         st.dataframe(df_r[show_cols], use_container_width=True)
         try:
+            summary_payload = {
+                "summary": summary,
+                "report_config": cfg,
+                "fetch_meta_by_symbol": rep.get("fetch_meta_by_symbol", {}),
+            }
             st.download_button("daytrade_validation_detail.csv をダウンロード", data=df_r.to_csv(index=False).encode("utf-8"), file_name="daytrade_validation_detail.csv", mime="text/csv")
-            st.download_button("daytrade_validation_summary.json をダウンロード", data=_safe_json_dump({"summary": summary, "report_config": cfg}).encode("utf-8"), file_name="daytrade_validation_summary.json", mime="application/json")
+            st.download_button("daytrade_validation_summary.json をダウンロード", data=_safe_json_dump(summary_payload).encode("utf-8"), file_name="daytrade_validation_summary.json", mime="application/json")
         except Exception:
             pass
 
