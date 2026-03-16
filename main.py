@@ -2545,6 +2545,7 @@ def _apply_sbi_minlot_guard(plan: dict, *, sbi_min_lot: int = 1) -> dict:
         intraday_quality = float(plan.get("intraday_entry_quality") or (ctx.get("intraday_entry_quality") if isinstance(ctx, dict) else 0.0) or 0.0)
         timing_score = float(plan.get("entry_timing_score") or (ctx.get("entry_timing_score") if isinstance(ctx, dict) else 0.0) or 0.0)
         hp_score = float(plan.get("high_precision_tp_score") or (ctx.get("high_precision_tp_score") if isinstance(ctx, dict) else 0.0) or 0.0)
+        hp_grade = str(plan.get("high_precision_tp_grade") or (ctx.get("high_precision_tp_grade") if isinstance(ctx, dict) else "C") or "C")
         hp_candidate = bool(plan.get("high_precision_tp_candidate") or (ctx.get("high_precision_tp_candidate") if isinstance(ctx, dict) else False))
         breakout_ok = bool((ctx.get("breakout_ok") if isinstance(ctx, dict) else False) or plan.get("breakout_ok", False))
         structure_ok = bool((ctx.get("structure_effective_dir_ok") if isinstance(ctx, dict) else False) or plan.get("structure_effective_dir_ok", False))
@@ -2569,15 +2570,15 @@ def _apply_sbi_minlot_guard(plan: dict, *, sbi_min_lot: int = 1) -> dict:
 
         desired_lots = float(max(int(sbi_min_lot), 1))
         lot_reason = "base_1lot"
-        if hp_candidate and quality >= 0.72 and confidence >= 0.58 and p_eff >= 0.50 and ev >= 0.10:
+        if hp_candidate and hp_grade in ("A-", "A") and quality >= 0.80 and confidence >= 0.60 and p_eff >= 0.52 and ev >= 0.12 and (breakout_ok or structure_ok):
             desired_lots = 2.0
-            lot_reason = "high_precision_2lots"
-        if hp_candidate and quality >= 0.84 and confidence >= 0.66 and p_eff >= 0.54 and ev >= 0.18 and rr >= 1.30:
+            lot_reason = "high_precision_Aminus_2lots"
+        if hp_candidate and hp_grade == "A" and quality >= 0.90 and confidence >= 0.68 and p_eff >= 0.56 and ev >= 0.20 and rr >= 1.35 and breakout_ok and structure_ok:
             desired_lots = 3.0
-            lot_reason = "high_precision_3lots"
-        if hp_candidate and quality >= 0.96 and confidence >= 0.74 and p_eff >= 0.58 and ev >= 0.28 and rr >= 1.45 and (breakout_ok or structure_ok):
+            lot_reason = "high_precision_A_3lots"
+        if hp_candidate and hp_grade == "A" and quality >= 1.00 and confidence >= 0.76 and p_eff >= 0.60 and ev >= 0.30 and rr >= 1.50 and breakout_ok and structure_ok:
             desired_lots = 4.0
-            lot_reason = "high_precision_4lots"
+            lot_reason = "high_precision_A_4lots"
 
         exec_lots = int(max(float(sbi_min_lot), round(desired_lots)))
         plan["_sbi"] = {
@@ -3600,7 +3601,8 @@ def _render_top_trade_panel(pair_label: str, plan: Dict[str, Any], current_price
         timing_mode = str(plan.get("entry_timing_mode") or (plan.get("_ctx") or {}).get("entry_timing_mode") or "—")
         hp_tp = bool(plan.get("high_precision_tp_candidate") or (plan.get("_ctx") or {}).get("high_precision_tp_candidate", False))
         hp_score = float(plan.get("high_precision_tp_score") or (plan.get("_ctx") or {}).get("high_precision_tp_score", 0.0) or 0.0)
-        st.caption(f"判定モード: {gate_mode} / EV(生)={ev_raw:+.3f} / EV(調整後)={ev_adj:+.3f} / 構造擬似OK={'ON' if pseudo_ok else 'OFF'} / 高精度TP={'ON' if hp_tp else 'OFF'}({hp_score:.2f}) / entry={timing_mode} / 下位足逆向き={opp_mode}")
+        hp_grade = str(plan.get("high_precision_tp_grade") or (plan.get("_ctx") or {}).get("high_precision_tp_grade", "C") or "C")
+        st.caption(f"判定モード: {gate_mode} / EV(生)={ev_raw:+.3f} / EV(調整後)={ev_adj:+.3f} / 構造擬似OK={'ON' if pseudo_ok else 'OFF'} / 高精度TP={'ON' if hp_tp else 'OFF'}({hp_score:.2f}, {hp_grade}) / entry={timing_mode} / 下位足逆向き={opp_mode}")
 
     r3c1, r3c2 = st.columns(2)
     r3c1.metric("信頼度", f"{confidence:.2f}")
@@ -3662,6 +3664,7 @@ def _render_top_trade_panel(pair_label: str, plan: Dict[str, Any], current_price
 
         hp_tp = bool(plan.get("high_precision_tp_candidate") or False)
         hp_score = float(plan.get("high_precision_tp_score") or 0.0)
+        hp_grade = str(plan.get("high_precision_tp_grade") or "C")
         tp1 = plan.get("tp1", None)
         tp2 = plan.get("tp2", None)
         hp_reason = str(plan.get("high_precision_tp_reason") or "")
@@ -3674,7 +3677,8 @@ def _render_top_trade_panel(pair_label: str, plan: Dict[str, Any], current_price
 - **利確(TP)**: {_fmt_price(tp)}
 - **分割利確TP1**: {_fmt_price(tp1)}
 - **最終利確TP2**: {_fmt_price(tp2)}
-- **高精度TP候補**: {'ON' if hp_tp else 'OFF'}（score {hp_score:.2f}）
+- **高精度TP候補**: {'ON' if hp_tp else 'OFF'}（score {hp_score:.2f} / grade {hp_grade}）
+- **高精度TP理由**: {hp_reason or '—'}
 """)
         st.caption(f"参考：勝率推定 p_win={p_win_ev:.2f}（あくまでモデル推定） / 高精度TP理由: {hp_reason or '—'}")
     else:
