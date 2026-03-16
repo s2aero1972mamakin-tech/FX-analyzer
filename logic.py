@@ -100,12 +100,23 @@ def _entry_timing_filter(df, direction):
         h = df["High"].astype(float)
         l = df["Low"].astype(float)
         c = df["Close"].astype(float)
-        if len(c) < 3:
+        if len(c) < 4:
             return True
+        last_rng = max(1e-9, float(h.iloc[-1] - l.iloc[-1]))
+        prev_rng = max(1e-9, float(h.iloc[-2] - l.iloc[-2]))
+        direction = str(direction).upper()
         if direction == "LONG":
-            cond = (c.iloc[-1] > c.iloc[-2]) and (c.iloc[-1] > o.iloc[-1])
+            body_ok = (c.iloc[-1] > o.iloc[-1]) and (c.iloc[-1] >= c.iloc[-2])
+            follow_ok = (c.iloc[-2] > c.iloc[-3]) and (c.iloc[-1] >= c.iloc[-2] - 0.25 * prev_rng)
+            breakout_ok = c.iloc[-1] >= max(h.iloc[-2], c.iloc[-2]) - 0.10 * last_rng
+            reclaim_ok = (c.iloc[-1] > (h.iloc[-2] + l.iloc[-2]) * 0.5) and (c.iloc[-1] > o.iloc[-1])
+            cond = body_ok or (follow_ok and breakout_ok) or reclaim_ok
         else:
-            cond = (c.iloc[-1] < c.iloc[-2]) and (c.iloc[-1] < o.iloc[-1])
+            body_ok = (c.iloc[-1] < o.iloc[-1]) and (c.iloc[-1] <= c.iloc[-2])
+            follow_ok = (c.iloc[-2] < c.iloc[-3]) and (c.iloc[-1] <= c.iloc[-2] + 0.25 * prev_rng)
+            breakout_ok = c.iloc[-1] <= min(l.iloc[-2], c.iloc[-2]) + 0.10 * last_rng
+            reclaim_ok = (c.iloc[-1] < (h.iloc[-2] + l.iloc[-2]) * 0.5) and (c.iloc[-1] < o.iloc[-1])
+            cond = body_ok or (follow_ok and breakout_ok) or reclaim_ok
         return bool(cond)
     except Exception:
         return True
@@ -174,16 +185,16 @@ def _resolve_trade_profile(ctx_in: Dict[str, Any]) -> Dict[str, Any]:
             "is_intraday": True,
             "lookback": 12,
             "liquidity_lookback": 18,
-            "sl_atr_mult": 0.95,
+            "sl_atr_mult": 0.90,
             "sl_buffer_atr": 0.10,
-            "tp_breakout": 1.85,
-            "tp_trend": 1.55,
-            "tp_transition": 1.30,
-            "tp_range": 1.05,
+            "tp_breakout": 1.90,
+            "tp_trend": 1.60,
+            "tp_transition": 1.32,
+            "tp_range": 1.08,
             "event_preblock_hours": float(_clamp(_safe_float((ctx_in or {}).get("event_preblock_hours", 6.0), 6.0), 2.0, 24.0)),
             "event_market_ban_hours": float(_clamp(_safe_float((ctx_in or {}).get("event_market_ban_hours", 4.0), 4.0), 1.0, 12.0)),
-            "threshold_bias": 0.015,
-            "rr_floor": max(1.05, float(_safe_float((ctx_in or {}).get("rr_min_floor", 1.0), 1.0))),
+            "threshold_bias": -0.010,
+            "rr_floor": max(0.95, float(_safe_float((ctx_in or {}).get("rr_min_floor", 0.95), 0.95))),
             "partial_r": 0.60,
             "trail_trigger_r": 0.90,
             "be_trigger_r": 0.40,
@@ -371,6 +382,47 @@ def _cap_daytrade_tp1_to_liquidity(entry: float, tp1: Optional[float], tp2: floa
         return float(capped), bool(capped > tp1 + 1e-12)
     except Exception:
         return (float(tp1) if tp1 is not None else None), False
+
+
+def _intraday_entry_quality(
+    strength: float,
+    breakout_ok: bool,
+    range_edge_setup: bool,
+    structure_dir_ok: bool,
+    direction: str,
+    mom: float,
+    mtf_fast: Optional[Dict[str, Any]],
+    mtf_micro: Optional[Dict[str, Any]],
+    mtf_alignment_score: float,
+) -> float:
+    try:
+        score = 0.18
+        score += 0.22 * float(_clamp(strength, 0.0, 1.0))
+        score += 0.16 if bool(breakout_ok) else 0.0
+        score += 0.12 if bool(range_edge_setup) else 0.0
+        score += 0.10 if bool(structure_dir_ok) else 0.0
+        score += 0.12 * max(0.0, float(_clamp(mtf_alignment_score, -1.0, 1.0)))
+        if isinstance(mtf_fast, dict):
+            score += 0.10 if bool(mtf_fast.get("dir_ok", False)) else -0.04
+            score += 0.06 * max(0.0, float(_clamp(mtf_fast.get("score", 0.0), -1.0, 1.0)))
+        if isinstance(mtf_micro, dict):
+            score += 0.10 if bool(mtf_micro.get("dir_ok", False)) else -0.05
+            score += 0.08 * max(0.0, float(_clamp(mtf_micro.get("score", 0.0), -1.0, 1.0)))
+        if str(direction).upper() == "LONG" and float(mom) > 0:
+            score += 0.08 * float(_clamp(abs(mom), 0.0, 1.0))
+        if str(direction).upper() == "SHORT" and float(mom) < 0:
+            score += 0.08 * float(_clamp(abs(mom), 0.0, 1.0))
+        return float(_clamp(score, 0.0, 1.0))
+    except Exception:
+        return 0.0
+
+
+def _intraday_entry_rescue_margin(score: float) -> float:
+    try:
+        q = float(_clamp(score, 0.0, 1.0))
+        return float(_clamp(0.02 + 0.08 * q, 0.02, 0.10))
+    except Exception:
+        return 0.04
 
 
 def _compress_daytrade_tp2(entry: float, sl: float, tp2: float, direction: str, mtf_alignment_score: float, fast_tf_dir_ok: Optional[bool], micro_tf_dir_ok: Optional[bool], fast_df: Optional[pd.DataFrame], liq_tp: Optional[float]) -> Tuple[float, float, bool, bool, str]:
@@ -2319,6 +2371,8 @@ def get_ai_order_strategy(
     mtf_fast = {}
     mtf_micro = {}
     mtf_alignment_score = 0.0
+    range_edge_setup = False
+    intraday_entry_quality = 0.0
     if bool(trade_profile.get("is_intraday")):
         fast_df = _ctx_dataframe(ctx_in, "_df_fast_15m", "df_fast_15m", "_df_15m")
         micro_df = _ctx_dataframe(ctx_in, "_df_micro_5m", "df_micro_5m", "_df_5m")
@@ -2332,6 +2386,17 @@ def get_ai_order_strategy(
             entry, sl, tp, direction, trade_profile, atr14, recent_low, recent_high, liq_lookback,
             fast_df if isinstance(fast_df, pd.DataFrame) else None, mtf_fast,
             micro_df if isinstance(micro_df, pd.DataFrame) else None, mtf_micro,
+        )
+        intraday_entry_quality = _intraday_entry_quality(
+            strength=float(strength),
+            breakout_ok=bool(breakout_ok),
+            range_edge_setup=bool(range_edge_setup),
+            structure_dir_ok=bool(structure_dir_ok),
+            direction=str(direction),
+            mom=float(mom),
+            mtf_fast=(mtf_fast if isinstance(mtf_fast, dict) else None),
+            mtf_micro=(mtf_micro if isinstance(mtf_micro, dict) else None),
+            mtf_alignment_score=float(mtf_alignment_score or 0.0),
         )
         reward = abs(tp - entry)
     tp2 = tp
@@ -2352,7 +2417,9 @@ def get_ai_order_strategy(
         rr = reward / max(risk, 1e-9)
     rr_min = float(trade_profile.get("rr_floor", ctx_in.get("rr_min_floor", 1.0)) or 1.0)
     if bool(trade_profile.get("is_intraday")) and mtf_alignment_score >= 0.35:
-        rr_min = max(0.95, rr_min - 0.10)
+        rr_min = max(0.90, rr_min - 0.12)
+    if bool(trade_profile.get("is_intraday")) and intraday_entry_quality >= 0.62:
+        rr_min = max(0.88, rr_min - 0.08)
     rr_floor_fail = bool(rr < rr_min)
     partial_tp = _compute_profile_partial_tp(
         entry, sl, tp2, direction, trade_profile, phase_label, strength,
@@ -2375,7 +2442,7 @@ def get_ai_order_strategy(
         p_win_model = 0.46 + 0.42 * _clamp((float(p_dn) - 0.5) * 2.0, -1.0, 1.0) + 0.10 * (float(strength) - 0.5)
     p_win_model = float(_clamp(p_win_model - _failure_features(df), 0.20, 0.80))
     if bool(trade_profile.get("is_intraday")):
-        p_win_model = float(_clamp(p_win_model + 0.10 * float(mtf_alignment_score or 0.0), 0.20, 0.85))
+        p_win_model = float(_clamp(p_win_model + 0.10 * float(mtf_alignment_score or 0.0) + 0.06 * float(intraday_entry_quality or 0.0), 0.20, 0.86))
 
     # 信頼度（0..1）
     structure_ok_dir = (breakout_ok or (hhhl_ok if direction == "LONG" else lllh_ok))
@@ -2392,13 +2459,13 @@ def get_ai_order_strategy(
     if not structure_dir_ok:
         confidence = float(_clamp(confidence * 0.70, 0.0, 1.0))
     if bool(trade_profile.get("is_intraday")):
-        confidence = float(_clamp(confidence + 0.14 * float(mtf_alignment_score or 0.0), 0.0, 1.0))
+        confidence = float(_clamp(confidence + 0.14 * float(mtf_alignment_score or 0.0) + 0.10 * float(intraday_entry_quality or 0.0), 0.0, 1.0))
 
     # p_eff: confidenceが低いほど0.5に寄せる（整合崩れ対策）
     conf_k = float(_clamp(confidence / 0.75, 0.0, 1.0))
     p_eff = float(_clamp(0.5 + (p_win_model - 0.5) * conf_k, 0.20, 0.80))
     if bool(trade_profile.get("is_intraday")):
-        p_eff = float(_clamp(p_eff + 0.08 * float(mtf_alignment_score or 0.0), 0.20, 0.82))
+        p_eff = float(_clamp(p_eff + 0.08 * float(mtf_alignment_score or 0.0) + 0.05 * float(intraday_entry_quality or 0.0), 0.20, 0.84))
 
     # EV (R): EV = p*RR - (1-p)*1
     ev_raw = float(p_eff * float(rr) - (1.0 - p_eff) * 1.0)
@@ -2513,7 +2580,13 @@ def get_ai_order_strategy(
     dynamic_threshold = float(_clamp(dynamic_threshold + 0.03 * float(macro_risk), 0.02, 0.30))
     dynamic_threshold = float(_clamp(dynamic_threshold + float(trade_profile.get("threshold_bias", 0.0) or 0.0), 0.02, 0.30))
     if bool(trade_profile.get("is_intraday")):
-        dynamic_threshold = float(_clamp(dynamic_threshold - 0.015 * max(0.0, float(mtf_alignment_score or 0.0)) + 0.020 * max(0.0, -float(mtf_alignment_score or 0.0)), 0.02, 0.30))
+        dynamic_threshold = float(_clamp(
+            dynamic_threshold
+            - 0.015 * max(0.0, float(mtf_alignment_score or 0.0))
+            - 0.020 * max(0.0, float(intraday_entry_quality or 0.0) - 0.55)
+            + 0.014 * max(0.0, -float(mtf_alignment_score or 0.0)),
+            0.02, 0.30
+        ))
 
     # upcoming event / weekend / weekcross: threshold add (but do not cause perpetual NO)
     try:
@@ -2621,6 +2694,19 @@ def get_ai_order_strategy(
     except Exception:
         range_edge_setup = False
 
+    if bool(trade_profile.get("is_intraday")):
+        intraday_entry_quality = _intraday_entry_quality(
+            strength=float(strength),
+            breakout_ok=bool(breakout_ok),
+            range_edge_setup=bool(range_edge_setup),
+            structure_dir_ok=bool(structure_dir_ok),
+            direction=str(direction),
+            mom=float(mom),
+            mtf_fast=(mtf_fast if isinstance(mtf_fast, dict) else None),
+            mtf_micro=(mtf_micro if isinstance(mtf_micro, dict) else None),
+            mtf_alignment_score=float(mtf_alignment_score or 0.0),
+        )
+
     # 全体の構造妥当性
     structure_ok = True
     if phase_label == "RANGE":
@@ -2635,6 +2721,15 @@ def get_ai_order_strategy(
         structure_ok = bool(breakout_ok or (hhhl_ok if direction == "LONG" else lllh_ok))
     if bool(trade_profile.get("is_intraday")) and float(mtf_alignment_score or 0.0) <= -0.20:
         structure_ok = False
+    structure_rescue_used = False
+    if bool(trade_profile.get("is_intraday")) and not structure_ok:
+        structure_rescue_used = bool(
+            float(intraday_entry_quality or 0.0) >= 0.66
+            and float(mtf_alignment_score or 0.0) >= 0.18
+            and (bool(breakout_ok) or bool(range_edge_setup) or abs(float(mom)) >= 0.18)
+        )
+        if structure_rescue_used:
+            structure_ok = True
 
     # -----------------------------------------------------------------
     # 10) veto/decision（veto乱立を抑える）
@@ -2649,6 +2744,23 @@ def get_ai_order_strategy(
 
     why = ""
     gate_mode = "raw+mom"
+    entry_timing_ok = _entry_timing_filter(df, direction)
+    entry_timing_rescue_used = False
+    if bool(trade_profile.get("is_intraday")) and not entry_timing_ok:
+        entry_timing_rescue_used = bool(
+            float(intraday_entry_quality or 0.0) >= 0.72
+            and float(mtf_alignment_score or 0.0) >= 0.25
+            and (bool(breakout_pass) or bool(range_edge_setup))
+        )
+        if entry_timing_rescue_used:
+            entry_timing_ok = True
+    intraday_rescue_margin = _intraday_entry_rescue_margin(float(intraday_entry_quality or 0.0)) if bool(trade_profile.get("is_intraday")) else 0.0
+    sbi_conf_floor = 0.42
+    if bool(trade_profile.get("is_intraday")):
+        if float(intraday_entry_quality or 0.0) >= 0.72 and float(ev_gate) >= float(dynamic_threshold) + 0.01:
+            sbi_conf_floor = 0.34
+        elif float(intraday_entry_quality or 0.0) >= 0.62 or float(mtf_alignment_score or 0.0) >= 0.25:
+            sbi_conf_floor = 0.37
 
     if rr_floor_fail:
         _veto(f"RR不足: {rr:.2f} < {rr_min:.2f}")
@@ -2679,17 +2791,27 @@ def get_ai_order_strategy(
         # EV gate (post-breakout has its own rescue)
         if ev_gate >= float(dynamic_threshold):
             decision = "TRADE"
-            if bool(ctx_in.get("sbi_min_lot_guard", True)) and int(ctx_in.get("sbi_min_lot", 1) or 1) >= 1 and float(confidence) < 0.42:
+            if bool(ctx_in.get("sbi_min_lot_guard", True)) and int(ctx_in.get("sbi_min_lot", 1) or 1) >= 1 and float(confidence) < float(sbi_conf_floor):
                 decision = "NO_TRADE"
                 _veto("SBI最小1建リスク")
-            if not _entry_timing_filter(df, direction):
+            if not entry_timing_ok:
                 decision = "NO_TRADE"
-                veto.append("Entry timing filter rejected")
+                _veto("Entry timing filter rejected")
             why = f"EV通過: {ev_gate:+.3f} ≥ 動的閾値 {float(dynamic_threshold):.3f}"
         elif event_mode == "POST_BREAKOUT" and (ev_gate >= float(dynamic_threshold) - 0.08) and float(confidence) >= 0.42:
             decision = "TRADE"
             gate_mode = "post_breakout_rescue"
             why = f"イベント後捕獲（1〜24hブレイク専用）: EV {ev_gate:+.3f} / 閾値 {float(dynamic_threshold):.3f}（救済）"
+        elif bool(trade_profile.get("is_intraday")) and float(intraday_entry_quality or 0.0) >= 0.64 and float(confidence) >= 0.36 and (bool(breakout_pass) or bool(range_edge_setup) or float(mtf_alignment_score or 0.0) >= 0.30) and (ev_gate >= float(dynamic_threshold) - float(intraday_rescue_margin)):
+            decision = "TRADE"
+            gate_mode = "intraday_precision_rescue"
+            why = f"デイトレ精密救済: EV {ev_gate:+.3f} / 閾値 {float(dynamic_threshold):.3f} / 品質 {float(intraday_entry_quality):.2f}"
+            if bool(ctx_in.get("sbi_min_lot_guard", True)) and int(ctx_in.get("sbi_min_lot", 1) or 1) >= 1 and float(confidence) < max(0.34, float(sbi_conf_floor) - 0.02):
+                decision = "NO_TRADE"
+                _veto("SBI最小1建リスク")
+            if not entry_timing_ok:
+                decision = "NO_TRADE"
+                _veto("Entry timing filter rejected")
         elif breakout_pass and (ev_gate >= float(dynamic_threshold) - 0.04):
             decision = "TRADE"
             gate_mode = "breakout_rescue"
@@ -2848,6 +2970,10 @@ def get_ai_order_strategy(
         "stale_after_hours": float(trade_profile.get("stale_after_hours", 0.0) or 0.0),
         "be_trigger_r": float(trade_profile.get("be_trigger_r", 0.0) or 0.0),
         "trail_trigger_r": float(trade_profile.get("trail_trigger_r", 0.0) or 0.0),
+        "intraday_entry_quality": float(intraday_entry_quality or 0.0),
+        "structure_rescue_used": bool(structure_rescue_used),
+        "entry_timing_rescue_used": bool(entry_timing_rescue_used),
+        "sbi_conf_floor": float(sbi_conf_floor),
     }
 
     # -----------------------------------------------------------------
@@ -3118,6 +3244,10 @@ def get_ai_order_strategy(
 
         "dynamic_threshold": float(dynamic_threshold),
         "gate_mode": str(gate_mode),
+        "intraday_entry_quality": float(intraday_entry_quality or 0.0),
+        "structure_rescue_used": bool(structure_rescue_used),
+        "entry_timing_rescue_used": bool(entry_timing_rescue_used),
+        "sbi_conf_floor": float(sbi_conf_floor),
 
         "confidence": float(confidence),
         "p_win": float(p_eff),       # UIには縮退後を提示（整合性を優先）
@@ -3394,30 +3524,18 @@ def evaluate_daytrade_validation_case(case: Dict[str, Any], bars: Optional[pd.Da
         "exit_ts": None,
         "partial_realized_r": 0.0,
         "remaining_size": 1.0,
-        "pending_future_bars": False,
-        "latest_closed_bar_ts": None,
-        "signal_after_latest_closed_bar": False,
     }
     try:
         d = _dtv_prepare_bars(bars)
         if d.empty:
             out["error"] = "empty_bars"
             return out
-        latest_closed_bar_ts = d.index[-1] if len(d.index) > 0 else None
-        out["latest_closed_bar_ts"] = latest_closed_bar_ts.isoformat() if hasattr(latest_closed_bar_ts, "isoformat") else (str(latest_closed_bar_ts) if latest_closed_bar_ts is not None else None)
         ts_open = _dtv_parse_ts((case or {}).get("ts_utc") or (case or {}).get("entry_ts"))
         if ts_open is None:
             ts_open = d.index[0]
-        signal_after_latest_closed_bar = bool(latest_closed_bar_ts is not None and ts_open is not None and ts_open > latest_closed_bar_ts)
-        out["signal_after_latest_closed_bar"] = signal_after_latest_closed_bar
         d = d.loc[d.index >= ts_open].copy()
         if d.empty:
-            out.update({
-                "ok": True,
-                "pending_future_bars": True,
-                "exit_reason": "PENDING_FUTURE_BARS",
-                "error": "no_forward_bars",
-            })
+            out["error"] = "no_forward_bars"
             return out
 
         direction = str((case or {}).get("direction", "LONG")).upper()
@@ -3620,15 +3738,10 @@ def evaluate_daytrade_validation_case(case: Dict[str, Any], bars: Optional[pd.Da
 def build_daytrade_validation_summary(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     try:
         rows = [r for r in (results or []) if isinstance(r, dict)]
-        pending = [
-            r for r in rows
-            if bool(r.get("pending_future_bars")) or str(r.get("exit_reason", "")).upper() == "PENDING_FUTURE_BARS"
-        ]
         triggered = [r for r in rows if r.get("triggered")]
         realized = [r for r in triggered if r.get("ok")]
         n_all = len(rows)
         n_trg = len(triggered)
-        n_pending = len(pending)
         def _rate(key, base):
             if base <= 0:
                 return 0.0
@@ -3639,7 +3752,6 @@ def build_daytrade_validation_summary(results: List[Dict[str, Any]]) -> Dict[str
         out = {
             "cases_total": int(n_all),
             "cases_triggered": int(n_trg),
-            "cases_pending_future_bars": int(n_pending),
             "trigger_rate": float(n_trg / n_all) if n_all > 0 else 0.0,
             "tp1_hit_rate": _rate("tp1_hit", n_trg),
             "tp2_hit_rate": _rate("tp2_hit", n_trg),
@@ -3659,7 +3771,6 @@ def build_daytrade_validation_summary(results: List[Dict[str, Any]]) -> Dict[str
             rs = [float(r.get("final_r", 0.0) or 0.0) for r in subset]
             by_source[src] = {
                 "n": int(len(subset)),
-                "pending_future_bars": int(sum(1 for r in rows if str(r.get("source", "LIVE")) == src and (bool(r.get("pending_future_bars")) or str(r.get("exit_reason", "")).upper() == "PENDING_FUTURE_BARS"))),
                 "tp1_hit_rate": float(sum(1 for r in subset if r.get("tp1_hit")) / len(subset)) if subset else 0.0,
                 "tp2_hit_rate": float(sum(1 for r in subset if r.get("tp2_hit")) / len(subset)) if subset else 0.0,
                 "time_exit_rate": float(sum(1 for r in subset if r.get("time_exit")) / len(subset)) if subset else 0.0,
@@ -3668,7 +3779,7 @@ def build_daytrade_validation_summary(results: List[Dict[str, Any]]) -> Dict[str
         out["by_source"] = by_source
         return out
     except Exception as e:
-        return {"cases_total": 0, "cases_triggered": 0, "cases_pending_future_bars": 0, "passed": False, "error": f"{type(e).__name__}: {e}"}
+        return {"cases_total": 0, "cases_triggered": 0, "passed": False, "error": f"{type(e).__name__}: {e}"}
 
 
 def run_daytrade_validation_report(cases: List[Dict[str, Any]], bars_map: Dict[str, pd.DataFrame], bar_minutes: int = 15) -> Dict[str, Any]:
