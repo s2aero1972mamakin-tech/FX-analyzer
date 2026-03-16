@@ -245,38 +245,100 @@ def _intraday_opposition_penalty(mtf_alignment_score, fast_tf_dir_ok, micro_tf_d
         threshold_add = 0.0
         confidence_mult = 1.0
         hard_block = False
+        block_reason = "none"
+        block_strength = "none"
         if fast_bad and micro_bad:
             mode = "fast_micro_opposition"
             ev_penalty = 0.08 + 0.06 * max(0.0, -score)
             threshold_add = 0.03 + 0.03 * max(0.0, -score)
             confidence_mult = 0.84
             hard_block = bool(score <= -0.72)
+            block_reason = "fast_and_micro_against"
+            block_strength = "hard" if hard_block else "medium"
         elif fast_bad:
             mode = "fast_opposition"
             ev_penalty = 0.05 + 0.04 * max(0.0, -score)
             threshold_add = 0.02 + 0.02 * max(0.0, -score)
             confidence_mult = 0.90
             hard_block = bool(score <= -0.92)
+            block_reason = "fast_against"
+            block_strength = "hard" if hard_block else "soft"
         elif micro_bad:
             mode = "micro_opposition"
             ev_penalty = 0.03 + 0.03 * max(0.0, -score)
             threshold_add = 0.01 + 0.015 * max(0.0, -score)
             confidence_mult = 0.94
             hard_block = bool(score <= -0.98)
+            block_reason = "micro_against"
+            block_strength = "hard" if hard_block else "soft"
         elif score < 0.0:
             mode = "score_only_opposition"
             ev_penalty = 0.015 + 0.02 * max(0.0, -score)
             threshold_add = 0.008 + 0.010 * max(0.0, -score)
             confidence_mult = 0.97
+            block_reason = "alignment_score_negative"
+            block_strength = "soft"
         return {
             "mode": str(mode),
             "ev_penalty": float(ev_penalty),
             "threshold_add": float(threshold_add),
             "confidence_mult": float(_clamp(confidence_mult, 0.70, 1.0)),
             "hard_block": bool(hard_block),
+            "base_hard_block": bool(hard_block),
+            "block_reason": str(block_reason),
+            "block_strength": str(block_strength),
+            "relaxed_by_timing": False,
         }
     except Exception:
-        return {"mode": "none", "ev_penalty": 0.0, "threshold_add": 0.0, "confidence_mult": 1.0, "hard_block": False}
+        return {
+            "mode": "none",
+            "ev_penalty": 0.0,
+            "threshold_add": 0.0,
+            "confidence_mult": 1.0,
+            "hard_block": False,
+            "base_hard_block": False,
+            "block_reason": "none",
+            "block_strength": "none",
+            "relaxed_by_timing": False,
+        }
+
+
+def _relax_intraday_opposition_block(opposition, entry_timing_score, entry_timing_flags, breakout_pass=False, breakout_ok=False, range_edge_setup=False, structure_pseudo_ok=False):
+    try:
+        opp = dict(opposition or {})
+        mode = str(opp.get("mode", "none") or "none")
+        base_hard = bool(opp.get("hard_block", False))
+        opp["base_hard_block"] = bool(opp.get("base_hard_block", base_hard))
+        opp["block_reason"] = str(opp.get("block_reason", "none") or "none")
+        opp["block_strength"] = str(opp.get("block_strength", "none") or "none")
+        opp["relaxed_by_timing"] = False
+
+        if mode != "fast_micro_opposition" or not base_hard:
+            return opp
+
+        timing_score = float(_clamp(entry_timing_score, 0.0, 1.0))
+        flags = {str(x) for x in (entry_timing_flags or [])}
+        breakout_timing = bool({"breakout_hold", "trend_resume", "pullback_resume"} & flags)
+        structural_support = bool(breakout_pass or breakout_ok or range_edge_setup or structure_pseudo_ok)
+        timing_strong = bool(timing_score >= 0.58)
+
+        if timing_strong and (breakout_timing or structural_support):
+            scale = 0.42 if breakout_timing else 0.55
+            opp["ev_penalty"] = float(max(0.0, float(opp.get("ev_penalty", 0.0) or 0.0) * scale))
+            opp["threshold_add"] = float(max(0.0, float(opp.get("threshold_add", 0.0) or 0.0) * scale))
+            base_conf_mult = float(opp.get("confidence_mult", 1.0) or 1.0)
+            opp["confidence_mult"] = float(_clamp(1.0 - ((1.0 - base_conf_mult) * scale), 0.70, 1.0))
+            opp["hard_block"] = False
+            opp["relaxed_by_timing"] = True
+            opp["block_reason"] = "timing_rescued_breakout" if breakout_timing else "timing_rescued"
+            opp["block_strength"] = "medium" if timing_score >= 0.70 else "soft"
+        else:
+            opp["hard_block"] = True
+            opp["block_reason"] = "fast_micro_opposition_hard_block"
+            opp["block_strength"] = "hard"
+        return opp
+    except Exception:
+        return dict(opposition or {})
 
 def _failure_features(df):
     try:
@@ -2746,6 +2808,23 @@ def get_ai_order_strategy(
     else:
         event_mode = "NORMAL"
 
+    event_horizon_mismatch = False
+    event_penalty_relaxed_by_horizon = 0.0
+    event_penalty_applied = 1.0
+    try:
+        nh_f = float(next_high) if next_high is not None else None
+        max_hold_h = float(trade_profile.get("max_hold_hours", 0.0) or 0.0)
+        strict_h = float(ctx_in.get("event_market_ban_hours", trade_profile.get("event_market_ban_hours", 0.0)) or trade_profile.get("event_market_ban_hours", 0.0) or 0.0)
+        if bool(trade_profile.get("is_intraday")) and event_mode == "PRE_EVENT" and nh_f is not None and max_hold_h > 0.0 and nh_f > max_hold_h and nh_f > strict_h:
+            gap_h = max(0.0, nh_f - max_hold_h)
+            event_horizon_mismatch = True
+            event_penalty_relaxed_by_horizon = float(_clamp(0.55 + 0.06 * gap_h, 0.55, 0.82))
+            event_penalty_applied = float(_clamp(1.0 - event_penalty_relaxed_by_horizon, 0.18, 0.45))
+    except Exception:
+        event_horizon_mismatch = False
+        event_penalty_relaxed_by_horizon = 0.0
+        event_penalty_applied = 1.0
+
     # -----------------------------------------------------------------
     # 7) 動的閾値（フェーズ/構造優先 + リスク時に軽く上げる）
     # -----------------------------------------------------------------
@@ -2789,6 +2868,8 @@ def get_ai_order_strategy(
         # POST_BREAKOUTでは“捕獲”を優先し、閾値上乗せを弱める
         if event_mode == "POST_BREAKOUT":
             ef *= 0.40
+        elif event_mode == "PRE_EVENT":
+            ef *= float(event_penalty_applied)
         dynamic_threshold = float(_clamp(
             dynamic_threshold
             + event_thr_add * ef
@@ -2879,8 +2960,8 @@ def get_ai_order_strategy(
     # RANGE 端の逆張り（厳格）
     range_edge_setup = False
     try:
-        # イベント直前はレンジ逆張りを避ける（事故回避）。直後捕獲はブレイク専用。
-        in_pre = (event_mode == "PRE_EVENT")
+        # イベント直前はレンジ逆張りを避ける（事故回避）。ただし、イベントが最大保有時間より後なら過度に縛らない。
+        in_pre = bool((event_mode == "PRE_EVENT") and (not event_horizon_mismatch))
         if phase_label == "RANGE" and (not in_pre) and (event_mode not in ("EVENT_WINDOW", "POST_WAIT")):
             near_edge = (range_pos <= 0.25) if direction == "LONG" else (range_pos >= 0.75)
             range_edge_setup = bool(
@@ -2935,6 +3016,22 @@ def get_ai_order_strategy(
     else:
         structure_effective_dir_ok = bool(structure_dir_ok)
 
+    entry_timing_state = _entry_timing_state(df, direction)
+    entry_timing_ok = bool(entry_timing_state.get("ok", True))
+    entry_timing_mode = str(entry_timing_state.get("mode", "none") or "none")
+    entry_timing_score = float(entry_timing_state.get("score", 0.0) or 0.0)
+    entry_timing_flags = list(entry_timing_state.get("flags", []) or [])
+    if bool(trade_profile.get("is_intraday")):
+        intraday_opposition = _relax_intraday_opposition_block(
+            intraday_opposition,
+            entry_timing_score=float(entry_timing_score),
+            entry_timing_flags=list(entry_timing_flags),
+            breakout_pass=bool(breakout_pass),
+            breakout_ok=bool(breakout_ok),
+            range_edge_setup=bool(range_edge_setup),
+            structure_pseudo_ok=bool(structure_pseudo_ok),
+        )
+
     # 全体の構造妥当性
     structure_ok = True
     if phase_label == "RANGE":
@@ -2947,7 +3044,7 @@ def get_ai_order_strategy(
     # POST_BREAKOUTはブレイク根拠必須（取り逃がし防止と事故回避を両立）
     if event_mode == "POST_BREAKOUT":
         structure_ok = bool(breakout_ok or structure_effective_dir_ok or (hhhl_ok if direction == "LONG" else lllh_ok))
-    if bool(trade_profile.get("is_intraday")) and bool(intraday_opposition.get("hard_block", False)):
+    if bool(trade_profile.get("is_intraday")) and bool((intraday_opposition or {}).get("hard_block", False)):
         structure_ok = False
     structure_rescue_used = False
     if bool(trade_profile.get("is_intraday")) and not structure_ok:
@@ -2972,11 +3069,6 @@ def get_ai_order_strategy(
 
     why = ""
     gate_mode = "raw+mom"
-    entry_timing_state = _entry_timing_state(df, direction)
-    entry_timing_ok = bool(entry_timing_state.get("ok", True))
-    entry_timing_mode = str(entry_timing_state.get("mode", "none") or "none")
-    entry_timing_score = float(entry_timing_state.get("score", 0.0) or 0.0)
-    entry_timing_flags = list(entry_timing_state.get("flags", []) or [])
     entry_timing_rescue_used = False
     if bool(trade_profile.get("is_intraday")) and not entry_timing_ok:
         entry_timing_rescue_used = bool(
@@ -3109,7 +3201,7 @@ def get_ai_order_strategy(
     ef_up = float(ev_meta.get("factor", 0.0) or 0.0)
     event_pen = 0.20 * ef_up
     if event_mode == "PRE_EVENT":
-        event_pen = 0.28 * ef_up
+        event_pen = 0.28 * ef_up * float(event_penalty_applied)
     if event_mode == "POST_BREAKOUT":
         event_pen = 0.10 * ef_up
 
@@ -3187,6 +3279,9 @@ def get_ai_order_strategy(
         "ev_scaled": float(ev_scaled),
         "rank_score": float(rank_score),
         "event_penalty": float(event_pen),
+        "event_penalty_applied": float(event_penalty_applied),
+        "event_penalty_relaxed_by_horizon": float(event_penalty_relaxed_by_horizon),
+        "event_horizon_mismatch": bool(event_horizon_mismatch),
         "macro_penalty": float(macro_pen),
         "len": int(len(df)),
         "regime_tp_multiple": float(regime_mult),
@@ -3216,6 +3311,9 @@ def get_ai_order_strategy(
         "intraday_opposition_ev_penalty": float((intraday_opposition or {}).get("ev_penalty", 0.0) or 0.0),
         "intraday_opposition_threshold_add": float((intraday_opposition or {}).get("threshold_add", 0.0) or 0.0),
         "intraday_opposition_hard_block": bool((intraday_opposition or {}).get("hard_block", False)),
+        "intraday_opposition_block_reason": str((intraday_opposition or {}).get("block_reason", "none") or "none"),
+        "intraday_opposition_block_strength": str((intraday_opposition or {}).get("block_strength", "none") or "none"),
+        "intraday_opposition_relaxed_by_timing": bool((intraday_opposition or {}).get("relaxed_by_timing", False)),
         "structure_rescue_used": bool(structure_rescue_used),
         "entry_timing_rescue_used": bool(entry_timing_rescue_used),
         "sbi_conf_floor": float(sbi_conf_floor),
@@ -3497,6 +3595,9 @@ def get_ai_order_strategy(
         "intraday_opposition_ev_penalty": float((intraday_opposition or {}).get("ev_penalty", 0.0) or 0.0),
         "intraday_opposition_threshold_add": float((intraday_opposition or {}).get("threshold_add", 0.0) or 0.0),
         "intraday_opposition_hard_block": bool((intraday_opposition or {}).get("hard_block", False)),
+        "intraday_opposition_block_reason": str((intraday_opposition or {}).get("block_reason", "none") or "none"),
+        "intraday_opposition_block_strength": str((intraday_opposition or {}).get("block_strength", "none") or "none"),
+        "intraday_opposition_relaxed_by_timing": bool((intraday_opposition or {}).get("relaxed_by_timing", False)),
         "structure_rescue_used": bool(structure_rescue_used),
         "entry_timing_rescue_used": bool(entry_timing_rescue_used),
         "sbi_conf_floor": float(sbi_conf_floor),
@@ -3509,6 +3610,9 @@ def get_ai_order_strategy(
         "event_mode": str(event_mode),
         "event_next_high_hours": (float(next_high) if next_high is not None else None),
         "event_last_high_hours": (float(last_high) if last_high is not None else None),
+        "event_penalty_applied": float(event_penalty_applied),
+        "event_penalty_relaxed_by_horizon": float(event_penalty_relaxed_by_horizon),
+        "event_horizon_mismatch": bool(event_horizon_mismatch),
 
         "why": str(why),
         "veto": list(veto),
