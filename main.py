@@ -994,7 +994,7 @@ def _ev_audit_summary(rows: List[Dict[str, Any]], days: int = 14) -> Dict[str, A
 # =========================
 SIGNAL_LOG_PATH = "logs/signals.csv"
 TRADE_LOG_PATH = "logs/trades.csv"
-AUTO_SESSION_VALIDATION_ROWS_KEY = "_daytrade_validation_auto_rows"
+AUTO_SESSION_VALIDATION_ROWS_KEY = "_daytrade_validation_auto_rows_by_pair"
 
 def _now_utc_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1081,89 +1081,18 @@ def _float_or_none(x: Any) -> Optional[float]:
         return None
 
 
-def _boolish(x: Any) -> bool:
+def _truthy_like(x: Any) -> bool:
     try:
         if isinstance(x, bool):
-            return x
+            return bool(x)
         if x is None:
             return False
         if isinstance(x, (int, float)):
-            return bool(int(x))
+            return bool(x)
         s = str(x).strip().lower()
-        return s in ("1", "true", "yes", "y", "on")
+        return s in ("1", "true", "t", "yes", "y", "on")
     except Exception:
         return False
-
-
-def _make_validation_row_key(row: Dict[str, Any]) -> str:
-    try:
-        pair = str(row.get("pair") or row.get("symbol") or "").upper().strip()
-        decision = str(row.get("decision") or "").upper().strip()
-        direction = str(row.get("direction") or row.get("shadow_direction") or "").upper().strip()
-        trade_profile = _trade_profile_name(row.get("trade_profile") or "").upper()
-        parts = [
-            pair,
-            trade_profile,
-            decision,
-            direction,
-            f"e:{_float_or_none(row.get('entry_hint'))}",
-            f"sl:{_float_or_none(row.get('sl_hint'))}",
-            f"tp1:{_float_or_none(row.get('tp1_hint'))}",
-            f"tp2:{_float_or_none(row.get('tp2_hint') if pd.notna(row.get('tp2_hint')) else row.get('tp_hint'))}",
-            f"sh:{int(_boolish(row.get('shadow_candidate')))}",
-            f"she:{_float_or_none(row.get('shadow_entry'))}",
-            f"shsl:{_float_or_none(row.get('shadow_sl'))}",
-            f"shtp1:{_float_or_none(row.get('shadow_tp1'))}",
-            f"shtp2:{_float_or_none(row.get('shadow_tp2'))}",
-            str(row.get("shadow_source") or "").upper().strip(),
-        ]
-        return "|".join(parts)
-    except Exception:
-        return str(row.get("signal_id") or row.get("pair") or row.get("symbol") or uuid.uuid4().hex)
-
-
-def _dtv_normalize_ts_any(v: Any) -> Optional[pd.Timestamp]:
-    try:
-        if v is None or v == "":
-            return None
-        ts = pd.to_datetime(v, utc=True, errors="coerce")
-        if pd.isna(ts):
-            return None
-        return ts
-    except Exception:
-        return None
-
-
-def _dtv_latest_bar_ts(df: Optional[pd.DataFrame]) -> Optional[pd.Timestamp]:
-    try:
-        if not isinstance(df, pd.DataFrame) or df.empty:
-            return None
-        idx = df.index
-        if not isinstance(idx, pd.DatetimeIndex) or len(idx) == 0:
-            return None
-        if idx.tz is None:
-            return idx.tz_localize("UTC")[-1]
-        return idx.tz_convert("UTC")[-1]
-    except Exception:
-        return None
-
-
-def _case_has_forward_bars(case_item: Dict[str, Any], bars: Optional[pd.DataFrame]) -> Tuple[bool, Optional[pd.Timestamp], Optional[pd.Timestamp]]:
-    try:
-        latest_bar_ts = _dtv_latest_bar_ts(bars)
-        signal_ts = _dtv_normalize_ts_any((case_item or {}).get("ts_utc") or (case_item or {}).get("entry_ts"))
-        if not isinstance(bars, pd.DataFrame) or bars.empty:
-            return False, signal_ts, latest_bar_ts
-        if signal_ts is None:
-            return True, signal_ts, latest_bar_ts
-        idx = bars.index
-        if not isinstance(idx, pd.DatetimeIndex) or len(idx) == 0:
-            return False, signal_ts, latest_bar_ts
-        idx_utc = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
-        has_fwd = bool((idx_utc >= signal_ts).any())
-        return has_fwd, signal_ts, latest_bar_ts
-    except Exception:
-        return False, _dtv_normalize_ts_any((case_item or {}).get("ts_utc") or (case_item or {}).get("entry_ts")), _dtv_latest_bar_ts(bars)
 
 def _calc_r_multiple(side: str, entry: float, exit_price: float, stop: float) -> Optional[float]:
     """R-multiple based on stop distance. Returns None if cannot compute."""
@@ -1373,15 +1302,78 @@ def _daytrade_validation_help_text(interval: str, period: str) -> str:
         return f"短期セットアップ確認向けの組み合わせです（{rp}）。"
     return f"執行寄りの細かな検証向けの組み合わせです（{rp}）。"
 
-def _build_daytrade_validation_cases(df_signals: pd.DataFrame, include_shadow: bool = True) -> List[Dict[str, Any]]:
+def _build_daytrade_validation_cases(df_signals: pd.DataFrame, include_shadow: bool = True, return_diag: bool = False):
+    diag = {
+        "rows_total": 0,
+        "signals_daytrade_in_scope": 0,
+        "cases_live": 0,
+        "cases_shadow": 0,
+        "rows_skipped_not_daytrade": 0,
+        "rows_no_live_trade": 0,
+        "rows_no_shadow_candidate": 0,
+        "rows_skipped_live_missing_levels": 0,
+        "rows_skipped_shadow_missing_levels": 0,
+        "cases_built": 0,
+    }
     if df_signals is None or df_signals.empty:
-        return []
+        return ([], diag, []) if return_diag else []
+
     cases: List[Dict[str, Any]] = []
     seen = set()
+    build_diag_rows: List[Dict[str, Any]] = []
+
+    def _build_skip_row(r: Dict[str, Any], status: str, reason: str) -> Dict[str, Any]:
+        return {
+            "case_id": None,
+            "source": "BUILD",
+            "pair": str(r.get("pair", "") or ""),
+            "symbol": str(r.get("symbol", "") or _pair_label_to_symbol(str(r.get("pair", "") or "")) or ""),
+            "direction": str(r.get("direction", "") or r.get("shadow_direction", "") or ""),
+            "decision": str(r.get("decision", "") or ""),
+            "trade_profile": str(r.get("trade_profile", "") or ""),
+            "price_interval": str(r.get("price_interval", "") or ""),
+            "timeframe_mode": str(r.get("timeframe_mode", "") or ""),
+            "shadow_candidate": bool(_truthy_like(r.get("shadow_candidate", False))),
+            "entry_hint": _float_or_none(r.get("entry_hint")),
+            "sl_hint": _float_or_none(r.get("sl_hint")),
+            "tp1_hint": _float_or_none(r.get("tp1_hint")),
+            "tp2_hint": _float_or_none(r.get("tp2_hint") if pd.notna(r.get("tp2_hint")) else r.get("tp_hint")),
+            "shadow_entry": _float_or_none(r.get("shadow_entry")),
+            "shadow_sl": _float_or_none(r.get("shadow_sl")),
+            "shadow_tp1": _float_or_none(r.get("shadow_tp1")),
+            "shadow_tp2": _float_or_none(r.get("shadow_tp2")),
+            "requested_interval": None,
+            "actual_interval_used": None,
+            "fetch_source": None,
+            "fetch_error": None,
+            "bars_loaded": 0,
+            "case_build_status": str(status),
+            "exit_reason": str(reason),
+            "ok": False,
+            "triggered": False,
+            "tp1_hit": False,
+            "tp2_hit": False,
+            "time_exit": False,
+            "be_exit": False,
+            "sl_hit": False,
+            "final_r": 0.0,
+            "mfe_r": 0.0,
+            "mae_r": 0.0,
+            "bars_held": 0,
+            "entry_ts": str(r.get("ts_utc", "") or ""),
+            "exit_ts": None,
+        }
+
     for _, row in df_signals.copy().iterrows():
         r = row.to_dict()
+        diag["rows_total"] += 1
+
         if not _is_daytrade_signal_row(r):
+            diag["rows_skipped_not_daytrade"] += 1
+            build_diag_rows.append(_build_skip_row(r, "SKIPPED_NOT_DAYTRADE", "SKIPPED_NOT_DAYTRADE"))
             continue
+
+        diag["signals_daytrade_in_scope"] += 1
         pair = str(r.get("pair", ""))
         symbol = str(r.get("symbol", "") or _pair_label_to_symbol(pair))
         ts_utc = str(r.get("ts_utc", ""))
@@ -1396,13 +1388,20 @@ def _build_daytrade_validation_cases(df_signals: pd.DataFrame, include_shadow: b
             "trade_profile": str(r.get("trade_profile", "DAYTRADE") or "DAYTRADE"),
             "time_exit_focus": "30m/60m/120m",
         }
-        if str(r.get("decision", "")).strip().upper() == "TRADE":
-            entry = _float_or_none(r.get("entry_hint"))
-            sl = _float_or_none(r.get("sl_hint"))
-            tp2 = _float_or_none(r.get("tp2_hint") if pd.notna(r.get("tp2_hint")) else r.get("tp_hint"))
-            tp1 = _float_or_none(r.get("tp1_hint"))
-            direction = str(r.get("direction", "")).strip().upper()
-            if entry is not None and sl is not None and tp2 is not None and direction:
+
+        decision_is_trade = str(r.get("decision", "")).strip().upper() == "TRADE"
+        shadow_candidate = bool(_truthy_like(r.get("shadow_candidate", False)))
+        row_had_case = False
+
+        entry = _float_or_none(r.get("entry_hint"))
+        sl = _float_or_none(r.get("sl_hint"))
+        tp2 = _float_or_none(r.get("tp2_hint") if pd.notna(r.get("tp2_hint")) else r.get("tp_hint"))
+        tp1 = _float_or_none(r.get("tp1_hint"))
+        direction = str(r.get("direction", "") or "")
+        live_levels_ok = bool(entry is not None and sl is not None and tp2 is not None and direction)
+
+        if decision_is_trade:
+            if live_levels_ok:
                 cid = f"LIVE|{r.get('signal_id','')}|{pair}|{direction}"
                 if cid not in seen:
                     cases.append({
@@ -1410,38 +1409,62 @@ def _build_daytrade_validation_cases(df_signals: pd.DataFrame, include_shadow: b
                         "case_id": cid,
                         "source": "LIVE",
                         "direction": direction,
-                        "side": direction,
+                        "side": str(r.get("direction", "")),
                         "entry_type": "MARKET_NOW",
                         "entry": entry,
                         "sl": sl,
-                        "tp1": (tp1 if tp1 is not None else entry + 0.5 * (tp2 - entry) if direction == "LONG" else entry - 0.5 * (entry - tp2)),
+                        "tp1": (tp1 if tp1 is not None else entry + 0.5 * (tp2 - entry) if str(direction).upper()=="LONG" else entry - 0.5 * (entry - tp2)),
                         "tp2": tp2,
                     })
                     seen.add(cid)
-        if include_shadow and _boolish(r.get("shadow_candidate", False)):
-            entry = _float_or_none(r.get("shadow_entry"))
-            sl = _float_or_none(r.get("shadow_sl"))
-            tp2 = _float_or_none(r.get("shadow_tp2"))
-            tp1 = _float_or_none(r.get("shadow_tp1"))
-            direction = str(r.get("shadow_direction", "")).strip().upper()
-            entry_type = str(r.get("shadow_entry_type", "MARKET_NOW") or "MARKET_NOW")
-            if entry is not None and sl is not None and tp2 is not None and direction:
-                cid = f"SHADOW|{r.get('signal_id','')}|{pair}|{direction}|{r.get('shadow_source','')}"
-                if cid not in seen:
-                    cases.append({
-                        **base,
-                        "case_id": cid,
-                        "source": "SHADOW",
-                        "direction": direction,
-                        "side": direction,
-                        "entry_type": entry_type,
-                        "entry": entry,
-                        "sl": sl,
-                        "tp1": (tp1 if tp1 is not None else entry + 0.5 * (tp2 - entry) if direction == "LONG" else entry - 0.5 * (entry - tp2)),
-                        "tp2": tp2,
-                    })
-                    seen.add(cid)
-    return cases
+                    diag["cases_live"] += 1
+                    row_had_case = True
+            else:
+                diag["rows_skipped_live_missing_levels"] += 1
+                build_diag_rows.append(_build_skip_row(r, "SKIPPED_LIVE_MISSING_LEVELS", "SKIPPED_LIVE_MISSING_LEVELS"))
+        else:
+            diag["rows_no_live_trade"] += 1
+
+        if include_shadow:
+            if shadow_candidate:
+                entry_s = _float_or_none(r.get("shadow_entry"))
+                sl_s = _float_or_none(r.get("shadow_sl"))
+                tp2_s = _float_or_none(r.get("shadow_tp2"))
+                tp1_s = _float_or_none(r.get("shadow_tp1"))
+                direction_s = str(r.get("shadow_direction", "") or "")
+                entry_type_s = str(r.get("shadow_entry_type", "MARKET_NOW") or "MARKET_NOW")
+                shadow_levels_ok = bool(entry_s is not None and sl_s is not None and tp2_s is not None and direction_s)
+                if shadow_levels_ok:
+                    cid = f"SHADOW|{r.get('signal_id','')}|{pair}|{direction_s}|{r.get('shadow_source','')}"
+                    if cid not in seen:
+                        cases.append({
+                            **base,
+                            "case_id": cid,
+                            "source": "SHADOW",
+                            "direction": direction_s,
+                            "side": direction_s,
+                            "entry_type": entry_type_s,
+                            "entry": entry_s,
+                            "sl": sl_s,
+                            "tp1": (tp1_s if tp1_s is not None else entry_s + 0.5 * (tp2_s - entry_s) if str(direction_s).upper()=="LONG" else entry_s - 0.5 * (entry_s - tp2_s)),
+                            "tp2": tp2_s,
+                        })
+                        seen.add(cid)
+                        diag["cases_shadow"] += 1
+                        row_had_case = True
+                else:
+                    diag["rows_skipped_shadow_missing_levels"] += 1
+                    build_diag_rows.append(_build_skip_row(r, "SKIPPED_SHADOW_MISSING_LEVELS", "SKIPPED_SHADOW_MISSING_LEVELS"))
+            else:
+                diag["rows_no_shadow_candidate"] += 1
+                if not decision_is_trade:
+                    build_diag_rows.append(_build_skip_row(r, "SKIPPED_NO_SHADOW_CANDIDATE", "SKIPPED_NO_SHADOW_CANDIDATE"))
+        elif (not decision_is_trade) and (not row_had_case):
+            build_diag_rows.append(_build_skip_row(r, "SKIPPED_NO_LIVE_TRADE", "SKIPPED_NO_LIVE_TRADE"))
+
+    diag["cases_built"] = int(len(cases))
+    return (cases, diag, build_diag_rows) if return_diag else cases
+
 
 
 def _fetch_daytrade_validation_bars(cases: List[Dict[str, Any]], interval: str = "15m", period: str = "10d") -> Tuple[Dict[str, pd.DataFrame], Dict[str, Dict[str, Any]]]:
@@ -1520,10 +1543,8 @@ def _run_daytrade_validation(df_signals: pd.DataFrame, bar_interval: str = "15m"
                 return "—"
             return ", ".join([f"{k}:{counts[k]}" for k in sorted(counts.keys())])
 
-        def _diag_case_row(case_item: Dict[str, Any], exit_reason: str, error_text: str = "") -> Dict[str, Any]:
+        def _diag_case_row(case_item: Dict[str, Any], exit_reason: str) -> Dict[str, Any]:
             row = dict(case_item or {})
-            signal_ts = _dtv_normalize_ts_any(row.get("ts_utc") or row.get("entry_ts"))
-            latest_bar_ts = _dtv_normalize_ts_any(row.get("latest_bar_ts"))
             row.update({
                 "ok": False,
                 "triggered": False,
@@ -1539,31 +1560,22 @@ def _run_daytrade_validation(df_signals: pd.DataFrame, bar_interval: str = "15m"
                 "entry_ts": row.get("ts_utc"),
                 "exit_ts": None,
                 "exit_reason": exit_reason,
-                "case_status": exit_reason,
-                "error": error_text or str(row.get("error") or ""),
-                "signal_ts_after_latest_bar": bool(signal_ts is not None and latest_bar_ts is not None and signal_ts > latest_bar_ts),
             })
             return row
 
         df_scope = _filter_daytrade_validation_signals(df_signals, report_period)
         cases = _build_daytrade_validation_cases(df_scope, include_shadow=include_shadow)
-        signals_source_counts: Dict[str, int] = {}
-        if isinstance(df_scope, pd.DataFrame) and not df_scope.empty and "validation_input_source" in df_scope.columns:
-            for v in df_scope["validation_input_source"].fillna("UNKNOWN").astype(str):
-                signals_source_counts[v] = int(signals_source_counts.get(v, 0)) + 1
         base_config = {
             "bar_interval": str(bar_interval),
             "report_period": str(report_period),
             "signals_total": int(len(df_signals)) if isinstance(df_signals, pd.DataFrame) else 0,
             "signals_in_scope": int(len(df_scope)) if isinstance(df_scope, pd.DataFrame) else 0,
-            "signals_source_counts": signals_source_counts,
             "cases_built": int(len(cases)),
             "cases_ready": 0,
             "bars_loaded": 0,
             "bars_loaded_symbols": 0,
             "cases_skipped_interval_mismatch": 0,
             "cases_failed_fetch": 0,
-            "cases_pending_future_bars": 0,
             "actual_interval_used": "—",
         }
         if not cases:
@@ -1582,22 +1594,11 @@ def _run_daytrade_validation(df_signals: pd.DataFrame, bar_interval: str = "15m"
         diagnostic_rows: List[Dict[str, Any]] = []
         cases_failed_fetch = 0
         cases_skipped_interval_mismatch = 0
-        cases_pending_future_bars = 0
 
         for case in cases:
             pair = str(case.get("pair", "") or "")
             symbol = str(case.get("symbol", "") or _pair_label_to_symbol(pair) or "")
             meta = fetch_meta_by_symbol.get(symbol, {}) if isinstance(fetch_meta_by_symbol, dict) else {}
-            bars = None
-            if isinstance(bars_map, dict):
-                cand = bars_map.get(symbol)
-                if isinstance(cand, pd.DataFrame):
-                    bars = cand
-                else:
-                    cand = bars_map.get(pair)
-                    if isinstance(cand, pd.DataFrame):
-                        bars = cand
-            has_forward_bars, signal_ts, latest_bar_ts = _case_has_forward_bars(case, bars)
             case_with_meta = dict(case)
             case_with_meta.update({
                 "requested_interval": str(meta.get("requested_interval") or bar_interval),
@@ -1607,24 +1608,17 @@ def _run_daytrade_validation(df_signals: pd.DataFrame, bar_interval: str = "15m"
                 "fetch_ok": bool(meta.get("fetch_ok", False)),
                 "interval_mismatch": bool(meta.get("interval_mismatch", False)),
                 "bars_loaded": int(meta.get("bars_loaded", 0) or 0),
-                "latest_bar_ts": latest_bar_ts.isoformat() if hasattr(latest_bar_ts, "isoformat") else (str(latest_bar_ts) if latest_bar_ts is not None else None),
-                "signal_ts_after_latest_bar": bool(signal_ts is not None and latest_bar_ts is not None and signal_ts > latest_bar_ts),
             })
             enriched_cases.append(case_with_meta)
 
             if not bool(meta.get("fetch_ok", False)):
                 cases_failed_fetch += 1
-                diagnostic_rows.append(_diag_case_row(case_with_meta, "FETCH_FAILED", error_text=str(case_with_meta.get("fetch_error") or "")))
+                diagnostic_rows.append(_diag_case_row(case_with_meta, "FETCH_FAILED"))
                 continue
 
             if str(bar_interval).strip().lower() == "1h" and bool(meta.get("interval_mismatch", False)):
                 cases_skipped_interval_mismatch += 1
-                diagnostic_rows.append(_diag_case_row(case_with_meta, "SKIPPED_INTERVAL_MISMATCH", error_text="interval_mismatch"))
-                continue
-
-            if not has_forward_bars:
-                cases_pending_future_bars += 1
-                diagnostic_rows.append(_diag_case_row(case_with_meta, "PENDING_FUTURE_BARS", error_text="no_forward_bars"))
+                diagnostic_rows.append(_diag_case_row(case_with_meta, "SKIPPED_INTERVAL_MISMATCH"))
                 continue
 
             case_with_meta["case_status"] = "READY"
@@ -1636,7 +1630,6 @@ def _run_daytrade_validation(df_signals: pd.DataFrame, bar_interval: str = "15m"
             "bars_loaded_symbols": int(sum(1 for meta in (fetch_meta_by_symbol or {}).values() if isinstance(meta, dict) and bool(meta.get("usable_for_validation", False)))),
             "cases_skipped_interval_mismatch": int(cases_skipped_interval_mismatch),
             "cases_failed_fetch": int(cases_failed_fetch),
-            "cases_pending_future_bars": int(cases_pending_future_bars),
             "actual_interval_used": _interval_summary(fetch_meta_by_symbol),
         })
 
@@ -1682,14 +1675,7 @@ def _run_daytrade_validation(df_signals: pd.DataFrame, bar_interval: str = "15m"
             }
         rep["cases"] = enriched_cases
         rep_results = rep.get("results", []) if isinstance(rep.get("results", []), list) else []
-        merged_results = list(rep_results) + diagnostic_rows
-        rep["results"] = merged_results
-        summary_builder = getattr(logic, "build_daytrade_validation_summary", None)
-        if callable(summary_builder):
-            try:
-                rep["summary"] = summary_builder(merged_results)
-            except Exception:
-                pass
+        rep["results"] = list(rep_results) + diagnostic_rows
         rep["fetch_meta_by_symbol"] = fetch_meta_by_symbol
         rep["bars_loaded"] = {k: int(v.get("bars_loaded", 0) or 0) for k, v in (fetch_meta_by_symbol or {}).items() if isinstance(v, dict)}
         rep["bar_interval"] = str(bar_interval)
@@ -1699,43 +1685,21 @@ def _run_daytrade_validation(df_signals: pd.DataFrame, bar_interval: str = "15m"
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
-
 def _upsert_daytrade_validation_auto_row(row: Dict[str, Any]) -> None:
     try:
         if not isinstance(row, dict) or not row:
             return
-        key = _make_validation_row_key(row)
-        if not key:
-            return
+        signal_key = str(row.get("signal_id") or "")
+        if not signal_key:
+            signal_key = f"{str(row.get('pair') or row.get('symbol') or 'UNK')}|{str(row.get('ts_utc') or _now_utc_iso())}"
         store = st.session_state.get(AUTO_SESSION_VALIDATION_ROWS_KEY, {})
         if not isinstance(store, dict):
             store = {}
         row2 = dict(row)
         row2["validation_input_source"] = "AUTO_SESSION"
-        store[key] = row2
+        row2["validation_captured_mode"] = str(st.session_state.get("timeframe_mode", "") or "")
+        store[signal_key] = row2
         st.session_state[AUTO_SESSION_VALIDATION_ROWS_KEY] = store
-    except Exception:
-        pass
-
-
-def _capture_ranked_rows_for_daytrade_validation(ranked_rows: List[Dict[str, Any]]) -> None:
-    try:
-        for item in (ranked_rows or []):
-            if not isinstance(item, dict):
-                continue
-            plan_ui = item.get("_plan_ui", item.get("_plan", {}))
-            ctx = item.get("_ctx", {})
-            feats = item.get("_feats", {})
-            price_meta = item.get("_price_meta", {})
-            ext_meta = item.get("_ext_meta", {})
-            pair = str(item.get("pair") or "")
-            if not pair or not isinstance(plan_ui, dict):
-                continue
-            if (str(plan_ui.get("decision") or "").strip().upper() != "TRADE") and (not _boolish(plan_ui.get("shadow_candidate", False))):
-                continue
-            row = _build_signal_row(pair, ctx if isinstance(ctx, dict) else {}, feats if isinstance(feats, dict) else {}, plan_ui, price_meta if isinstance(price_meta, dict) else {}, ext_meta if isinstance(ext_meta, dict) else {})
-            if _is_daytrade_signal_row(row):
-                _upsert_daytrade_validation_auto_row(row)
     except Exception:
         pass
 
@@ -1824,13 +1788,19 @@ def _render_daytrade_validation_panel(df_signals: pd.DataFrame):
         top1.metric("検証足", str(cfg.get("bar_interval") or rep.get("bar_interval") or "—"))
         top2.metric("対象期間", str(cfg.get("report_period") or rep.get("period") or "—"))
         top3.metric("signals_in_scope", f"{int(cfg.get('signals_in_scope', 0))}")
-        top4.metric("cases_built", f"{int(cfg.get('cases_built', 0))}")
+        top4.metric("signals_daytrade_in_scope", f"{int(cfg.get('signals_daytrade_in_scope', 0))}")
 
         mid1, mid2, mid3, mid4 = st.columns(4)
-        mid1.metric("bars_loaded", f"{int(cfg.get('bars_loaded', 0))}")
-        mid2.metric("cases_skipped_interval_mismatch", f"{int(cfg.get('cases_skipped_interval_mismatch', 0))}")
-        mid3.metric("cases_failed_fetch", f"{int(cfg.get('cases_failed_fetch', 0))}")
-        mid4.metric("cases_pending_future_bars", f"{int(cfg.get('cases_pending_future_bars', 0))}")
+        mid1.metric("cases_built", f"{int(cfg.get('cases_built', 0))}")
+        mid2.metric("bars_loaded", f"{int(cfg.get('bars_loaded', 0))}")
+        mid3.metric("cases_skipped_interval_mismatch", f"{int(cfg.get('cases_skipped_interval_mismatch', 0))}")
+        mid4.metric("cases_failed_fetch", f"{int(cfg.get('cases_failed_fetch', 0))}")
+
+        low1, low2, low3, low4 = st.columns(4)
+        low1.metric("cases_live", f"{int(cfg.get('cases_live', 0))}")
+        low2.metric("cases_shadow", f"{int(cfg.get('cases_shadow', 0))}")
+        low3.metric("rows_skipped_not_daytrade", f"{int(cfg.get('rows_skipped_not_daytrade', 0))}")
+        low4.metric("rows_no_shadow_candidate", f"{int(cfg.get('rows_no_shadow_candidate', 0))}")
 
         st.caption(f"actual_interval_used: {str(cfg.get('actual_interval_used') or '—')}")
         source_counts = cfg.get("signals_source_counts", {}) if isinstance(cfg.get("signals_source_counts", {}), dict) else {}
@@ -1842,11 +1812,11 @@ def _render_daytrade_validation_panel(df_signals: pd.DataFrame):
         results = rep.get("results", []) if isinstance(rep.get("results", []), list) else []
         if results:
             df_fail = pd.DataFrame(results)
-            fail_cols = [c for c in ["case_id", "source", "pair", "direction", "requested_interval", "actual_interval_used", "fetch_source", "fetch_error", "bars_loaded", "latest_bar_ts", "signal_ts_after_latest_bar", "exit_reason"] if c in df_fail.columns]
+            fail_cols = [c for c in ["case_build_status", "case_id", "source", "pair", "decision", "trade_profile", "price_interval", "timeframe_mode", "shadow_candidate", "direction", "requested_interval", "actual_interval_used", "fetch_source", "fetch_error", "bars_loaded", "exit_reason"] if c in df_fail.columns]
             if fail_cols:
-                st.dataframe(df_fail[fail_cols], use_container_width=True)
+                st.dataframe(df_fail[fail_cols], width='stretch')
         elif rep.get("cases"):
-            st.dataframe(pd.DataFrame(rep.get("cases", [])), use_container_width=True)
+            st.dataframe(pd.DataFrame(rep.get("cases", [])), width='stretch')
         return
 
     summary = rep.get("summary", {}) if isinstance(rep.get("summary", {}), dict) else {}
@@ -1875,7 +1845,7 @@ def _render_daytrade_validation_panel(df_signals: pd.DataFrame):
         show_cols = [
             c for c in [
                 "case_id", "source", "pair", "direction", "entry_type", "requested_interval", "actual_interval_used",
-                "fetch_source", "fetch_error", "bars_loaded", "latest_bar_ts", "signal_ts_after_latest_bar", "triggered", "tp1_hit", "tp2_hit", "time_exit",
+                "fetch_source", "fetch_error", "bars_loaded", "triggered", "tp1_hit", "tp2_hit", "time_exit",
                 "be_exit", "sl_hit", "final_r", "mfe_r", "mae_r", "bars_held", "exit_reason", "entry_ts", "exit_ts"
             ] if c in df_r.columns
         ]
@@ -2351,7 +2321,8 @@ def _render_logging_panel(pair_label: str, plan_ui: Dict[str, Any], ctx: Dict[st
     st.markdown("### 📝 シグナル/損益ログ（運用用）")
     with st.expander("📝 保存（signals / trades）+ 外部Sink（Webhook/Supabase）", expanded=False):
         row = _build_signal_row(pair_label, ctx, feats, plan_ui, price_meta=price_meta, ext_meta=ext_meta)
-        _upsert_daytrade_validation_auto_row(row)
+        if _is_daytrade_signal_row(row):
+            _upsert_daytrade_validation_auto_row(row)
         st.caption("運用の第一歩：**『シグナル保存 → 決済後に損益保存 → パフォーマンス自動集計』** の流れを固定します。")
 
         c1, c2 = st.columns(2)
@@ -4732,8 +4703,6 @@ with tabs[0]:
             st.error("有効なペアがありません（全てNO_DATA）。")
             st.dataframe(pd.DataFrame(rows)[["pair", "decision"]], use_container_width=True)
             st.stop()
-
-        _capture_ranked_rows_for_daytrade_validation(ranked)
 
         # --- AI selection: pick ONE pair to act on (SBIガード込みのTRADE候補から) ---
         trade_ranked = [r for r in ranked if str(r.get("decision", "")) == "TRADE"]
