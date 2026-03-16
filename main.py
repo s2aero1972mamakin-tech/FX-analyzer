@@ -2513,128 +2513,85 @@ def _lot_multiplier(global_risk_index: Any, alpha: Any, floor: float = 0.2, ceil
 
 
 def _apply_sbi_minlot_guard(plan: dict, *, sbi_min_lot: int = 1) -> dict:
-    """SBI（最小1建・小数不可）を前提に、縮退が効かない局面をAI側で『見送り』に倒す。
+    """SBI（最小1建・小数不可）向けに、建玉数を“リスク縮退”ではなく“トレード条件”で決める。
 
-    目的：
-      - 画面が「エントリー可」と出ても、実際は縮退できず事故りやすいケースを可視化＆抑制
-      - 根拠を“数値”で説明（SBI補正EV、EV余裕、必要余裕、実質リスク倍率）
-
-    方針（過度に見送り地獄にしないための段階制）：
-      - hard: 推奨ロット係数が極端に低い（<0.35）→ ほぼ確実に縮退必須なので見送り
-      - soft: 係数が低い（<0.55）かつ、EV余裕が薄い/イベント近接ガード中 → 見送り
-      - それ以外は元の decision を尊重
+    方針：
+      - TRADEなら最低1建
+      - 条件が強いほど2建、3建、最大4建まで表示
+      - 建玉数は見送り判定の理由に使わない（decisionは元のロジックを尊重）
     """
     try:
         if not isinstance(plan, dict):
             return plan
-        decision = str(plan.get("decision", "NO_TRADE"))
-        # 既に見送りならそのまま
+        decision = str(plan.get("decision", "NO_TRADE") or "NO_TRADE").upper()
         if decision != "TRADE":
+            plan["_sbi"] = {
+                "min_lot": int(sbi_min_lot),
+                "base_lots": int(sbi_min_lot),
+                "desired_lots": 0.0,
+                "exec_lots": 0,
+                "trade_quality_score": 0.0,
+                "lot_reason": "no_trade",
+                "decision_sbi": "NO_TRADE",
+            }
             plan["_sbi_exec_lots"] = 0
             return plan
 
         ctx = plan.get("_ctx", {}) if isinstance(plan.get("_ctx", {}), dict) else {}
+        confidence = float(plan.get("confidence") or 0.0)
+        p_eff = float(plan.get("p_eff") or plan.get("p_win_ev") or 0.0)
         ev = float(plan.get("expected_R_ev") or 0.0)
-        dyn = float(plan.get("dynamic_threshold") or 0.0)
-        lot_mult = float(plan.get("_lot_multiplier_reco") or 1.0)
-        lot_mult = max(0.000001, min(1.0, lot_mult))
-
-        # SBIは最小1建。ここでは「基準建玉=1」を前提に、縮退不能による実質リスク倍率を算出。
-        base_lots = 1.0
-        desired_lots = base_lots * lot_mult
-        exec_lots = max(float(sbi_min_lot), float(int(round(desired_lots))))
-        # roundで0になる可能性があるので再ガード
-        exec_lots = max(float(sbi_min_lot), exec_lots)
-
-        risk_x = float(exec_lots) / max(desired_lots, 1e-9)  # 例: 0.269→1建=3.7倍
-        ev_sbi = ev / max(risk_x, 1e-9)  # ＝ ev * desired/exec
-        ev_margin = ev - dyn
-
-        # 必要余裕（数値基準）
-        req_margin = 0.03  # 通常時の最低余裕
-        event_ban = bool(ctx.get("event_market_ban_active", False))
-        if event_ban:
-            req_margin += 0.03  # イベント近接中は余裕を上乗せ（見送り地獄防止のため控えめ）
-        if float(ctx.get("weekcross_risk") or 0.0) > 0.0:
-            req_margin += 0.02
-        if float(ctx.get("weekend_risk") or 0.0) > 0.0:
-            req_margin += 0.03
-        # 縮退不能の度合い（実質リスク倍率）を余裕に反映（上限0.10R）
-        req_margin += min(0.10, 0.04 * max(0.0, risk_x - 1.0))
-
-        trade_profile = str(plan.get("trade_profile") or ctx.get("trade_profile") or "")
+        rr = float((ctx.get("rr") if isinstance(ctx, dict) else None) or plan.get("rr") or 0.0)
+        intraday_quality = float(plan.get("intraday_entry_quality") or (ctx.get("intraday_entry_quality") if isinstance(ctx, dict) else 0.0) or 0.0)
+        timing_score = float(plan.get("entry_timing_score") or (ctx.get("entry_timing_score") if isinstance(ctx, dict) else 0.0) or 0.0)
+        hp_score = float(plan.get("high_precision_tp_score") or (ctx.get("high_precision_tp_score") if isinstance(ctx, dict) else 0.0) or 0.0)
+        hp_candidate = bool(plan.get("high_precision_tp_candidate") or (ctx.get("high_precision_tp_candidate") if isinstance(ctx, dict) else False))
+        breakout_ok = bool((ctx.get("breakout_ok") if isinstance(ctx, dict) else False) or plan.get("breakout_ok", False))
+        structure_ok = bool((ctx.get("structure_effective_dir_ok") if isinstance(ctx, dict) else False) or plan.get("structure_effective_dir_ok", False))
         gate_mode = str(plan.get("gate_mode") or "")
-        intraday_quality = float(ctx.get("intraday_entry_quality") or plan.get("intraday_entry_quality") or 0.0)
-        strong_daytrade = bool(
-            trade_profile == "DAYTRADE" and (
-                intraday_quality >= 0.66
-                or gate_mode in ("intraday_precision_rescue", "breakout_rescue", "post_breakout_rescue")
-            )
-        )
 
-        if strong_daytrade:
-            req_margin = max(0.01, req_margin - 0.02)
-            hard_veto = (lot_mult < 0.22) and (ev_sbi < dyn)
-            soft_veto = (lot_mult < 0.40) and ((event_ban and intraday_quality < 0.72) or ((ev_margin < req_margin) and (ev_sbi < dyn - 0.01)))
-        else:
-            hard_veto = (lot_mult < 0.35)
-            soft_veto = (lot_mult < 0.55) and (event_ban or (ev_margin < req_margin) or (ev_sbi < dyn))
+        quality = 0.0
+        quality += 0.24 * max(0.0, min(1.0, confidence))
+        quality += 0.18 * max(0.0, min(1.0, p_eff))
+        quality += 0.18 * max(0.0, min(1.0, intraday_quality))
+        quality += 0.12 * max(0.0, min(1.0, timing_score))
+        quality += 0.18 * max(0.0, min(1.0, hp_score))
+        quality += 0.10 * max(0.0, min(1.0, (ev + 0.05) / 0.35))
+        if hp_candidate:
+            quality += 0.08
+        if breakout_ok:
+            quality += 0.04
+        if structure_ok:
+            quality += 0.04
+        if gate_mode == "intraday_precision_rescue":
+            quality -= 0.04
+        quality = float(max(0.0, min(1.25, quality)))
 
-        # 情報はplanに格納（UI表示用）
+        desired_lots = float(max(int(sbi_min_lot), 1))
+        lot_reason = "base_1lot"
+        if hp_candidate and quality >= 0.72 and confidence >= 0.58 and p_eff >= 0.50 and ev >= 0.10:
+            desired_lots = 2.0
+            lot_reason = "high_precision_2lots"
+        if hp_candidate and quality >= 0.84 and confidence >= 0.66 and p_eff >= 0.54 and ev >= 0.18 and rr >= 1.30:
+            desired_lots = 3.0
+            lot_reason = "high_precision_3lots"
+        if hp_candidate and quality >= 0.96 and confidence >= 0.74 and p_eff >= 0.58 and ev >= 0.28 and rr >= 1.45 and (breakout_ok or structure_ok):
+            desired_lots = 4.0
+            lot_reason = "high_precision_4lots"
+
+        exec_lots = int(max(float(sbi_min_lot), round(desired_lots)))
         plan["_sbi"] = {
             "min_lot": int(sbi_min_lot),
-            "base_lots": base_lots,
+            "base_lots": int(sbi_min_lot),
             "desired_lots": float(desired_lots),
             "exec_lots": int(exec_lots),
-            "risk_x": float(risk_x),
-            "ev_sbi": float(ev_sbi),
-            "ev_margin": float(ev_margin),
-            "ev_margin_req": float(req_margin),
-            "event_ban": bool(event_ban),
-            "decision_sbi": "NO_TRADE" if (hard_veto or soft_veto) else "TRADE",
+            "trade_quality_score": float(quality),
+            "lot_reason": str(lot_reason),
+            "decision_sbi": "TRADE",
         }
-        plan["_sbi_exec_lots"] = int(exec_lots) if not (hard_veto or soft_veto) else 0
-
-        if hard_veto or soft_veto:
-            reasons = []
-            reasons.append(f"SBI最小{int(sbi_min_lot)}建のため縮退不可（推奨係数{lot_mult:.3f}→実質リスク×{risk_x:.2f}）")
-            reasons.append(f"SBI補正EV {ev_sbi:+.3f} / 閾値 {dyn:.3f}")
-            reasons.append(f"EV余裕 {ev_margin:+.3f} / 必要余裕 {req_margin:.3f}" + ("（イベント近接）" if event_ban else ""))
-
-            plan["_decision_original"] = plan.get("decision")
-            plan["decision"] = "NO_TRADE"
-            plan["_decision_override_reason"] = "SBI最小1建ガード: " + " / ".join(reasons)
-
-            # veto表示にも反映（既存の理由を壊さない）
-            vr = plan.get("veto_reasons")
-            if not isinstance(vr, list):
-                vr = []
-            for r in reasons:
-                vr.append(r)
-            plan["veto_reasons"] = vr
-            plan["veto"] = vr
-
-            # why も補足
-            plan["why"] = " / ".join(reasons[:2])
-            shadow = plan.get("shadow", {}) if isinstance(plan.get("shadow", {}), dict) else {}
-            shadow = dict(shadow)
-            shadow["enabled"] = True
-            shadow["candidate"] = True
-            shadow["mode"] = "TRACK"
-            shadow["reason"] = "SBI最小1建ガードで実売買不可のためSHADOW追跡"
-            shadow["score"] = float(max(float(shadow.get("score", 0.0) or 0.0), 0.55))
-            shadow["gate_gap"] = float(shadow.get("gate_gap", ev - dyn) or (ev - dyn))
-            shadow["rr_gap"] = float(shadow.get("rr_gap", 0.0) or 0.0)
-            shadow["time_exit_focus"] = "30m/60m/120m"
-            plan["shadow"] = shadow
-            plan["shadow_best"] = shadow
-            plan["shadow_candidate"] = True
-            plan["shadow_reason"] = str(shadow.get("reason") or "")
-            plan["shadow_score"] = float(shadow.get("score") or 0.0)
-
+        plan["_sbi_exec_lots"] = int(exec_lots)
         return plan
     except Exception:
-        # 失敗してもアプリを落とさない（安全側：元のplanを返す）
         return plan
 
 
@@ -3641,7 +3598,9 @@ def _render_top_trade_panel(pair_label: str, plan: Dict[str, Any], current_price
         pseudo_ok = bool(plan.get("structure_pseudo_ok") or (plan.get("_ctx") or {}).get("structure_pseudo_ok", False))
         opp_mode = str(plan.get("intraday_opposition_mode") or (plan.get("_ctx") or {}).get("intraday_opposition_mode") or "none")
         timing_mode = str(plan.get("entry_timing_mode") or (plan.get("_ctx") or {}).get("entry_timing_mode") or "—")
-        st.caption(f"判定モード: {gate_mode} / EV(生)={ev_raw:+.3f} / EV(調整後)={ev_adj:+.3f} / 構造擬似OK={'ON' if pseudo_ok else 'OFF'} / entry={timing_mode} / 下位足逆向き={opp_mode}")
+        hp_tp = bool(plan.get("high_precision_tp_candidate") or (plan.get("_ctx") or {}).get("high_precision_tp_candidate", False))
+        hp_score = float(plan.get("high_precision_tp_score") or (plan.get("_ctx") or {}).get("high_precision_tp_score", 0.0) or 0.0)
+        st.caption(f"判定モード: {gate_mode} / EV(生)={ev_raw:+.3f} / EV(調整後)={ev_adj:+.3f} / 構造擬似OK={'ON' if pseudo_ok else 'OFF'} / 高精度TP={'ON' if hp_tp else 'OFF'}({hp_score:.2f}) / entry={timing_mode} / 下位足逆向き={opp_mode}")
 
     r3c1, r3c2 = st.columns(2)
     r3c1.metric("信頼度", f"{confidence:.2f}")
@@ -3649,20 +3608,18 @@ def _render_top_trade_panel(pair_label: str, plan: Dict[str, Any], current_price
     sbi_lots = int(plan.get("_sbi_exec_lots") or (0 if decision == "NO_TRADE" else 1))
     r3c2.metric("推奨建玉（SBI）", f"{sbi_lots}建")
 
-    # SBIガードの数値根拠（必要なときだけ）
+    # SBI建玉条件の数値根拠（必要なときだけ）
     sbi_info = plan.get("_sbi") if isinstance(plan.get("_sbi"), dict) else None
     if isinstance(sbi_info, dict) and sbi_info:
         try:
-            ev_sbi = float(sbi_info.get("ev_sbi") or 0.0)
-            risk_x = float(sbi_info.get("risk_x") or 1.0)
-            ev_margin = float(sbi_info.get("ev_margin") or 0.0)
-            req = float(sbi_info.get("ev_margin_req") or 0.0)
-            if decision == "NO_TRADE":
-                st.caption(f"SBI最小1建ガード：実質リスク×{risk_x:.2f} / SBI補正EV {ev_sbi:+.3f} / EV余裕 {ev_margin:+.3f}（必要 {req:.3f}）")
+            tq = float(sbi_info.get("trade_quality_score") or 0.0)
+            lot_reason = str(sbi_info.get("lot_reason") or "")
+            desired_lots = float(sbi_info.get("desired_lots") or 0.0)
+            exec_lots = int(sbi_info.get("exec_lots") or 0)
+            if decision == "TRADE":
+                st.caption(f"SBI建玉条件：品質スコア {tq:.2f} / 建玉条件 {lot_reason} / 表示建玉 {exec_lots}建")
             else:
-                # TRADEでも縮退推奨が残る場合は注意喚起だけ表示
-                if float(plan.get("_lot_multiplier_reco") or 1.0) < 0.80:
-                    st.caption(f"SBI参考：縮退推奨 係数{float(plan.get('_lot_multiplier_reco') or 1.0):.3f}（実質リスク×{risk_x:.2f}）")
+                st.caption("SBI建玉条件：TRADE時は最低1建から、条件が強いほど2建以上を表示します。")
         except Exception:
             pass
 
@@ -3672,7 +3629,7 @@ def _render_top_trade_panel(pair_label: str, plan: Dict[str, Any], current_price
     st.caption(
         "EV (R) は『損切り幅=1R』基準の期待値です。"
         "動的閾値は危険時に上がります（見送りが増えるのは仕様）。"
-        "縮退係数（参考）は“連続補正”で急変しません。SBIは最小1建のため係数は警戒度として見てください。"
+        "SBI建玉は最小1建からで、建玉数はリスク縮退ではなくトレード条件の強さで表示します。"
     )
 
 
@@ -3703,6 +3660,11 @@ def _render_top_trade_panel(pair_label: str, plan: Dict[str, Any], current_price
                 "（フェーズ/継続確率/構造判定が更新され、条件を満たした可能性があります）"
             )
 
+        hp_tp = bool(plan.get("high_precision_tp_candidate") or False)
+        hp_score = float(plan.get("high_precision_tp_score") or 0.0)
+        tp1 = plan.get("tp1", None)
+        tp2 = plan.get("tp2", None)
+        hp_reason = str(plan.get("high_precision_tp_reason") or "")
         st.markdown(f"""
 - **売買**: {_jp_side(side_raw)}
 - **エントリー注文**: {entry_kind_jp}
@@ -3710,8 +3672,11 @@ def _render_top_trade_panel(pair_label: str, plan: Dict[str, Any], current_price
 - **エントリー価格**: {_fmt_price(entry)}
 - **損切り(SL)**: {_fmt_price(sl)}
 - **利確(TP)**: {_fmt_price(tp)}
+- **分割利確TP1**: {_fmt_price(tp1)}
+- **最終利確TP2**: {_fmt_price(tp2)}
+- **高精度TP候補**: {'ON' if hp_tp else 'OFF'}（score {hp_score:.2f}）
 """)
-        st.caption(f"参考：勝率推定 p_win={p_win_ev:.2f}（あくまでモデル推定）。")
+        st.caption(f"参考：勝率推定 p_win={p_win_ev:.2f}（あくまでモデル推定） / 高精度TP理由: {hp_reason or '—'}")
     else:
         st.warning("⏸ 見送り（NO_TRADE）")
 
