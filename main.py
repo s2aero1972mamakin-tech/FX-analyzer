@@ -2006,12 +2006,25 @@ def _render_ai_engine_panel(ctx: Dict[str, Any], plan_ui: Dict[str, Any]):
             pseudo_ok = bool(ctx.get("structure_pseudo_ok") or plan_ui.get("structure_pseudo_ok") or False)
             timing_mode = str(ctx.get("entry_timing_mode") or plan_ui.get("entry_timing_mode") or "—")
             opp_mode = str(ctx.get("intraday_opposition_mode") or plan_ui.get("intraday_opposition_mode") or "none")
+            opp_strength = str(ctx.get("intraday_opposition_block_strength") or plan_ui.get("intraday_opposition_block_strength") or "none")
+            opp_relaxed = bool(ctx.get("intraday_opposition_relaxed_by_timing") or plan_ui.get("intraday_opposition_relaxed_by_timing") or False)
+            evt_relaxed = bool(ctx.get("event_horizon_mismatch") or plan_ui.get("event_horizon_mismatch") or False)
             d1, d2, d3, d4 = st.columns(4)
             d1.metric("デイトレ品質", f"{iq:.2f}")
             d2.metric("15m整合", "OK" if ff else "NG")
             d3.metric("5m整合", "OK" if mf else "NG")
             d4.metric("判定モード", gmode)
-            st.caption(f"構造擬似OK: {'ON' if pseudo_ok else 'OFF'} / entry timing: {timing_mode} / 下位足逆向き: {opp_mode}")
+            aux = [
+                f"擬似構造:{'ON' if pseudo_ok else 'OFF'}",
+                f"timing:{timing_mode}",
+            ]
+            if opp_mode != "none":
+                aux.append(f"逆行:{opp_strength}")
+            if opp_relaxed:
+                aux.append("逆行緩和")
+            if evt_relaxed:
+                aux.append("イベント緩和")
+            st.caption(" / ".join(aux))
         st.caption("※継続確率は、直近10年（取得できる範囲）のOHLCから簡易学習したロジスティック回帰モデル（統計推定）です。")
 
         # Target zones (not a prediction)
@@ -2051,8 +2064,8 @@ def _render_ai_engine_panel(ctx: Dict[str, Any], plan_ui: Dict[str, Any]):
 
 
 # True RL exit agent (Q-learning) — trains from history and persists model
-st.markdown("#### RL利確管理")
-st.caption("学習済みポリシーで出口提案を出します。入力とボタンはスマホでも崩れにくい短い表示です。")
+st.markdown("#### RL出口管理")
+st.caption("学習済みポリシーで出口候補を表示します。スマホ向けに短い表記へ寄せています。")
 
 rl_dir = "logs"
 os.makedirs(rl_dir, exist_ok=True)
@@ -3647,10 +3660,21 @@ def _ui_quality_badges(plan: Dict[str, Any]) -> List[str]:
         badges.append(gate_label)
     timing = str(plan.get("entry_timing_mode") or ctx.get("entry_timing_mode") or "none")
     if timing and timing != "none":
-        badges.append(f"entry:{timing}")
+        badges.append(f"timing:{timing}")
     opp = str(plan.get("intraday_opposition_mode") or ctx.get("intraday_opposition_mode") or "none")
+    opp_strength = str(plan.get("intraday_opposition_block_strength") or ctx.get("intraday_opposition_block_strength") or "none")
+    opp_relaxed = bool(plan.get("intraday_opposition_relaxed_by_timing") or ctx.get("intraday_opposition_relaxed_by_timing") or False)
     if opp != "none":
-        badges.append(f"逆向き:{opp}")
+        if opp_relaxed:
+            badges.append("逆行:緩和")
+        elif opp_strength == "hard":
+            badges.append("逆行:強")
+        elif opp_strength == "medium":
+            badges.append("逆行:中")
+        else:
+            badges.append("逆行:弱")
+    if bool(plan.get("event_horizon_mismatch") or ctx.get("event_horizon_mismatch") or False):
+        badges.append("イベント緩和")
     return badges[:5]
 
 
@@ -3659,13 +3683,13 @@ def _render_ai_pick_banner(best: Dict[str, Any], trade_axis: str, trade_ranked: 
     decision = str((best.get("decision") or plan.get("decision") or "NO_TRADE")).upper()
     pair = str(best.get("pair") or "—")
     if decision == "TRADE":
-        kicker = "AI自動選択 / 実行候補"
+        kicker = "AI選定 / 実行候補"
         badge = "TRADE"
     elif bool(best.get("shadow_candidate", False)):
-        kicker = "AI自動選択 / SHADOW監視"
+        kicker = "AI選定 / SHADOW"
         badge = "TRACK"
     else:
-        kicker = "AI自動選択 / 見送り"
+        kicker = "AI選定 / 見送り"
         badge = "NO TRADE"
     reason = _ui_reason_short(plan)
     chips_html = ''.join([f'<span class="fx-chip">{c}</span>' for c in _ui_quality_badges(plan)])
@@ -3717,10 +3741,15 @@ def _render_top_trade_panel(pair_label: str, plan: Dict[str, Any], current_price
     if ev_raw is not None and ev_adj is not None and gate_mode:
         pseudo_ok = bool(plan.get("structure_pseudo_ok") or (plan.get("_ctx") or {}).get("structure_pseudo_ok", False))
         opp_mode = str(plan.get("intraday_opposition_mode") or (plan.get("_ctx") or {}).get("intraday_opposition_mode") or "none")
+        opp_strength = str(plan.get("intraday_opposition_block_strength") or (plan.get("_ctx") or {}).get("intraday_opposition_block_strength") or "none")
+        opp_relaxed = bool(plan.get("intraday_opposition_relaxed_by_timing") or (plan.get("_ctx") or {}).get("intraday_opposition_relaxed_by_timing") or False)
+        evt_relaxed = bool(plan.get("event_horizon_mismatch") or (plan.get("_ctx") or {}).get("event_horizon_mismatch") or False)
         timing_mode = str(plan.get("entry_timing_mode") or (plan.get("_ctx") or {}).get("entry_timing_mode") or "—")
-        chips = [f"判定:{_ui_gate_label(plan)}", f"entry:{timing_mode}", f"擬似構造:{'ON' if pseudo_ok else 'OFF'}"]
+        chips = [f"判定:{_ui_gate_label(plan)}", f"timing:{timing_mode}", f"擬似構造:{'ON' if pseudo_ok else 'OFF'}"]
         if opp_mode != "none":
-            chips.append(f"逆向き:{opp_mode}")
+            chips.append("逆行:緩和" if opp_relaxed else f"逆行:{opp_strength}")
+        if evt_relaxed:
+            chips.append("イベント緩和")
         st.markdown('<div class="fx-chip-row">' + ''.join([f'<span class="fx-chip">{x}</span>' for x in chips]) + '</div>', unsafe_allow_html=True)
         st.caption(f"EV(生)={ev_raw:+.3f} / EV(調整後)={ev_adj:+.3f}")
 
@@ -4409,7 +4438,7 @@ st.markdown("""
 <style>
 .block-container { padding-top: 0.8rem; padding-bottom: 4rem; }
 .fx-pick-card { border: 1px solid rgba(148,163,184,0.28); border-radius: 18px; padding: 0.85rem 0.95rem; margin: 0.2rem 0 0.9rem 0; background: linear-gradient(180deg, rgba(15,23,42,0.03), rgba(15,23,42,0.01)); }
-.fx-pick-kicker { font-size: 0.76rem; font-weight: 700; letter-spacing: 0.04em; color: #64748b; text-transform: uppercase; }
+.fx-pick-kicker { font-size: 0.72rem; font-weight: 700; letter-spacing: 0.02em; color: #64748b; }
 .fx-pair-line { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.45rem; margin: 0.15rem 0 0.45rem 0; }
 .fx-pair-line .pair { font-size: 1.35rem; line-height: 1.15; font-weight: 800; color: #0f172a; }
 .fx-pair-line .badge { font-size: 0.74rem; font-weight: 700; padding: 0.20rem 0.5rem; border-radius: 999px; background: rgba(59,130,246,0.10); color: #1d4ed8; }
