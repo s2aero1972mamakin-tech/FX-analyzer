@@ -994,6 +994,7 @@ def _ev_audit_summary(rows: List[Dict[str, Any]], days: int = 14) -> Dict[str, A
 # =========================
 SIGNAL_LOG_PATH = "logs/signals.csv"
 TRADE_LOG_PATH = "logs/trades.csv"
+AUTO_SESSION_VALIDATION_ROWS_KEY = "_daytrade_validation_auto_rows_by_pair"
 
 def _now_utc_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1050,6 +1051,23 @@ def _norm_side(x: Any) -> str:
     if s in ("SHORT", "SELL"):
         return "SHORT"
     return s or "—"
+
+def _trade_profile_name(x: Any) -> str:
+    try:
+        if isinstance(x, dict):
+            s = str(x.get("name") or x.get("profile") or x.get("mode") or "")
+        else:
+            s = str(x or "")
+        u = s.upper()
+        if "DAYTRADE" in u:
+            return "DAYTRADE"
+        if "SWING" in u:
+            return "SWING"
+        if "POSITION" in u:
+            return "POSITION"
+        return s.strip()
+    except Exception:
+        return str(x or "").strip()
 
 def _float_or_none(x: Any) -> Optional[float]:
     try:
@@ -1113,7 +1131,7 @@ def _build_signal_row(pair_label: str, ctx: Dict[str, Any], feats: Dict[str, Any
         "external_meta": (json.dumps(ext_meta, ensure_ascii=False)[:2000] if isinstance(ext_meta, dict) else ""),
         "why": str(plan.get("why", ""))[:500],
         "veto_reasons": (json.dumps(plan.get("veto_reasons", []), ensure_ascii=False)[:500] if plan.get("veto_reasons") else ""),
-        "trade_profile": str(plan.get("trade_profile", "")),
+        "trade_profile": _trade_profile_name(plan.get("trade_profile") or ctx.get("trade_profile")),
         "price_interval": str(plan.get("price_interval", "")),
         "tp1_hint": _float_or_none(plan.get("tp1")),
         "tp2_hint": _float_or_none(plan.get("tp2", plan.get("take_profit"))),
@@ -1204,7 +1222,7 @@ def _safe_ts_parse(v: Any):
 
 def _is_daytrade_signal_row(row: Dict[str, Any]) -> bool:
     try:
-        trade_profile = str(row.get("trade_profile", "")).upper()
+        trade_profile = _trade_profile_name(row.get("trade_profile", "")).upper()
         tf_mode = str(row.get("timeframe_mode", ""))
         price_interval = str(row.get("price_interval", "")).lower()
         return (trade_profile == "DAYTRADE") or ("デイトレ" in tf_mode) or (price_interval in ("1h", "60m", "30m", "15m", "5m"))
@@ -1270,7 +1288,7 @@ def _daytrade_validation_help_text(interval: str, period: str) -> str:
         return f"短期セットアップ確認向けの組み合わせです（{rp}）。"
     return f"執行寄りの細かな検証向けの組み合わせです（{rp}）。"
 
-def _build_daytrade_validation_cases(df_signals: pd.DataFrame) -> List[Dict[str, Any]]:
+def _build_daytrade_validation_cases(df_signals: pd.DataFrame, include_shadow: bool = True) -> List[Dict[str, Any]]:
     if df_signals is None or df_signals.empty:
         return []
     cases: List[Dict[str, Any]] = []
@@ -1406,7 +1424,7 @@ def _fetch_daytrade_validation_bars(cases: List[Dict[str, Any]], interval: str =
 
     return bars_map, fetch_meta_map
 
-def _run_daytrade_validation(df_signals: pd.DataFrame, bar_interval: str = "15m", report_period: str = "1mo") -> Dict[str, Any]:
+def _run_daytrade_validation(df_signals: pd.DataFrame, bar_interval: str = "15m", report_period: str = "1mo", include_shadow: bool = True) -> Dict[str, Any]:
     try:
         def _interval_summary(fetch_meta_map: Dict[str, Dict[str, Any]]) -> str:
             counts: Dict[str, int] = {}
@@ -1440,7 +1458,7 @@ def _run_daytrade_validation(df_signals: pd.DataFrame, bar_interval: str = "15m"
             return row
 
         df_scope = _filter_daytrade_validation_signals(df_signals, report_period)
-        cases = _build_daytrade_validation_cases(df_scope)
+        cases = _build_daytrade_validation_cases(df_scope, include_shadow=include_shadow)
         base_config = {
             "bar_interval": str(bar_interval),
             "report_period": str(report_period),
@@ -1561,6 +1579,61 @@ def _run_daytrade_validation(df_signals: pd.DataFrame, bar_interval: str = "15m"
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
+def _upsert_daytrade_validation_auto_row(row: Dict[str, Any]) -> None:
+    try:
+        if not isinstance(row, dict) or not row:
+            return
+        pair_key = str(row.get("pair") or row.get("symbol") or row.get("signal_id") or "")
+        if not pair_key:
+            return
+        store = st.session_state.get(AUTO_SESSION_VALIDATION_ROWS_KEY, {})
+        if not isinstance(store, dict):
+            store = {}
+        row2 = dict(row)
+        row2["validation_input_source"] = "AUTO_SESSION"
+        store[pair_key] = row2
+        st.session_state[AUTO_SESSION_VALIDATION_ROWS_KEY] = store
+    except Exception:
+        pass
+
+
+def _compose_daytrade_validation_input(df_signals: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    frames: List[pd.DataFrame] = []
+    if isinstance(df_signals, pd.DataFrame) and not df_signals.empty:
+        dlog = df_signals.copy()
+        dlog["validation_input_source"] = "LOG_CSV"
+        frames.append(dlog)
+    try:
+        auto_store = st.session_state.get(AUTO_SESSION_VALIDATION_ROWS_KEY, {})
+    except Exception:
+        auto_store = {}
+    if isinstance(auto_store, dict) and auto_store:
+        rows = [dict(v) for v in auto_store.values() if isinstance(v, dict)]
+        if rows:
+            dauto = pd.DataFrame(rows)
+            dauto["validation_input_source"] = "AUTO_SESSION"
+            frames.append(dauto)
+    if not frames:
+        return pd.DataFrame(), {}
+
+    merged = pd.concat(frames, ignore_index=True, sort=False)
+    merged["validation_input_source"] = merged.get("validation_input_source", "UNKNOWN").fillna("UNKNOWN").astype(str)
+    src_rank = {"LOG_CSV": 0, "AUTO_SESSION": 1}
+    merged["__src_rank__"] = merged["validation_input_source"].map(src_rank).fillna(9).astype(int)
+
+    dedupe_subset = [c for c in ["signal_id"] if c in merged.columns]
+    if not dedupe_subset:
+        dedupe_subset = [c for c in ["pair", "decision", "direction", "entry_hint", "sl_hint", "tp1_hint", "tp2_hint", "shadow_direction", "shadow_entry", "shadow_sl", "shadow_tp1", "shadow_tp2", "ts_utc"] if c in merged.columns]
+    if dedupe_subset:
+        merged = merged.sort_values(["__src_rank__"]).drop_duplicates(subset=dedupe_subset, keep="first")
+    merged = merged.drop(columns=["__src_rank__"], errors="ignore").reset_index(drop=True)
+
+    counts: Dict[str, int] = {}
+    for v in merged["validation_input_source"].fillna("UNKNOWN").astype(str):
+        counts[v] = int(counts.get(v, 0)) + 1
+    return merged, counts
+
+
 def _render_daytrade_validation_panel(df_signals: pd.DataFrame):
     st.markdown("### デイトレ検証レポート")
     st.caption("価格期間上書きとは別に、デイトレ検証レポート専用の足・期間で TP1 / TP2 / TIME_EXIT / 建値撤退 / 最終R / MFE / MAE を集計します。")
@@ -1578,11 +1651,17 @@ def _render_daytrade_validation_panel(df_signals: pd.DataFrame):
     st.info(_daytrade_validation_help_text(interval, period))
     st.caption(f"対象シグナルは直近 {period} の DAYTRADE 候補に限定して集計します。")
 
+    df_validation_input, source_counts = _compose_daytrade_validation_input(df_signals)
+    if source_counts:
+        st.caption("検証入力: " + ", ".join([f"{k}:{source_counts[k]}" for k in sorted(source_counts.keys())]))
+    else:
+        st.caption("検証入力: 0件")
+
     if st.button("デイトレ検証レポートを作成", key="run_daytrade_validation"):
-        df_use = df_signals.copy()
+        df_use = df_validation_input.copy()
         if not include_auto and "decision" in df_use.columns:
-            df_use = df_use[df_use["decision"].astype(str).str.upper() == "TRADE"].copy()
-        rep = _run_daytrade_validation(df_use, bar_interval=interval, report_period=period)
+            df_use = df_use[df_use["decision"].astype(str).str.strip().str.upper() == "TRADE"].copy()
+        rep = _run_daytrade_validation(df_use, bar_interval=interval, report_period=period, include_shadow=include_auto)
         st.session_state["daytrade_validation_report"] = rep
 
     rep = st.session_state.get("daytrade_validation_report")
@@ -1610,6 +1689,9 @@ def _render_daytrade_validation_panel(df_signals: pd.DataFrame):
         mid3.metric("cases_failed_fetch", f"{int(cfg.get('cases_failed_fetch', 0))}")
 
         st.caption(f"actual_interval_used: {str(cfg.get('actual_interval_used') or '—')}")
+        source_counts = cfg.get("signals_source_counts", {}) if isinstance(cfg.get("signals_source_counts", {}), dict) else {}
+        if source_counts:
+            st.caption("signals_source_counts: " + ", ".join([f"{k}:{source_counts[k]}" for k in sorted(source_counts.keys())]))
 
     if not rep.get("ok"):
         st.warning(f"デイトレ検証を作成できませんでした: {rep.get('error','unknown')}")
@@ -2125,6 +2207,7 @@ def _render_logging_panel(pair_label: str, plan_ui: Dict[str, Any], ctx: Dict[st
     st.markdown("### 📝 シグナル/損益ログ（運用用）")
     with st.expander("📝 保存（signals / trades）+ 外部Sink（Webhook/Supabase）", expanded=False):
         row = _build_signal_row(pair_label, ctx, feats, plan_ui, price_meta=price_meta, ext_meta=ext_meta)
+        _upsert_daytrade_validation_auto_row(row)
         st.caption("運用の第一歩：**『シグナル保存 → 決済後に損益保存 → パフォーマンス自動集計』** の流れを固定します。")
 
         c1, c2 = st.columns(2)
