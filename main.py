@@ -2003,11 +2003,15 @@ def _render_ai_engine_panel(ctx: Dict[str, Any], plan_ui: Dict[str, Any]):
             ff = bool(ctx.get("fast_tf_dir_ok", False))
             mf = bool(ctx.get("micro_tf_dir_ok", False))
             gmode = str(plan_ui.get("gate_mode") or "—")
+            pseudo_ok = bool(ctx.get("structure_pseudo_ok") or plan_ui.get("structure_pseudo_ok") or False)
+            timing_mode = str(ctx.get("entry_timing_mode") or plan_ui.get("entry_timing_mode") or "—")
+            opp_mode = str(ctx.get("intraday_opposition_mode") or plan_ui.get("intraday_opposition_mode") or "none")
             d1, d2, d3, d4 = st.columns(4)
             d1.metric("デイトレ品質", f"{iq:.2f}")
             d2.metric("15m整合", "OK" if ff else "NG")
             d3.metric("5m整合", "OK" if mf else "NG")
             d4.metric("判定モード", gmode)
+            st.caption(f"構造擬似OK: {'ON' if pseudo_ok else 'OFF'} / entry timing: {timing_mode} / 下位足逆向き: {opp_mode}")
         st.caption("※継続確率は、直近10年（取得できる範囲）のOHLCから簡易学習したロジスティック回帰モデル（統計推定）です。")
 
         # Target zones (not a prediction)
@@ -3634,7 +3638,10 @@ def _render_top_trade_panel(pair_label: str, plan: Dict[str, Any], current_price
     ev_adj = plan.get("expected_R_ev_adj", None)
     gate_mode = plan.get("gate_mode", None)
     if ev_raw is not None and ev_adj is not None and gate_mode:
-        st.caption(f"判定モード: {gate_mode} / EV(生)={ev_raw:+.3f} / EV(調整後)={ev_adj:+.3f}")
+        pseudo_ok = bool(plan.get("structure_pseudo_ok") or (plan.get("_ctx") or {}).get("structure_pseudo_ok", False))
+        opp_mode = str(plan.get("intraday_opposition_mode") or (plan.get("_ctx") or {}).get("intraday_opposition_mode") or "none")
+        timing_mode = str(plan.get("entry_timing_mode") or (plan.get("_ctx") or {}).get("entry_timing_mode") or "—")
+        st.caption(f"判定モード: {gate_mode} / EV(生)={ev_raw:+.3f} / EV(調整後)={ev_adj:+.3f} / 構造擬似OK={'ON' if pseudo_ok else 'OFF'} / entry={timing_mode} / 下位足逆向き={opp_mode}")
 
     r3c1, r3c2 = st.columns(2)
     r3c1.metric("信頼度", f"{confidence:.2f}")
