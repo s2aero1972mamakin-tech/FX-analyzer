@@ -3394,18 +3394,30 @@ def evaluate_daytrade_validation_case(case: Dict[str, Any], bars: Optional[pd.Da
         "exit_ts": None,
         "partial_realized_r": 0.0,
         "remaining_size": 1.0,
+        "pending_future_bars": False,
+        "latest_closed_bar_ts": None,
+        "signal_after_latest_closed_bar": False,
     }
     try:
         d = _dtv_prepare_bars(bars)
         if d.empty:
             out["error"] = "empty_bars"
             return out
+        latest_closed_bar_ts = d.index[-1] if len(d.index) > 0 else None
+        out["latest_closed_bar_ts"] = latest_closed_bar_ts.isoformat() if hasattr(latest_closed_bar_ts, "isoformat") else (str(latest_closed_bar_ts) if latest_closed_bar_ts is not None else None)
         ts_open = _dtv_parse_ts((case or {}).get("ts_utc") or (case or {}).get("entry_ts"))
         if ts_open is None:
             ts_open = d.index[0]
+        signal_after_latest_closed_bar = bool(latest_closed_bar_ts is not None and ts_open is not None and ts_open > latest_closed_bar_ts)
+        out["signal_after_latest_closed_bar"] = signal_after_latest_closed_bar
         d = d.loc[d.index >= ts_open].copy()
         if d.empty:
-            out["error"] = "no_forward_bars"
+            out.update({
+                "ok": True,
+                "pending_future_bars": True,
+                "exit_reason": "PENDING_FUTURE_BARS",
+                "error": "no_forward_bars",
+            })
             return out
 
         direction = str((case or {}).get("direction", "LONG")).upper()
@@ -3608,10 +3620,15 @@ def evaluate_daytrade_validation_case(case: Dict[str, Any], bars: Optional[pd.Da
 def build_daytrade_validation_summary(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     try:
         rows = [r for r in (results or []) if isinstance(r, dict)]
+        pending = [
+            r for r in rows
+            if bool(r.get("pending_future_bars")) or str(r.get("exit_reason", "")).upper() == "PENDING_FUTURE_BARS"
+        ]
         triggered = [r for r in rows if r.get("triggered")]
         realized = [r for r in triggered if r.get("ok")]
         n_all = len(rows)
         n_trg = len(triggered)
+        n_pending = len(pending)
         def _rate(key, base):
             if base <= 0:
                 return 0.0
@@ -3622,6 +3639,7 @@ def build_daytrade_validation_summary(results: List[Dict[str, Any]]) -> Dict[str
         out = {
             "cases_total": int(n_all),
             "cases_triggered": int(n_trg),
+            "cases_pending_future_bars": int(n_pending),
             "trigger_rate": float(n_trg / n_all) if n_all > 0 else 0.0,
             "tp1_hit_rate": _rate("tp1_hit", n_trg),
             "tp2_hit_rate": _rate("tp2_hit", n_trg),
@@ -3641,6 +3659,7 @@ def build_daytrade_validation_summary(results: List[Dict[str, Any]]) -> Dict[str
             rs = [float(r.get("final_r", 0.0) or 0.0) for r in subset]
             by_source[src] = {
                 "n": int(len(subset)),
+                "pending_future_bars": int(sum(1 for r in rows if str(r.get("source", "LIVE")) == src and (bool(r.get("pending_future_bars")) or str(r.get("exit_reason", "")).upper() == "PENDING_FUTURE_BARS"))),
                 "tp1_hit_rate": float(sum(1 for r in subset if r.get("tp1_hit")) / len(subset)) if subset else 0.0,
                 "tp2_hit_rate": float(sum(1 for r in subset if r.get("tp2_hit")) / len(subset)) if subset else 0.0,
                 "time_exit_rate": float(sum(1 for r in subset if r.get("time_exit")) / len(subset)) if subset else 0.0,
@@ -3649,7 +3668,7 @@ def build_daytrade_validation_summary(results: List[Dict[str, Any]]) -> Dict[str
         out["by_source"] = by_source
         return out
     except Exception as e:
-        return {"cases_total": 0, "cases_triggered": 0, "passed": False, "error": f"{type(e).__name__}: {e}"}
+        return {"cases_total": 0, "cases_triggered": 0, "cases_pending_future_bars": 0, "passed": False, "error": f"{type(e).__name__}: {e}"}
 
 
 def run_daytrade_validation_report(cases: List[Dict[str, Any]], bars_map: Dict[str, pd.DataFrame], bar_minutes: int = 15) -> Dict[str, Any]:
