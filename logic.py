@@ -585,17 +585,17 @@ def _intraday_entry_rescue_margin(score: float) -> float:
 def _high_precision_tp_floor_r(phase_label: str, strength: float, intraday_entry_quality: float, entry_timing_score: float) -> float:
     try:
         phase = str(phase_label or "")
-        floor_r = 0.16
-        floor_r += 0.10 * float(_clamp(strength, 0.0, 1.0))
-        floor_r += 0.12 * float(_clamp(intraday_entry_quality, 0.0, 1.0))
-        floor_r += 0.08 * float(_clamp(entry_timing_score, 0.0, 1.0))
+        floor_r = 0.24
+        floor_r += 0.12 * float(_clamp(strength, 0.0, 1.0))
+        floor_r += 0.14 * float(_clamp(intraday_entry_quality, 0.0, 1.0))
+        floor_r += 0.10 * float(_clamp(entry_timing_score, 0.0, 1.0))
         if phase.startswith("BREAKOUT"):
-            floor_r += 0.04
+            floor_r += 0.06
         elif phase == "RANGE":
-            floor_r -= 0.04
-        return float(_clamp(floor_r, 0.18, 0.38))
+            floor_r -= 0.03
+        return float(_clamp(floor_r, 0.24, 0.50))
     except Exception:
-        return 0.22
+        return 0.30
 
 
 def _enforce_high_precision_tp1(entry: float, sl: float, tp1: float, tp2: float, direction: str, phase_label: str, strength: float, intraday_entry_quality: float, entry_timing_score: float) -> Tuple[float, float, bool]:
@@ -608,22 +608,40 @@ def _enforce_high_precision_tp1(entry: float, sl: float, tp1: float, tp2: float,
         if risk <= 1e-9:
             return float(tp1), 0.0, False
         floor_r = _high_precision_tp_floor_r(phase_label, strength, intraday_entry_quality, entry_timing_score)
-        min_reward = max(floor_r * risk, 0.18 * risk)
+        min_reward = max(floor_r * risk, 0.24 * risk)
         current_reward = abs(tp1 - entry)
         adjusted = False
         if current_reward + 1e-12 < min_reward:
             tp2_reward = abs(tp2 - entry)
-            target_reward = min(max(min_reward, 0.34 * tp2_reward), 0.82 * max(tp2_reward, min_reward))
+            target_reward = min(max(min_reward, 0.42 * tp2_reward), 0.78 * max(tp2_reward, min_reward))
             if str(direction).upper() == "LONG":
-                tp1 = min(entry + target_reward, entry + 0.84 * max(tp2_reward, target_reward))
+                tp1 = min(entry + target_reward, entry + 0.80 * max(tp2_reward, target_reward))
                 tp1 = min(tp1, tp2 - 1e-6) if tp2 > entry else tp1
             else:
-                tp1 = max(entry - target_reward, entry - 0.84 * max(tp2_reward, target_reward))
+                tp1 = max(entry - target_reward, entry - 0.80 * max(tp2_reward, target_reward))
                 tp1 = max(tp1, tp2 + 1e-6) if tp2 < entry else tp1
             adjusted = True
         return float(tp1), float(floor_r), bool(adjusted)
     except Exception:
-        return float(tp1), 0.22, False
+        return float(tp1), 0.30, False
+
+
+def _precision_grade(score: float) -> str:
+    try:
+        s = float(_clamp(score, 0.0, 1.0))
+        if s >= 0.90:
+            return "A"
+        if s >= 0.82:
+            return "A-"
+        if s >= 0.74:
+            return "B+"
+        if s >= 0.66:
+            return "B"
+        if s >= 0.58:
+            return "C+"
+        return "C"
+    except Exception:
+        return "C"
 
 
 def _assess_high_precision_tp_candidate(entry: float, sl: float, tp1: float, tp2: float, direction: str, intraday_entry_quality: float, entry_timing_score: float, p_eff: float, confidence: float, rr: float, mtf_alignment_score: float, structure_effective_dir_ok: bool, breakout_ok: bool, opposition_mode: str, gate_mode: str) -> Dict[str, Any]:
@@ -637,6 +655,7 @@ def _assess_high_precision_tp_candidate(entry: float, sl: float, tp1: float, tp2
             return {
                 "candidate": False,
                 "score": 0.0,
+                "grade": "C",
                 "reason": "zero_risk",
                 "tp1_r": 0.0,
                 "tp2_r": 0.0,
@@ -645,61 +664,71 @@ def _assess_high_precision_tp_candidate(entry: float, sl: float, tp1: float, tp2
         tp1_r = abs(tp1 - entry) / max(risk, 1e-9)
         tp2_r = abs(tp2 - entry) / max(risk, 1e-9)
         floor_r = _high_precision_tp_floor_r("", 0.5, intraday_entry_quality, entry_timing_score)
-        structure_bonus = 0.10 if bool(structure_effective_dir_ok) else 0.0
-        breakout_bonus = 0.06 if bool(breakout_ok) else 0.0
+        structure_bonus = 0.16 if bool(structure_effective_dir_ok) else 0.0
+        breakout_bonus = 0.10 if bool(breakout_ok) else 0.0
         opposition_pen = 0.0
         opp = str(opposition_mode or "none")
         if opp in ("micro_opposition", "score_only_opposition"):
-            opposition_pen = 0.04
+            opposition_pen = 0.06
         elif opp != "none":
-            opposition_pen = 0.10
-        rescue_pen = 0.06 if str(gate_mode or "") == "intraday_precision_rescue" else 0.0
+            opposition_pen = 0.14
+        rescue_pen = 0.12 if str(gate_mode or "") == "intraday_precision_rescue" else 0.0
         score = 0.0
-        score += 0.24 * float(_clamp((tp1_r - 0.16) / 0.18, 0.0, 1.0))
-        score += 0.20 * float(_clamp((tp2_r - 1.00) / 0.50, 0.0, 1.0))
-        score += 0.18 * float(_clamp(intraday_entry_quality, 0.0, 1.0))
-        score += 0.12 * float(_clamp(entry_timing_score, 0.0, 1.0))
-        score += 0.12 * float(_clamp((confidence - 0.40) / 0.30, 0.0, 1.0))
-        score += 0.10 * float(_clamp((p_eff - 0.40) / 0.18, 0.0, 1.0))
-        score += 0.08 * float(_clamp((rr - 1.00) / 0.45, 0.0, 1.0))
-        score += 0.06 * float(_clamp((mtf_alignment_score + 0.10) / 0.70, 0.0, 1.0))
+        score += 0.22 * float(_clamp((tp1_r - 0.24) / 0.26, 0.0, 1.0))
+        score += 0.18 * float(_clamp((tp2_r - 1.20) / 0.55, 0.0, 1.0))
+        score += 0.16 * float(_clamp((intraday_entry_quality - 0.64) / 0.22, 0.0, 1.0))
+        score += 0.12 * float(_clamp((entry_timing_score - 0.56) / 0.22, 0.0, 1.0))
+        score += 0.12 * float(_clamp((confidence - 0.48) / 0.24, 0.0, 1.0))
+        score += 0.10 * float(_clamp((p_eff - 0.46) / 0.12, 0.0, 1.0))
+        score += 0.08 * float(_clamp((rr - 1.10) / 0.40, 0.0, 1.0))
+        score += 0.06 * float(_clamp((mtf_alignment_score - 0.10) / 0.55, 0.0, 1.0))
         score += structure_bonus + breakout_bonus
         score -= opposition_pen + rescue_pen
         score = float(_clamp(score, 0.0, 1.0))
 
         reasons = []
-        if tp1_r < 0.18:
-            reasons.append("TP1近すぎ")
-        if tp2_r < 1.10:
+        if tp1_r < max(0.28, floor_r):
+            reasons.append("TP1不足")
+        if tp2_r < 1.25:
             reasons.append("TP2不足")
-        if intraday_entry_quality < 0.66:
+        if intraday_entry_quality < 0.72:
             reasons.append("短期足品質不足")
-        if entry_timing_score < 0.58:
+        if entry_timing_score < 0.64:
             reasons.append("entry timing弱い")
-        if confidence < 0.50:
+        if confidence < 0.56:
             reasons.append("信頼度不足")
-        if p_eff < 0.46:
+        if p_eff < 0.50:
             reasons.append("勝率不足")
-        if (not structure_effective_dir_ok) and (not breakout_ok):
-            reasons.append("構造弱い")
-        if opp not in ("none", "score_only_opposition"):
+        if rr < 1.25:
+            reasons.append("RR不足")
+        if mtf_alignment_score < 0.32:
+            reasons.append("下位足整合不足")
+        if not (bool(structure_effective_dir_ok) or bool(breakout_ok)):
+            reasons.append("構造未確認")
+        if str(gate_mode or "") == "intraday_precision_rescue":
+            reasons.append("救済通過")
+        if opp != "none":
             reasons.append("下位足逆向き")
 
         candidate = bool(
-            tp1_r >= 0.18
-            and tp2_r >= 1.10
-            and float(intraday_entry_quality) >= 0.66
-            and float(entry_timing_score) >= 0.58
-            and float(confidence) >= 0.50
-            and float(p_eff) >= 0.46
-            and (bool(structure_effective_dir_ok) or bool(breakout_ok) or float(mtf_alignment_score) >= 0.28)
-            and opp in ("none", "score_only_opposition")
-            and score >= 0.60
+            tp1_r >= max(0.28, floor_r)
+            and tp2_r >= 1.25
+            and float(intraday_entry_quality) >= 0.72
+            and float(entry_timing_score) >= 0.64
+            and float(confidence) >= 0.56
+            and float(p_eff) >= 0.50
+            and float(rr) >= 1.25
+            and float(mtf_alignment_score) >= 0.32
+            and (bool(structure_effective_dir_ok) or bool(breakout_ok))
+            and opp == "none"
+            and str(gate_mode or "") != "intraday_precision_rescue"
+            and score >= 0.74
         )
         return {
             "candidate": bool(candidate),
             "score": float(score),
-            "reason": " / ".join(reasons) if reasons else "high_precision_tp_ok",
+            "grade": _precision_grade(score),
+            "reason": "high_precision_tp_ok" if candidate else (" / ".join(reasons) if reasons else "tp_precision_insufficient"),
             "tp1_r": float(tp1_r),
             "tp2_r": float(tp2_r),
             "floor_r": float(floor_r),
@@ -708,6 +737,7 @@ def _assess_high_precision_tp_candidate(entry: float, sl: float, tp1: float, tp2
         return {
             "candidate": False,
             "score": 0.0,
+            "grade": "C",
             "reason": "high_precision_tp_error",
             "tp1_r": 0.0,
             "tp2_r": 0.0,
@@ -3188,7 +3218,7 @@ def get_ai_order_strategy(
             decision = "TRADE"
             gate_mode = "post_breakout_rescue"
             why = f"イベント後捕獲（1〜24hブレイク専用）: EV {ev_gate:+.3f} / 閾値 {float(dynamic_threshold):.3f}（救済）"
-        elif bool(trade_profile.get("is_intraday")) and float(intraday_entry_quality or 0.0) >= 0.62 and float(confidence) >= 0.35 and (bool(breakout_pass) or bool(range_edge_setup) or bool(structure_pseudo_ok) or float(mtf_alignment_score or 0.0) >= 0.18) and (ev_gate >= float(dynamic_threshold) - float(intraday_rescue_margin)):
+        elif bool(trade_profile.get("is_intraday")) and float(intraday_entry_quality or 0.0) >= 0.68 and float(confidence) >= 0.42 and float(p_eff) >= 0.48 and float(entry_timing_score or 0.0) >= 0.60 and (bool(breakout_pass) or bool(structure_effective_dir_ok) or (bool(range_edge_setup) and float(mtf_alignment_score or 0.0) >= 0.10)) and (ev_gate >= float(dynamic_threshold) - float(min(intraday_rescue_margin, 0.05))):
             decision = "TRADE"
             gate_mode = "intraday_precision_rescue"
             why = f"デイトレ精密救済: EV {ev_gate:+.3f} / 閾値 {float(dynamic_threshold):.3f} / 品質 {float(intraday_entry_quality):.2f}"
@@ -3381,6 +3411,7 @@ def get_ai_order_strategy(
         "tp2_cap_reason": str(tp2_cap_reason),
         "high_precision_tp_candidate": bool(high_precision_tp.get("candidate", False)),
         "high_precision_tp_score": float(high_precision_tp.get("score", 0.0) or 0.0),
+        "high_precision_tp_grade": str(high_precision_tp.get("grade", "C") or "C"),
         "high_precision_tp_reason": str(high_precision_tp.get("reason", "") or ""),
         "high_precision_tp1_r": float(high_precision_tp.get("tp1_r", 0.0) or 0.0),
         "high_precision_tp2_r": float(high_precision_tp.get("tp2_r", 0.0) or 0.0),
@@ -3646,6 +3677,7 @@ def get_ai_order_strategy(
         "tp2_cap_reason": str(tp2_cap_reason),
         "high_precision_tp_candidate": bool(high_precision_tp.get("candidate", False)),
         "high_precision_tp_score": float(high_precision_tp.get("score", 0.0) or 0.0),
+        "high_precision_tp_grade": str(high_precision_tp.get("grade", "C") or "C"),
         "high_precision_tp_reason": str(high_precision_tp.get("reason", "") or ""),
         "high_precision_tp1_r": float(high_precision_tp.get("tp1_r", 0.0) or 0.0),
         "high_precision_tp2_r": float(high_precision_tp.get("tp2_r", 0.0) or 0.0),
