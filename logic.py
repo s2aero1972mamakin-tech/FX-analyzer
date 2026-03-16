@@ -94,32 +94,189 @@ def _quality_decay(strength, breakout_ok, hhhl_ok, confidence):
     q = max(0.35, min(1.0, q))
     return q
 
-def _entry_timing_filter(df, direction):
+def _entry_timing_state(df, direction):
     try:
         o = df["Open"].astype(float)
         h = df["High"].astype(float)
         l = df["Low"].astype(float)
         c = df["Close"].astype(float)
-        if len(c) < 4:
-            return True
+        if len(c) < 6:
+            return {"ok": True, "mode": "len_short", "score": 0.60, "flags": ["len_short"]}
+
+        direction = str(direction).upper()
         last_rng = max(1e-9, float(h.iloc[-1] - l.iloc[-1]))
         prev_rng = max(1e-9, float(h.iloc[-2] - l.iloc[-2]))
-        direction = str(direction).upper()
+        prev2_rng = max(1e-9, float(h.iloc[-3] - l.iloc[-3]))
+        body = abs(float(c.iloc[-1] - o.iloc[-1]))
+        upper_wick = float(h.iloc[-1] - max(c.iloc[-1], o.iloc[-1]))
+        lower_wick = float(min(c.iloc[-1], o.iloc[-1]) - l.iloc[-1])
+        prev_mid = float((h.iloc[-2] + l.iloc[-2]) * 0.5)
+        prev2_mid = float((h.iloc[-3] + l.iloc[-3]) * 0.5)
+
+        flags = []
+        score = 0.0
+        mode = "none"
+
         if direction == "LONG":
-            body_ok = (c.iloc[-1] > o.iloc[-1]) and (c.iloc[-1] >= c.iloc[-2])
-            follow_ok = (c.iloc[-2] > c.iloc[-3]) and (c.iloc[-1] >= c.iloc[-2] - 0.25 * prev_rng)
-            breakout_ok = c.iloc[-1] >= max(h.iloc[-2], c.iloc[-2]) - 0.10 * last_rng
-            reclaim_ok = (c.iloc[-1] > (h.iloc[-2] + l.iloc[-2]) * 0.5) and (c.iloc[-1] > o.iloc[-1])
-            cond = body_ok or (follow_ok and breakout_ok) or reclaim_ok
+            body_ok = bool((c.iloc[-1] > o.iloc[-1]) and (c.iloc[-1] >= c.iloc[-2]))
+            follow2_ok = bool((c.iloc[-2] >= c.iloc[-3] - 0.18 * prev2_rng) and (c.iloc[-1] >= c.iloc[-2] - 0.12 * prev_rng) and (c.iloc[-1] > o.iloc[-1]))
+            breakout_hold = bool(c.iloc[-1] >= max(h.iloc[-2], h.iloc[-3], c.iloc[-2]) - 0.08 * last_rng)
+            reclaim_ok = bool((c.iloc[-2] <= prev_mid) and (c.iloc[-1] > prev_mid) and (c.iloc[-1] > o.iloc[-1]))
+            pullback_resume = bool((c.iloc[-3] >= c.iloc[-4]) and (c.iloc[-2] <= c.iloc[-3]) and (c.iloc[-1] >= max(c.iloc[-2], o.iloc[-2])) and (c.iloc[-1] > o.iloc[-1]))
+            wick_reject = bool((lower_wick >= max(body * 0.85, 0.22 * last_rng)) and (c.iloc[-1] > o.iloc[-1]) and (c.iloc[-1] >= prev_mid))
+            inside_break = bool((h.iloc[-2] <= h.iloc[-3]) and (l.iloc[-2] >= l.iloc[-3]) and (c.iloc[-1] >= h.iloc[-2] - 0.05 * last_rng))
+            trend_resume = bool((c.iloc[-1] >= c.iloc[-2]) and (c.iloc[-2] >= prev2_mid) and (c.iloc[-1] > prev_mid))
+            checks = [
+                (body_ok, 0.18, "body"),
+                (follow2_ok, 0.18, "follow2"),
+                (breakout_hold, 0.20, "breakout_hold"),
+                (reclaim_ok, 0.16, "reclaim"),
+                (pullback_resume, 0.18, "pullback_resume"),
+                (wick_reject, 0.14, "wick_reject"),
+                (inside_break, 0.12, "inside_break"),
+                (trend_resume, 0.12, "trend_resume"),
+            ]
+            precedence = ["breakout_hold", "pullback_resume", "reclaim", "wick_reject", "follow2", "inside_break", "trend_resume", "body"]
         else:
-            body_ok = (c.iloc[-1] < o.iloc[-1]) and (c.iloc[-1] <= c.iloc[-2])
-            follow_ok = (c.iloc[-2] < c.iloc[-3]) and (c.iloc[-1] <= c.iloc[-2] + 0.25 * prev_rng)
-            breakout_ok = c.iloc[-1] <= min(l.iloc[-2], c.iloc[-2]) + 0.10 * last_rng
-            reclaim_ok = (c.iloc[-1] < (h.iloc[-2] + l.iloc[-2]) * 0.5) and (c.iloc[-1] < o.iloc[-1])
-            cond = body_ok or (follow_ok and breakout_ok) or reclaim_ok
-        return bool(cond)
+            body_ok = bool((c.iloc[-1] < o.iloc[-1]) and (c.iloc[-1] <= c.iloc[-2]))
+            follow2_ok = bool((c.iloc[-2] <= c.iloc[-3] + 0.18 * prev2_rng) and (c.iloc[-1] <= c.iloc[-2] + 0.12 * prev_rng) and (c.iloc[-1] < o.iloc[-1]))
+            breakout_hold = bool(c.iloc[-1] <= min(l.iloc[-2], l.iloc[-3], c.iloc[-2]) + 0.08 * last_rng)
+            reclaim_ok = bool((c.iloc[-2] >= prev_mid) and (c.iloc[-1] < prev_mid) and (c.iloc[-1] < o.iloc[-1]))
+            pullback_resume = bool((c.iloc[-3] <= c.iloc[-4]) and (c.iloc[-2] >= c.iloc[-3]) and (c.iloc[-1] <= min(c.iloc[-2], o.iloc[-2])) and (c.iloc[-1] < o.iloc[-1]))
+            wick_reject = bool((upper_wick >= max(body * 0.85, 0.22 * last_rng)) and (c.iloc[-1] < o.iloc[-1]) and (c.iloc[-1] <= prev_mid))
+            inside_break = bool((h.iloc[-2] <= h.iloc[-3]) and (l.iloc[-2] >= l.iloc[-3]) and (c.iloc[-1] <= l.iloc[-2] + 0.05 * last_rng))
+            trend_resume = bool((c.iloc[-1] <= c.iloc[-2]) and (c.iloc[-2] <= prev2_mid) and (c.iloc[-1] < prev_mid))
+            checks = [
+                (body_ok, 0.18, "body"),
+                (follow2_ok, 0.18, "follow2"),
+                (breakout_hold, 0.20, "breakout_hold"),
+                (reclaim_ok, 0.16, "reclaim"),
+                (pullback_resume, 0.18, "pullback_resume"),
+                (wick_reject, 0.14, "wick_reject"),
+                (inside_break, 0.12, "inside_break"),
+                (trend_resume, 0.12, "trend_resume"),
+            ]
+            precedence = ["breakout_hold", "pullback_resume", "reclaim", "wick_reject", "follow2", "inside_break", "trend_resume", "body"]
+
+        for ok_flag, weight, label in checks:
+            if ok_flag:
+                score += float(weight)
+                flags.append(label)
+        for label in precedence:
+            if label in flags:
+                mode = label
+                break
+
+        strong_ok = bool(
+            "breakout_hold" in flags
+            or "pullback_resume" in flags
+            or ("follow2" in flags and "body" in flags)
+            or ("wick_reject" in flags and ("reclaim" in flags or "trend_resume" in flags))
+        )
+        ok = bool(strong_ok or score >= 0.50)
+        return {
+            "ok": bool(ok),
+            "mode": str(mode),
+            "score": float(_clamp(score, 0.0, 1.0)),
+            "flags": list(flags),
+        }
+    except Exception:
+        return {"ok": True, "mode": "error_fallback", "score": 0.50, "flags": ["error_fallback"]}
+
+
+def _entry_timing_filter(df, direction):
+    try:
+        return bool((_entry_timing_state(df, direction) or {}).get("ok", True))
     except Exception:
         return True
+
+
+def _pseudo_structure_ok(direction, phase_label, strength, mom, cont_dir, range_pos, breakout_ok, breakout_strength, mtf_alignment_score, fast_tf_dir_ok, micro_tf_dir_ok, range_edge_setup=False):
+    try:
+        phase = str(phase_label or "")
+        direction = str(direction).upper()
+        strength = float(_clamp(strength, 0.0, 1.0))
+        cont_dir = float(_clamp(cont_dir, 0.0, 1.0))
+        mom = float(mom)
+        breakout_strength = float(_clamp(breakout_strength, 0.0, 1.0))
+        mtf_alignment_score = float(_clamp(mtf_alignment_score, -1.0, 1.0))
+        fast_bad = bool(fast_tf_dir_ok is False)
+        micro_bad = bool(micro_tf_dir_ok is False)
+        severe_opposition = bool(fast_bad and micro_bad and mtf_alignment_score <= -0.55)
+        if phase == "RANGE" and not bool(range_edge_setup):
+            return False, "range_phase", 0.0
+        if severe_opposition:
+            return False, "severe_lower_tf_opposition", 0.0
+        favorable_zone = bool(float(range_pos) <= 0.78) if direction == "LONG" else bool(float(range_pos) >= 0.22)
+        mom_ok = bool(mom >= 0.16) if direction == "LONG" else bool(mom <= -0.16)
+        breakout_soft = bool(breakout_ok) or bool(breakout_strength >= 0.22)
+        score = 0.0
+        score += 0.34 * strength
+        score += 0.28 * max(0.0, (cont_dir - 0.5) * 2.0)
+        score += 0.14 if mom_ok else 0.0
+        score += 0.12 if breakout_soft else 0.0
+        score += 0.08 if favorable_zone else -0.10
+        score += 0.10 * max(0.0, mtf_alignment_score)
+        score -= 0.08 if micro_bad else 0.0
+        score -= 0.04 if fast_bad else 0.0
+        score = float(_clamp(score, 0.0, 1.0))
+        ok = bool(
+            favorable_zone
+            and (
+                (strength >= 0.58 and cont_dir >= 0.60 and mom_ok)
+                or (strength >= 0.52 and cont_dir >= 0.57 and breakout_soft)
+                or (strength >= 0.48 and cont_dir >= 0.62 and abs(mom) >= 0.24 and mtf_alignment_score >= 0.05)
+                or (bool(range_edge_setup) and cont_dir >= 0.56 and abs(mom) >= 0.12)
+            )
+        )
+        reason = "pseudo_structure_ok" if ok else "pseudo_structure_insufficient"
+        return bool(ok), str(reason), float(score)
+    except Exception:
+        return False, "pseudo_structure_error", 0.0
+
+
+def _intraday_opposition_penalty(mtf_alignment_score, fast_tf_dir_ok, micro_tf_dir_ok):
+    try:
+        score = float(_clamp(mtf_alignment_score, -1.0, 1.0))
+        fast_bad = bool(fast_tf_dir_ok is False)
+        micro_bad = bool(micro_tf_dir_ok is False)
+        mode = "none"
+        ev_penalty = 0.0
+        threshold_add = 0.0
+        confidence_mult = 1.0
+        hard_block = False
+        if fast_bad and micro_bad:
+            mode = "fast_micro_opposition"
+            ev_penalty = 0.08 + 0.06 * max(0.0, -score)
+            threshold_add = 0.03 + 0.03 * max(0.0, -score)
+            confidence_mult = 0.84
+            hard_block = bool(score <= -0.72)
+        elif fast_bad:
+            mode = "fast_opposition"
+            ev_penalty = 0.05 + 0.04 * max(0.0, -score)
+            threshold_add = 0.02 + 0.02 * max(0.0, -score)
+            confidence_mult = 0.90
+            hard_block = bool(score <= -0.92)
+        elif micro_bad:
+            mode = "micro_opposition"
+            ev_penalty = 0.03 + 0.03 * max(0.0, -score)
+            threshold_add = 0.01 + 0.015 * max(0.0, -score)
+            confidence_mult = 0.94
+            hard_block = bool(score <= -0.98)
+        elif score < 0.0:
+            mode = "score_only_opposition"
+            ev_penalty = 0.015 + 0.02 * max(0.0, -score)
+            threshold_add = 0.008 + 0.010 * max(0.0, -score)
+            confidence_mult = 0.97
+        return {
+            "mode": str(mode),
+            "ev_penalty": float(ev_penalty),
+            "threshold_add": float(threshold_add),
+            "confidence_mult": float(_clamp(confidence_mult, 0.70, 1.0)),
+            "hard_block": bool(hard_block),
+        }
+    except Exception:
+        return {"mode": "none", "ev_penalty": 0.0, "threshold_add": 0.0, "confidence_mult": 1.0, "hard_block": False}
 
 def _failure_features(df):
     try:
@@ -2432,6 +2589,34 @@ def get_ai_order_strategy(
     if bool(trade_profile.get("is_intraday")):
         tp1, tp1_liquidity_capped = _cap_daytrade_tp1_to_liquidity(entry, tp1, tp2, direction, liq_tp_intraday)
 
+    cont_dir = float(p_up if direction == "LONG" else p_dn)
+    structure_pseudo_ok = False
+    structure_pseudo_reason = "disabled"
+    structure_pseudo_score = 0.0
+    intraday_opposition = {"mode": "none", "ev_penalty": 0.0, "threshold_add": 0.0, "confidence_mult": 1.0, "hard_block": False}
+    structure_effective_dir_ok = bool(structure_dir_ok)
+    if bool(trade_profile.get("is_intraday")):
+        structure_pseudo_ok, structure_pseudo_reason, structure_pseudo_score = _pseudo_structure_ok(
+            direction=str(direction),
+            phase_label=phase_label,
+            strength=float(strength),
+            mom=float(mom),
+            cont_dir=float(cont_dir),
+            range_pos=float(range_pos),
+            breakout_ok=bool(breakout_ok),
+            breakout_strength=float(breakout_strength),
+            mtf_alignment_score=float(mtf_alignment_score or 0.0),
+            fast_tf_dir_ok=(bool(mtf_fast.get("dir_ok")) if mtf_fast else None),
+            micro_tf_dir_ok=(bool(mtf_micro.get("dir_ok")) if mtf_micro else None),
+            range_edge_setup=False,
+        )
+        intraday_opposition = _intraday_opposition_penalty(
+            mtf_alignment_score=float(mtf_alignment_score or 0.0),
+            fast_tf_dir_ok=(bool(mtf_fast.get("dir_ok")) if mtf_fast else None),
+            micro_tf_dir_ok=(bool(mtf_micro.get("dir_ok")) if mtf_micro else None),
+        )
+        structure_effective_dir_ok = bool(structure_dir_ok or structure_pseudo_ok)
+
     # -----------------------------------------------------------------
     # 5) 勝率 proxy（モデル）→ confidenceで縮退（p_eff）
     # -----------------------------------------------------------------
@@ -2460,6 +2645,9 @@ def get_ai_order_strategy(
         confidence = float(_clamp(confidence * 0.70, 0.0, 1.0))
     if bool(trade_profile.get("is_intraday")):
         confidence = float(_clamp(confidence + 0.14 * float(mtf_alignment_score or 0.0) + 0.10 * float(intraday_entry_quality or 0.0), 0.0, 1.0))
+        confidence = float(_clamp(confidence * float((intraday_opposition or {}).get("confidence_mult", 1.0) or 1.0), 0.0, 1.0))
+        if bool(structure_pseudo_ok):
+            confidence = float(_clamp(confidence + 0.03 * float(structure_pseudo_score or 0.0), 0.0, 1.0))
 
     # p_eff: confidenceが低いほど0.5に寄せる（整合崩れ対策）
     conf_k = float(_clamp(confidence / 0.75, 0.0, 1.0))
@@ -2611,6 +2799,13 @@ def get_ai_order_strategy(
     except Exception:
         pass
 
+    if bool(trade_profile.get("is_intraday")):
+        dynamic_threshold = float(_clamp(
+            dynamic_threshold + float((intraday_opposition or {}).get("threshold_add", 0.0) or 0.0),
+            0.02, 0.30
+        ))
+        if bool(structure_pseudo_ok):
+            dynamic_threshold = float(_clamp(dynamic_threshold - 0.01 * float(structure_pseudo_score or 0.0), 0.02, 0.30))
 
     # B-rank: condition-specific threshold optimization
     try:
@@ -2664,12 +2859,17 @@ def get_ai_order_strategy(
     if regime == "RANGE":
         ev_gate -= 0.15
     if not structure_dir_ok:
-        ev_gate -= 0.10
+        ev_gate -= 0.06 if bool(structure_pseudo_ok) else 0.10
+    if bool(trade_profile.get("is_intraday")):
+        ev_gate -= float((intraday_opposition or {}).get("ev_penalty", 0.0) or 0.0)
+        if bool(structure_pseudo_ok):
+            ev_gate += 0.03 * float(structure_pseudo_score or 0.0)
 
     # -----------------------------------------------------------------
     # 9) 構造ゲート（最優先）
     # -----------------------------------------------------------------
-    breakout_pass = bool(_entry_timing_filter(df, direction) and 
+    entry_timing_state_pre = _entry_timing_state(df, direction)
+    breakout_pass = bool(bool(entry_timing_state_pre.get("ok", True)) and 
         (breakout_ok or (hhhl_ok if direction == "LONG" else lllh_ok))
         and (float(cont_best) >= 0.57)
         and (max(float(strength), float(breakout_strength)) >= 0.35)
@@ -2707,26 +2907,54 @@ def get_ai_order_strategy(
             mtf_alignment_score=float(mtf_alignment_score or 0.0),
         )
 
+    if bool(trade_profile.get("is_intraday")):
+        prev_pseudo = bool(structure_pseudo_ok)
+        structure_pseudo_ok, structure_pseudo_reason, structure_pseudo_score = _pseudo_structure_ok(
+            direction=str(direction),
+            phase_label=phase_label,
+            strength=float(strength),
+            mom=float(mom),
+            cont_dir=float(cont_dir),
+            range_pos=float(range_pos),
+            breakout_ok=bool(breakout_ok),
+            breakout_strength=float(breakout_strength),
+            mtf_alignment_score=float(mtf_alignment_score or 0.0),
+            fast_tf_dir_ok=(bool(mtf_fast.get("dir_ok")) if mtf_fast else None),
+            micro_tf_dir_ok=(bool(mtf_micro.get("dir_ok")) if mtf_micro else None),
+            range_edge_setup=bool(range_edge_setup),
+        )
+        structure_effective_dir_ok = bool(structure_dir_ok or structure_pseudo_ok)
+        if bool(structure_pseudo_ok) and not prev_pseudo:
+            confidence = float(_clamp(confidence + 0.03 * float(structure_pseudo_score or 0.0), 0.0, 1.0))
+            conf_k = float(_clamp(confidence / 0.75, 0.0, 1.0))
+            p_eff = float(_clamp(0.5 + (p_win_model - 0.5) * conf_k + 0.02 * float(structure_pseudo_score or 0.0), 0.20, 0.84))
+            ev_raw = float(p_eff * float(rr) - (1.0 - p_eff) * 1.0)
+            ev_adj = float(ev_raw - 0.18 * float(risk_penalty))
+            ev_gate = float(ev_gate + 0.03 * float(structure_pseudo_score or 0.0))
+            dynamic_threshold = float(_clamp(dynamic_threshold - 0.01 * float(structure_pseudo_score or 0.0), 0.02, 0.30))
+    else:
+        structure_effective_dir_ok = bool(structure_dir_ok)
+
     # 全体の構造妥当性
     structure_ok = True
     if phase_label == "RANGE":
         center_avoid = bool(abs(float(range_pos) - 0.5) >= 0.18)
         structure_ok = bool((breakout_pass or range_edge_setup) and center_avoid)
     else:
-        if (float(strength) < 0.18) and not (breakout_ok or (hhhl_ok if direction == "LONG" else lllh_ok)):
+        if (float(strength) < 0.18) and not bool(structure_effective_dir_ok or breakout_ok or (hhhl_ok if direction == "LONG" else lllh_ok)):
             structure_ok = False
 
     # POST_BREAKOUTはブレイク根拠必須（取り逃がし防止と事故回避を両立）
     if event_mode == "POST_BREAKOUT":
-        structure_ok = bool(breakout_ok or (hhhl_ok if direction == "LONG" else lllh_ok))
-    if bool(trade_profile.get("is_intraday")) and float(mtf_alignment_score or 0.0) <= -0.20:
+        structure_ok = bool(breakout_ok or structure_effective_dir_ok or (hhhl_ok if direction == "LONG" else lllh_ok))
+    if bool(trade_profile.get("is_intraday")) and bool(intraday_opposition.get("hard_block", False)):
         structure_ok = False
     structure_rescue_used = False
     if bool(trade_profile.get("is_intraday")) and not structure_ok:
         structure_rescue_used = bool(
             float(intraday_entry_quality or 0.0) >= 0.66
-            and float(mtf_alignment_score or 0.0) >= 0.18
-            and (bool(breakout_ok) or bool(range_edge_setup) or abs(float(mom)) >= 0.18)
+            and float(mtf_alignment_score or 0.0) >= 0.05
+            and (bool(breakout_ok) or bool(range_edge_setup) or bool(structure_pseudo_ok) or abs(float(mom)) >= 0.18)
         )
         if structure_rescue_used:
             structure_ok = True
@@ -2744,13 +2972,17 @@ def get_ai_order_strategy(
 
     why = ""
     gate_mode = "raw+mom"
-    entry_timing_ok = _entry_timing_filter(df, direction)
+    entry_timing_state = _entry_timing_state(df, direction)
+    entry_timing_ok = bool(entry_timing_state.get("ok", True))
+    entry_timing_mode = str(entry_timing_state.get("mode", "none") or "none")
+    entry_timing_score = float(entry_timing_state.get("score", 0.0) or 0.0)
+    entry_timing_flags = list(entry_timing_state.get("flags", []) or [])
     entry_timing_rescue_used = False
     if bool(trade_profile.get("is_intraday")) and not entry_timing_ok:
         entry_timing_rescue_used = bool(
-            float(intraday_entry_quality or 0.0) >= 0.72
-            and float(mtf_alignment_score or 0.0) >= 0.25
-            and (bool(breakout_pass) or bool(range_edge_setup))
+            float(intraday_entry_quality or 0.0) >= 0.68
+            and float(mtf_alignment_score or 0.0) >= 0.10
+            and (bool(breakout_pass) or bool(range_edge_setup) or bool(structure_pseudo_ok) or float(entry_timing_score or 0.0) >= 0.58)
         )
         if entry_timing_rescue_used:
             entry_timing_ok = True
@@ -2781,10 +3013,12 @@ def get_ai_order_strategy(
         decision = "NO_TRADE"
     elif not structure_ok:
         gate_mode = "structure_veto"
-        if phase_label == "RANGE":
+        if bool(trade_profile.get("is_intraday")) and bool((intraday_opposition or {}).get("hard_block", False)):
+            why = "15分足/5分足が主方向に強く逆行しており、短期足の逆向きが大きい"
+        elif phase_label == "RANGE":
             why = "レンジ優勢で構造根拠が不足（ブレイク or 端の逆張り条件が未達）"
         else:
-            why = "価格構造の根拠が弱い（トレンド強度/HHHL/ブレイクが不足）"
+            why = "価格構造の根拠が弱い（トレンド強度/構造擬似OK/ブレイクが不足）"
         _veto(why)
         decision = "NO_TRADE"
     else:
@@ -2802,7 +3036,7 @@ def get_ai_order_strategy(
             decision = "TRADE"
             gate_mode = "post_breakout_rescue"
             why = f"イベント後捕獲（1〜24hブレイク専用）: EV {ev_gate:+.3f} / 閾値 {float(dynamic_threshold):.3f}（救済）"
-        elif bool(trade_profile.get("is_intraday")) and float(intraday_entry_quality or 0.0) >= 0.64 and float(confidence) >= 0.36 and (bool(breakout_pass) or bool(range_edge_setup) or float(mtf_alignment_score or 0.0) >= 0.30) and (ev_gate >= float(dynamic_threshold) - float(intraday_rescue_margin)):
+        elif bool(trade_profile.get("is_intraday")) and float(intraday_entry_quality or 0.0) >= 0.62 and float(confidence) >= 0.35 and (bool(breakout_pass) or bool(range_edge_setup) or bool(structure_pseudo_ok) or float(mtf_alignment_score or 0.0) >= 0.18) and (ev_gate >= float(dynamic_threshold) - float(intraday_rescue_margin)):
             decision = "TRADE"
             gate_mode = "intraday_precision_rescue"
             why = f"デイトレ精密救済: EV {ev_gate:+.3f} / 閾値 {float(dynamic_threshold):.3f} / 品質 {float(intraday_entry_quality):.2f}"
@@ -2919,6 +3153,10 @@ def get_ai_order_strategy(
         "structure_long": bool(structure_long),
         "structure_short": bool(structure_short),
         "structure_dir_ok": bool(structure_dir_ok),
+        "structure_pseudo_ok": bool(structure_pseudo_ok),
+        "structure_pseudo_reason": str(structure_pseudo_reason),
+        "structure_pseudo_score": float(structure_pseudo_score),
+        "structure_effective_dir_ok": bool(structure_effective_dir_ok),
         "breakout_ok": bool(breakout_ok),
         "breakout_strength": float(breakout_strength),
         "breakout_pass": bool(breakout_pass),
@@ -2971,6 +3209,13 @@ def get_ai_order_strategy(
         "be_trigger_r": float(trade_profile.get("be_trigger_r", 0.0) or 0.0),
         "trail_trigger_r": float(trade_profile.get("trail_trigger_r", 0.0) or 0.0),
         "intraday_entry_quality": float(intraday_entry_quality or 0.0),
+        "entry_timing_mode": str(entry_timing_mode),
+        "entry_timing_score": float(entry_timing_score),
+        "entry_timing_flags": list(entry_timing_flags),
+        "intraday_opposition_mode": str((intraday_opposition or {}).get("mode", "none") or "none"),
+        "intraday_opposition_ev_penalty": float((intraday_opposition or {}).get("ev_penalty", 0.0) or 0.0),
+        "intraday_opposition_threshold_add": float((intraday_opposition or {}).get("threshold_add", 0.0) or 0.0),
+        "intraday_opposition_hard_block": bool((intraday_opposition or {}).get("hard_block", False)),
         "structure_rescue_used": bool(structure_rescue_used),
         "entry_timing_rescue_used": bool(entry_timing_rescue_used),
         "sbi_conf_floor": float(sbi_conf_floor),
@@ -3245,6 +3490,13 @@ def get_ai_order_strategy(
         "dynamic_threshold": float(dynamic_threshold),
         "gate_mode": str(gate_mode),
         "intraday_entry_quality": float(intraday_entry_quality or 0.0),
+        "entry_timing_mode": str(entry_timing_mode),
+        "entry_timing_score": float(entry_timing_score),
+        "entry_timing_flags": list(entry_timing_flags),
+        "intraday_opposition_mode": str((intraday_opposition or {}).get("mode", "none") or "none"),
+        "intraday_opposition_ev_penalty": float((intraday_opposition or {}).get("ev_penalty", 0.0) or 0.0),
+        "intraday_opposition_threshold_add": float((intraday_opposition or {}).get("threshold_add", 0.0) or 0.0),
+        "intraday_opposition_hard_block": bool((intraday_opposition or {}).get("hard_block", False)),
         "structure_rescue_used": bool(structure_rescue_used),
         "entry_timing_rescue_used": bool(entry_timing_rescue_used),
         "sbi_conf_floor": float(sbi_conf_floor),
