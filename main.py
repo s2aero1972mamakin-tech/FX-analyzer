@@ -210,7 +210,7 @@ class RLExitAgent:
             return {"ok": False, "error": "not_enough_bars"}
 
         c = d["Close"].astype(float)
-        atr = _atr(d, 14).astype(float).fillna(method="bfill").fillna(method="ffill")
+        atr = _atr(d, 14).astype(float).bfill().ffill()
         n = len(d)
         rng = np.random.default_rng(seed)
 
@@ -322,9 +322,9 @@ class RLExitAgent:
             d = df.copy()
             if "Close" not in d.columns or "Low" not in d.columns:
                 return {"ok": False, "error": "missing_ohlc"}
-            c = pd.to_numeric(d["Close"], errors="coerce").fillna(method="ffill").fillna(method="bfill")
-            low = pd.to_numeric(d["Low"], errors="coerce").fillna(method="ffill").fillna(method="bfill")
-            atr = _atr(d, 14).fillna(method="ffill").fillna(method="bfill")
+            c = pd.to_numeric(d["Close"], errors="coerce").ffill().bfill()
+            low = pd.to_numeric(d["Low"], errors="coerce").ffill().bfill()
+            atr = _atr(d, 14).ffill().bfill()
             ph = phase_series.reindex(d.index).fillna("RANGE").astype(str)
             ts = pd.to_numeric(trend_strength_series.reindex(d.index), errors="coerce").fillna(0.0)
             pu = pd.to_numeric(p_up_series.reindex(d.index), errors="coerce").fillna(0.5)
@@ -1837,7 +1837,7 @@ def _render_daytrade_validation_panel(df_signals: pd.DataFrame):
     by_source = summary.get("by_source", {}) if isinstance(summary.get("by_source", {}), dict) else {}
     if by_source:
         st.markdown("#### ソース別")
-        st.dataframe(pd.DataFrame([{"source": k, **v} for k, v in by_source.items()]), use_container_width=True)
+        st.dataframe(pd.DataFrame([{"source": k, **v} for k, v in by_source.items()]), width="stretch")
 
     results = rep.get("results", []) if isinstance(rep.get("results", []), list) else []
     if results:
@@ -1849,7 +1849,7 @@ def _render_daytrade_validation_panel(df_signals: pd.DataFrame):
                 "be_exit", "sl_hit", "final_r", "mfe_r", "mae_r", "bars_held", "exit_reason", "entry_ts", "exit_ts"
             ] if c in df_r.columns
         ]
-        st.dataframe(df_r[show_cols], use_container_width=True)
+        st.dataframe(df_r[show_cols], width="stretch")
         try:
             summary_payload = {
                 "summary": summary,
@@ -1923,11 +1923,11 @@ def _estimate_target_zones(df: Optional[pd.DataFrame]) -> Dict[str, Any]:
         for col in ["High", "Low", "Close"]:
             if col not in d.columns:
                 return {"ok": False}
-        c = pd.to_numeric(d["Close"], errors="coerce").fillna(method="ffill").fillna(method="bfill")
-        h = pd.to_numeric(d["High"], errors="coerce").fillna(method="ffill").fillna(method="bfill")
-        l = pd.to_numeric(d["Low"], errors="coerce").fillna(method="ffill").fillna(method="bfill")
+        c = pd.to_numeric(d["Close"], errors="coerce").ffill().bfill()
+        h = pd.to_numeric(d["High"], errors="coerce").ffill().bfill()
+        l = pd.to_numeric(d["Low"], errors="coerce").ffill().bfill()
         last = float(c.iloc[-1])
-        atr14 = _atr(d, 14).fillna(method="ffill").fillna(method="bfill")
+        atr14 = _atr(d, 14).ffill().bfill()
         atr = float(atr14.iloc[-1])
         if not (atr > 0):
             return {"ok": False}
@@ -2033,16 +2033,16 @@ def _render_ai_engine_panel(ctx: Dict[str, Any], plan_ui: Dict[str, Any]):
             ctu, ctd = st.columns(2)
             with ctu:
                 st.write("上方向（候補）")
-                st.dataframe(t_up, use_container_width=True, hide_index=True)
+                st.dataframe(t_up, width="stretch", hide_index=True)
             with ctd:
                 st.write("下方向（候補）")
-                st.dataframe(t_dn, use_container_width=True, hide_index=True)
+                st.dataframe(t_dn, width="stretch", hide_index=True)
 
         # Similar patterns
         patt = ctx.get("_similar_patterns_df")
         if isinstance(patt, pd.DataFrame) and not patt.empty:
             st.markdown("#### 類似パターン（直近30本と似た局面）")
-            st.dataframe(patt, use_container_width=True)
+            st.dataframe(patt, width="stretch")
             try:
                 avg = float(pd.to_numeric(patt["fwd_R_atr"], errors="coerce").mean())
                 st.caption(f"類似局面の平均（{int(ctx.get('horizon_days',5))}日先）: {avg:+.2f} ATR-R")
@@ -2051,8 +2051,8 @@ def _render_ai_engine_panel(ctx: Dict[str, Any], plan_ui: Dict[str, Any]):
 
 
 # True RL exit agent (Q-learning) — trains from history and persists model
-st.markdown("#### 強化学習（RL）利確管理：学習済みポリシー")
-st.caption("これは **学習するRL** です（Q-learning）。ボタンで学習→モデル保存→以後は学習済みポリシーで提案します。")
+st.markdown("#### RL利確管理")
+st.caption("学習済みポリシーで出口提案を出します。入力とボタンはスマホでも崩れにくい短い表示です。")
 
 rl_dir = "logs"
 os.makedirs(rl_dir, exist_ok=True)
@@ -2064,22 +2064,22 @@ rl_path = os.path.join(rl_dir, f"rl_exit_{str(_pair_for_rl_path).replace('/','')
 
 # load agent (best-effort)
 agent = _load_rl_agent(rl_path)
+rl_state = "学習済み" if (agent is not None and len(getattr(agent,'q',{}))>0) else "未学習"
+st.markdown(f'<div class="fx-chip-row"><span class="fx-chip">モデル:{rl_state}</span><span class="fx-chip">対象:{str(_pair_for_rl_path)}</span></div>', unsafe_allow_html=True)
 
-cA, cB, cC = st.columns([1,1,2])
-with cA:
-    episodes = st.number_input("学習エピソード数（多いほど精度↑/時間↑）", min_value=200, max_value=20000, value=3000, step=200)
-with cB:
-    max_h = st.number_input("最大保有（学習）日数", min_value=5, max_value=60, value=20, step=1)
-with cC:
-    st.write("**モデル状態**")
-    st.code("trained" if (agent is not None and len(getattr(agent,'q',{}))>0) else "not trained", language="text")
+rc1, rc2 = st.columns(2)
+with rc1:
+    st.markdown('<div class="fx-compact-label">学習回数</div>', unsafe_allow_html=True)
+    episodes = st.number_input("学習回数", min_value=200, max_value=20000, value=3000, step=200, label_visibility="collapsed")
+with rc2:
+    st.markdown('<div class="fx-compact-label">最大保有日数</div>', unsafe_allow_html=True)
+    max_h = st.number_input("最大保有日数", min_value=5, max_value=60, value=20, step=1, label_visibility="collapsed")
 
-
-cT1, cT2 = st.columns([1,1])
-with cT1:
-    do_wfa = st.button("🧠 RLを自動WFA学習（推奨：係数も自動選定）", key="train_rl_wfa")
-with cT2:
-    do_quick = st.button("🧠 RLを学習（手動係数・高速）", key="train_rl_quick")
+rc3, rc4 = st.columns(2)
+with rc3:
+    do_wfa = st.button("自動学習（推奨）", key="train_rl_wfa", width="stretch")
+with rc4:
+    do_quick = st.button("高速学習", key="train_rl_quick", width="stretch")
 
 if do_wfa or do_quick:
     with st.spinner("RL学習中...（初回は少し時間がかかります）"):
@@ -2108,9 +2108,9 @@ if do_wfa or do_quick:
                     st.warning(f"WFAが失敗したため、既定係数で学習します: {wfa}")
                 else:
                     best_params = dict(wfa["best"])
-                    st.success(f"WFA選定係数: dd_penalty={best_params['dd_penalty']}, time_penalty={best_params['time_penalty']}, atr_mult_stop={best_params['atr_mult_stop']}（score={best_params['score']:+.4f}）")
+                    st.success(f"WFA係数を更新: dd={best_params['dd_penalty']}, time={best_params['time_penalty']}, stop={best_params['atr_mult_stop']} / score={best_params['score']:+.4f}")
                     try:
-                        st.dataframe(pd.DataFrame(wfa.get("top", [])), use_container_width=True)
+                        st.dataframe(pd.DataFrame(wfa.get("top", [])), width="stretch")
                     except Exception:
                         pass
 
@@ -2125,11 +2125,13 @@ if do_wfa or do_quick:
             )
             if res.get("ok"):
                 _save_rl_agent(rl_path, ag)
-                st.success(f"RL学習完了: {res}")
+                st.success("RL学習完了")
+                st.json(res)
                 agent = ag
                 st.session_state[f"_rl_best_params_{pair_label}"] = best_params
             else:
-                st.error(f"RL学習失敗: {res}")
+                st.error("RL学習失敗")
+                st.json(res)
 st.divider()
 
 # --- ensure variables exist (avoid NameError) ---
@@ -2513,86 +2515,128 @@ def _lot_multiplier(global_risk_index: Any, alpha: Any, floor: float = 0.2, ceil
 
 
 def _apply_sbi_minlot_guard(plan: dict, *, sbi_min_lot: int = 1) -> dict:
-    """SBI（最小1建・小数不可）向けに、建玉数を“リスク縮退”ではなく“トレード条件”で決める。
+    """SBI（最小1建・小数不可）を前提に、縮退が効かない局面をAI側で『見送り』に倒す。
 
-    方針：
-      - TRADEなら最低1建
-      - 条件が強いほど2建、3建、最大4建まで表示
-      - 建玉数は見送り判定の理由に使わない（decisionは元のロジックを尊重）
+    目的：
+      - 画面が「エントリー可」と出ても、実際は縮退できず事故りやすいケースを可視化＆抑制
+      - 根拠を“数値”で説明（SBI補正EV、EV余裕、必要余裕、実質リスク倍率）
+
+    方針（過度に見送り地獄にしないための段階制）：
+      - hard: 推奨ロット係数が極端に低い（<0.35）→ ほぼ確実に縮退必須なので見送り
+      - soft: 係数が低い（<0.55）かつ、EV余裕が薄い/イベント近接ガード中 → 見送り
+      - それ以外は元の decision を尊重
     """
     try:
         if not isinstance(plan, dict):
             return plan
-        decision = str(plan.get("decision", "NO_TRADE") or "NO_TRADE").upper()
+        decision = str(plan.get("decision", "NO_TRADE"))
+        # 既に見送りならそのまま
         if decision != "TRADE":
-            plan["_sbi"] = {
-                "min_lot": int(sbi_min_lot),
-                "base_lots": int(sbi_min_lot),
-                "desired_lots": 0.0,
-                "exec_lots": 0,
-                "trade_quality_score": 0.0,
-                "lot_reason": "no_trade",
-                "decision_sbi": "NO_TRADE",
-            }
             plan["_sbi_exec_lots"] = 0
             return plan
 
         ctx = plan.get("_ctx", {}) if isinstance(plan.get("_ctx", {}), dict) else {}
-        confidence = float(plan.get("confidence") or 0.0)
-        p_eff = float(plan.get("p_eff") or plan.get("p_win_ev") or 0.0)
         ev = float(plan.get("expected_R_ev") or 0.0)
-        rr = float((ctx.get("rr") if isinstance(ctx, dict) else None) or plan.get("rr") or 0.0)
-        intraday_quality = float(plan.get("intraday_entry_quality") or (ctx.get("intraday_entry_quality") if isinstance(ctx, dict) else 0.0) or 0.0)
-        timing_score = float(plan.get("entry_timing_score") or (ctx.get("entry_timing_score") if isinstance(ctx, dict) else 0.0) or 0.0)
-        hp_score = float(plan.get("high_precision_tp_score") or (ctx.get("high_precision_tp_score") if isinstance(ctx, dict) else 0.0) or 0.0)
-        hp_grade = str(plan.get("high_precision_tp_grade") or (ctx.get("high_precision_tp_grade") if isinstance(ctx, dict) else "C") or "C")
-        hp_candidate = bool(plan.get("high_precision_tp_candidate") or (ctx.get("high_precision_tp_candidate") if isinstance(ctx, dict) else False))
-        breakout_ok = bool((ctx.get("breakout_ok") if isinstance(ctx, dict) else False) or plan.get("breakout_ok", False))
-        structure_ok = bool((ctx.get("structure_effective_dir_ok") if isinstance(ctx, dict) else False) or plan.get("structure_effective_dir_ok", False))
+        dyn = float(plan.get("dynamic_threshold") or 0.0)
+        lot_mult = float(plan.get("_lot_multiplier_reco") or 1.0)
+        lot_mult = max(0.000001, min(1.0, lot_mult))
+
+        # SBIは最小1建。ここでは「基準建玉=1」を前提に、縮退不能による実質リスク倍率を算出。
+        base_lots = 1.0
+        desired_lots = base_lots * lot_mult
+        exec_lots = max(float(sbi_min_lot), float(int(round(desired_lots))))
+        # roundで0になる可能性があるので再ガード
+        exec_lots = max(float(sbi_min_lot), exec_lots)
+
+        risk_x = float(exec_lots) / max(desired_lots, 1e-9)  # 例: 0.269→1建=3.7倍
+        ev_sbi = ev / max(risk_x, 1e-9)  # ＝ ev * desired/exec
+        ev_margin = ev - dyn
+
+        # 必要余裕（数値基準）
+        req_margin = 0.03  # 通常時の最低余裕
+        event_ban = bool(ctx.get("event_market_ban_active", False))
+        if event_ban:
+            req_margin += 0.03  # イベント近接中は余裕を上乗せ（見送り地獄防止のため控えめ）
+        if float(ctx.get("weekcross_risk") or 0.0) > 0.0:
+            req_margin += 0.02
+        if float(ctx.get("weekend_risk") or 0.0) > 0.0:
+            req_margin += 0.03
+        # 縮退不能の度合い（実質リスク倍率）を余裕に反映（上限0.10R）
+        req_margin += min(0.10, 0.04 * max(0.0, risk_x - 1.0))
+
+        trade_profile = str(plan.get("trade_profile") or ctx.get("trade_profile") or "")
         gate_mode = str(plan.get("gate_mode") or "")
+        intraday_quality = float(ctx.get("intraday_entry_quality") or plan.get("intraday_entry_quality") or 0.0)
+        strong_daytrade = bool(
+            trade_profile == "DAYTRADE" and (
+                intraday_quality >= 0.66
+                or gate_mode in ("intraday_precision_rescue", "breakout_rescue", "post_breakout_rescue")
+            )
+        )
 
-        quality = 0.0
-        quality += 0.24 * max(0.0, min(1.0, confidence))
-        quality += 0.18 * max(0.0, min(1.0, p_eff))
-        quality += 0.18 * max(0.0, min(1.0, intraday_quality))
-        quality += 0.12 * max(0.0, min(1.0, timing_score))
-        quality += 0.18 * max(0.0, min(1.0, hp_score))
-        quality += 0.10 * max(0.0, min(1.0, (ev + 0.05) / 0.35))
-        if hp_candidate:
-            quality += 0.08
-        if breakout_ok:
-            quality += 0.04
-        if structure_ok:
-            quality += 0.04
-        if gate_mode == "intraday_precision_rescue":
-            quality -= 0.04
-        quality = float(max(0.0, min(1.25, quality)))
+        if strong_daytrade:
+            req_margin = max(0.01, req_margin - 0.02)
+            hard_veto = (lot_mult < 0.22) and (ev_sbi < dyn)
+            soft_veto = (lot_mult < 0.40) and ((event_ban and intraday_quality < 0.72) or ((ev_margin < req_margin) and (ev_sbi < dyn - 0.01)))
+        else:
+            hard_veto = (lot_mult < 0.35)
+            soft_veto = (lot_mult < 0.55) and (event_ban or (ev_margin < req_margin) or (ev_sbi < dyn))
 
-        desired_lots = float(max(int(sbi_min_lot), 1))
-        lot_reason = "base_1lot"
-        if hp_candidate and hp_grade in ("A-", "A") and quality >= 0.80 and confidence >= 0.60 and p_eff >= 0.52 and ev >= 0.12 and (breakout_ok or structure_ok):
-            desired_lots = 2.0
-            lot_reason = "high_precision_Aminus_2lots"
-        if hp_candidate and hp_grade == "A" and quality >= 0.90 and confidence >= 0.68 and p_eff >= 0.56 and ev >= 0.20 and rr >= 1.35 and breakout_ok and structure_ok:
-            desired_lots = 3.0
-            lot_reason = "high_precision_A_3lots"
-        if hp_candidate and hp_grade == "A" and quality >= 1.00 and confidence >= 0.76 and p_eff >= 0.60 and ev >= 0.30 and rr >= 1.50 and breakout_ok and structure_ok:
-            desired_lots = 4.0
-            lot_reason = "high_precision_A_4lots"
-
-        exec_lots = int(max(float(sbi_min_lot), round(desired_lots)))
+        # 情報はplanに格納（UI表示用）
         plan["_sbi"] = {
             "min_lot": int(sbi_min_lot),
-            "base_lots": int(sbi_min_lot),
+            "base_lots": base_lots,
             "desired_lots": float(desired_lots),
             "exec_lots": int(exec_lots),
-            "trade_quality_score": float(quality),
-            "lot_reason": str(lot_reason),
-            "decision_sbi": "TRADE",
+            "risk_x": float(risk_x),
+            "ev_sbi": float(ev_sbi),
+            "ev_margin": float(ev_margin),
+            "ev_margin_req": float(req_margin),
+            "event_ban": bool(event_ban),
+            "decision_sbi": "NO_TRADE" if (hard_veto or soft_veto) else "TRADE",
         }
-        plan["_sbi_exec_lots"] = int(exec_lots)
+        plan["_sbi_exec_lots"] = int(exec_lots) if not (hard_veto or soft_veto) else 0
+
+        if hard_veto or soft_veto:
+            reasons = []
+            reasons.append(f"SBI最小{int(sbi_min_lot)}建のため縮退不可（推奨係数{lot_mult:.3f}→実質リスク×{risk_x:.2f}）")
+            reasons.append(f"SBI補正EV {ev_sbi:+.3f} / 閾値 {dyn:.3f}")
+            reasons.append(f"EV余裕 {ev_margin:+.3f} / 必要余裕 {req_margin:.3f}" + ("（イベント近接）" if event_ban else ""))
+
+            plan["_decision_original"] = plan.get("decision")
+            plan["decision"] = "NO_TRADE"
+            plan["_decision_override_reason"] = "SBI最小1建ガード: " + " / ".join(reasons)
+
+            # veto表示にも反映（既存の理由を壊さない）
+            vr = plan.get("veto_reasons")
+            if not isinstance(vr, list):
+                vr = []
+            for r in reasons:
+                vr.append(r)
+            plan["veto_reasons"] = vr
+            plan["veto"] = vr
+
+            # why も補足
+            plan["why"] = " / ".join(reasons[:2])
+            shadow = plan.get("shadow", {}) if isinstance(plan.get("shadow", {}), dict) else {}
+            shadow = dict(shadow)
+            shadow["enabled"] = True
+            shadow["candidate"] = True
+            shadow["mode"] = "TRACK"
+            shadow["reason"] = "SBI最小1建ガードで実売買不可のためSHADOW追跡"
+            shadow["score"] = float(max(float(shadow.get("score", 0.0) or 0.0), 0.55))
+            shadow["gate_gap"] = float(shadow.get("gate_gap", ev - dyn) or (ev - dyn))
+            shadow["rr_gap"] = float(shadow.get("rr_gap", 0.0) or 0.0)
+            shadow["time_exit_focus"] = "30m/60m/120m"
+            plan["shadow"] = shadow
+            plan["shadow_best"] = shadow
+            plan["shadow_candidate"] = True
+            plan["shadow_reason"] = str(shadow.get("reason") or "")
+            plan["shadow_score"] = float(shadow.get("score") or 0.0)
+
         return plan
     except Exception:
+        # 失敗してもアプリを落とさない（安全側：元のplanを返す）
         return plan
 
 
@@ -2995,7 +3039,7 @@ def _similar_pattern_search(df: pd.DataFrame, window: int = 30, horizon: int = 5
         "ret": c.pct_change().fillna(0.0),
         "rsi": (rsi14-50)/50.0,
         "adx": (adx14/50.0).clip(0,2),
-        "atrp": (atr14/c).fillna(method="bfill").fillna(0.0),
+        "atrp": (atr14/c).bfill().fillna(0.0),
     }).fillna(0.0)
     # build last window vector
     last = feat.iloc[-window:].to_numpy().reshape(-1)
@@ -3564,6 +3608,82 @@ def _dominant_state(state_probs: Dict[str, Any]) -> str:
         return "—"
 
 
+
+def _ui_gate_label(plan: Dict[str, Any]) -> str:
+    gate = str(plan.get("gate_mode") or "none")
+    mapping = {
+        "raw+mom": "通常判定",
+        "intraday_precision_rescue": "短期足救済",
+        "breakout_rescue": "ブレイク救済",
+        "post_breakout_rescue": "イベント後救済",
+        "structure_veto": "構造見送り",
+        "event_block": "イベント前後",
+        "post_wait": "イベント直後待機",
+    }
+    return mapping.get(gate, gate)
+
+
+def _ui_reason_short(plan: Dict[str, Any]) -> str:
+    why = str(plan.get("why") or "").strip()
+    if why:
+        why = why.replace("15分足/5分足", "短期足").replace("主方向に強く逆行しており、", "").replace("高インパクト指標の前後", "指標前後")
+        if len(why) > 52:
+            why = why[:52].rstrip() + "…"
+        return why
+    veto = plan.get("veto_reasons") or []
+    if isinstance(veto, (list, tuple)) and veto:
+        s = str(veto[0])
+        return s if len(s) <= 52 else s[:52].rstrip() + "…"
+    return "根拠を再確認"
+
+
+def _ui_quality_badges(plan: Dict[str, Any]) -> List[str]:
+    ctx = plan.get("_ctx") if isinstance(plan.get("_ctx"), dict) else {}
+    badges: List[str] = []
+    badges.append(str(plan.get("trade_profile") or "DAYTRADE"))
+    badges.append(str(plan.get("price_interval") or ctx.get("price_interval") or "1h"))
+    gate_label = _ui_gate_label(plan)
+    if gate_label:
+        badges.append(gate_label)
+    timing = str(plan.get("entry_timing_mode") or ctx.get("entry_timing_mode") or "none")
+    if timing and timing != "none":
+        badges.append(f"entry:{timing}")
+    opp = str(plan.get("intraday_opposition_mode") or ctx.get("intraday_opposition_mode") or "none")
+    if opp != "none":
+        badges.append(f"逆向き:{opp}")
+    return badges[:5]
+
+
+def _render_ai_pick_banner(best: Dict[str, Any], trade_axis: str, trade_ranked: List[Dict[str, Any]], shadow_ranked: List[Dict[str, Any]]):
+    plan = best.get("_plan_ui") or best.get("_plan") or {}
+    decision = str((best.get("decision") or plan.get("decision") or "NO_TRADE")).upper()
+    pair = str(best.get("pair") or "—")
+    if decision == "TRADE":
+        kicker = "AI自動選択 / 実行候補"
+        badge = "TRADE"
+    elif bool(best.get("shadow_candidate", False)):
+        kicker = "AI自動選択 / SHADOW監視"
+        badge = "TRACK"
+    else:
+        kicker = "AI自動選択 / 見送り"
+        badge = "NO TRADE"
+    reason = _ui_reason_short(plan)
+    chips_html = ''.join([f'<span class="fx-chip">{c}</span>' for c in _ui_quality_badges(plan)])
+    ev = float(plan.get("expected_R_ev") or 0.0)
+    conf = float(plan.get("confidence") or 0.0)
+    lots = int(plan.get("_sbi_exec_lots") or 0)
+    html = (
+        f'<div class="fx-pick-card">'
+        f'<div class="fx-pick-kicker">{kicker}</div>'
+        f'<div class="fx-pair-line"><div class="pair">{pair}</div><div class="badge">{badge}</div></div>'
+        f'<div class="fx-chip-row">{chips_html}</div>'
+        f'<div class="fx-mini">理由: {reason}</div>'
+        f'<div class="fx-mini">EV {ev:+.3f} / 信頼度 {conf:.2f} / SBI {lots}建</div>'
+        f'</div>'
+    )
+    st.markdown(html, unsafe_allow_html=True)
+
+
 def _render_top_trade_panel(pair_label: str, plan: Dict[str, Any], current_price: float):
     """
     運用者が「いま実行すべきか」を迷わないための最上段パネル。
@@ -3591,7 +3711,6 @@ def _render_top_trade_panel(pair_label: str, plan: Dict[str, Any], current_price
     r2c1.metric("期待値EV (R)", f"{expected_R_ev:+.3f}")
     r2c2.metric("動的閾値", f"{dyn_th:.3f}")
 
-    # 判定に使ったEVが「生EV」か「リスク調整後EV」かを明示（検証用）
     ev_raw = plan.get("expected_R_ev_raw", None)
     ev_adj = plan.get("expected_R_ev_adj", None)
     gate_mode = plan.get("gate_mode", None)
@@ -3599,10 +3718,11 @@ def _render_top_trade_panel(pair_label: str, plan: Dict[str, Any], current_price
         pseudo_ok = bool(plan.get("structure_pseudo_ok") or (plan.get("_ctx") or {}).get("structure_pseudo_ok", False))
         opp_mode = str(plan.get("intraday_opposition_mode") or (plan.get("_ctx") or {}).get("intraday_opposition_mode") or "none")
         timing_mode = str(plan.get("entry_timing_mode") or (plan.get("_ctx") or {}).get("entry_timing_mode") or "—")
-        hp_tp = bool(plan.get("high_precision_tp_candidate") or (plan.get("_ctx") or {}).get("high_precision_tp_candidate", False))
-        hp_score = float(plan.get("high_precision_tp_score") or (plan.get("_ctx") or {}).get("high_precision_tp_score", 0.0) or 0.0)
-        hp_grade = str(plan.get("high_precision_tp_grade") or (plan.get("_ctx") or {}).get("high_precision_tp_grade", "C") or "C")
-        st.caption(f"判定モード: {gate_mode} / EV(生)={ev_raw:+.3f} / EV(調整後)={ev_adj:+.3f} / 構造擬似OK={'ON' if pseudo_ok else 'OFF'} / 高精度TP={'ON' if hp_tp else 'OFF'}({hp_score:.2f}, {hp_grade}) / entry={timing_mode} / 下位足逆向き={opp_mode}")
+        chips = [f"判定:{_ui_gate_label(plan)}", f"entry:{timing_mode}", f"擬似構造:{'ON' if pseudo_ok else 'OFF'}"]
+        if opp_mode != "none":
+            chips.append(f"逆向き:{opp_mode}")
+        st.markdown('<div class="fx-chip-row">' + ''.join([f'<span class="fx-chip">{x}</span>' for x in chips]) + '</div>', unsafe_allow_html=True)
+        st.caption(f"EV(生)={ev_raw:+.3f} / EV(調整後)={ev_adj:+.3f}")
 
     r3c1, r3c2 = st.columns(2)
     r3c1.metric("信頼度", f"{confidence:.2f}")
@@ -3610,29 +3730,27 @@ def _render_top_trade_panel(pair_label: str, plan: Dict[str, Any], current_price
     sbi_lots = int(plan.get("_sbi_exec_lots") or (0 if decision == "NO_TRADE" else 1))
     r3c2.metric("推奨建玉（SBI）", f"{sbi_lots}建")
 
-    # SBI建玉条件の数値根拠（必要なときだけ）
+    # SBIガードの数値根拠（必要なときだけ）
     sbi_info = plan.get("_sbi") if isinstance(plan.get("_sbi"), dict) else None
     if isinstance(sbi_info, dict) and sbi_info:
         try:
-            tq = float(sbi_info.get("trade_quality_score") or 0.0)
-            lot_reason = str(sbi_info.get("lot_reason") or "")
-            desired_lots = float(sbi_info.get("desired_lots") or 0.0)
-            exec_lots = int(sbi_info.get("exec_lots") or 0)
-            if decision == "TRADE":
-                st.caption(f"SBI建玉条件：品質スコア {tq:.2f} / 建玉条件 {lot_reason} / 表示建玉 {exec_lots}建")
+            ev_sbi = float(sbi_info.get("ev_sbi") or 0.0)
+            risk_x = float(sbi_info.get("risk_x") or 1.0)
+            ev_margin = float(sbi_info.get("ev_margin") or 0.0)
+            req = float(sbi_info.get("ev_margin_req") or 0.0)
+            if decision == "NO_TRADE":
+                st.caption(f"SBI最小1建ガード：実質リスク×{risk_x:.2f} / SBI補正EV {ev_sbi:+.3f} / EV余裕 {ev_margin:+.3f}（必要 {req:.3f}）")
             else:
-                st.caption("SBI建玉条件：TRADE時は最低1建から、条件が強いほど2建以上を表示します。")
+                # TRADEでも縮退推奨が残る場合は注意喚起だけ表示
+                if float(plan.get("_lot_multiplier_reco") or 1.0) < 0.80:
+                    st.caption(f"SBI参考：縮退推奨 係数{float(plan.get('_lot_multiplier_reco') or 1.0):.3f}（実質リスク×{risk_x:.2f}）")
         except Exception:
             pass
 
     if orig is not None and ovr:
         st.warning(f"判断は上書きされています：{_jp_decision(str(orig))} → {decision_jp}（理由：{ovr}）")
 
-    st.caption(
-        "EV (R) は『損切り幅=1R』基準の期待値です。"
-        "動的閾値は危険時に上がります（見送りが増えるのは仕様）。"
-        "SBI建玉は最小1建からで、建玉数はリスク縮退ではなくトレード条件の強さで表示します。"
-    )
+    st.caption("EVは1R基準です。閾値が高いほど慎重判定、SBI建玉は実行条件を反映します。")
 
 
     if decision != "NO_TRADE":
@@ -3653,7 +3771,7 @@ def _render_top_trade_panel(pair_label: str, plan: Dict[str, Any], current_price
         has_sl = (sl is not None) and (float(sl or 0.0) != 0.0)
         scheme = _jp_order_scheme(True, has_tp, has_sl)
 
-        st.success("✅ エントリー候補（このアプリは発注しません。発注は運用者が実行）")
+        st.success("✅ 実行候補")
 
         # 信頼度が中程度以下のときは注意喚起（急にエントリーになった不安を軽減）
         if confidence < 0.55:
@@ -3662,12 +3780,6 @@ def _render_top_trade_panel(pair_label: str, plan: Dict[str, Any], current_price
                 "（フェーズ/継続確率/構造判定が更新され、条件を満たした可能性があります）"
             )
 
-        hp_tp = bool(plan.get("high_precision_tp_candidate") or False)
-        hp_score = float(plan.get("high_precision_tp_score") or 0.0)
-        hp_grade = str(plan.get("high_precision_tp_grade") or "C")
-        tp1 = plan.get("tp1", None)
-        tp2 = plan.get("tp2", None)
-        hp_reason = str(plan.get("high_precision_tp_reason") or "")
         st.markdown(f"""
 - **売買**: {_jp_side(side_raw)}
 - **エントリー注文**: {entry_kind_jp}
@@ -3675,14 +3787,10 @@ def _render_top_trade_panel(pair_label: str, plan: Dict[str, Any], current_price
 - **エントリー価格**: {_fmt_price(entry)}
 - **損切り(SL)**: {_fmt_price(sl)}
 - **利確(TP)**: {_fmt_price(tp)}
-- **分割利確TP1**: {_fmt_price(tp1)}
-- **最終利確TP2**: {_fmt_price(tp2)}
-- **高精度TP候補**: {'ON' if hp_tp else 'OFF'}（score {hp_score:.2f} / grade {hp_grade}）
-- **高精度TP理由**: {hp_reason or '—'}
 """)
-        st.caption(f"参考：勝率推定 p_win={p_win_ev:.2f}（あくまでモデル推定） / 高精度TP理由: {hp_reason or '—'}")
+        st.caption(f"参考：勝率推定 p_win={p_win_ev:.2f}（あくまでモデル推定）。")
     else:
-        st.warning("⏸ 見送り（NO_TRADE）")
+        st.warning("⏸ 今回は見送り")
 
         # --- 要件: NO_TRADEでも「注文方式（指値/逆指値/IFD/OCO/IFDOCO）」を必ず表示 ---
         direction = str(plan.get("direction", "") or "").upper()
@@ -3820,7 +3928,7 @@ def _render_shadow_card(title: str, pair_label: str, plan: Dict[str, Any], curre
                             "理由": str(meta.get("reason") or ""),
                         })
                 if rows:
-                    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
     except Exception:
         return
 
@@ -3908,7 +4016,7 @@ def _render_operational_three_blocks(
                     "エントリー": _entry_type_jp(p.get("entry_type", "")),
                     "event_mode": str(p.get("event_mode", "")),
                 })
-            st.dataframe(pd.DataFrame(view), use_container_width=True)
+            st.dataframe(pd.DataFrame(view), width="stretch")
             st.caption("※ 1つしかトレード候補がない日は表示しません。")
 
         if bool(show_debug) and isinstance(ranked, list):
@@ -3923,7 +4031,7 @@ def _render_operational_three_blocks(
                     "global_risk": float(r["_feats"].get("global_risk_index", 0.0)),
                     "war": float(r["_feats"].get("war_probability", 0.0)),
                 } for r in ranked]
-                st.dataframe(pd.DataFrame(view_all), use_container_width=True)
+                st.dataframe(pd.DataFrame(view_all), width="stretch")
 
         st.markdown("### EV内訳（AI選択ペア）")
         source_plan = raw_plan if isinstance(raw_plan, dict) and raw_plan else plan_ui
@@ -3941,7 +4049,7 @@ def _render_operational_three_blocks(
             })
         cdf = pd.DataFrame(rows_ev)
         if not cdf.empty:
-            st.dataframe(cdf, use_container_width=True)
+            st.dataframe(cdf, width="stretch")
             with st.expander("棒グラフ（参考）", expanded=False):
                 st.bar_chart(cdf.set_index("状態")[["寄与EV(R)"]])
         else:
@@ -4123,7 +4231,7 @@ def _render_risk_dashboard(plan: Dict[str, Any], feats: Dict[str, float], ext_me
                         except Exception:
                             continue
                     if rows:
-                        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
             except Exception:
                 pass
 
@@ -4165,7 +4273,7 @@ def _render_risk_dashboard(plan: Dict[str, Any], feats: Dict[str, float], ext_me
             if "source" in df.columns:
                 df["意味"] = df["source"].map(meaning).fillna("")
 
-            st.dataframe(df, use_container_width=True)
+            st.dataframe(df, width="stretch")
 
             try:
                 csv = df.to_csv(index=False).encode("utf-8")
@@ -4193,10 +4301,10 @@ def _render_risk_dashboard(plan: Dict[str, Any], feats: Dict[str, float], ext_me
                     st.info(f"自動推奨 min_expected_R: まだ算出できません（{rec.get('reason','')} / n={rec.get('n',0)}）")
             with colB:
                 if rec.get("ok"):
-                    if st.button("この推奨値を適用", use_container_width=True):
+                    if st.button("この推奨値を適用", width="stretch"):
                         st.session_state["min_expected_R_override"] = float(rec["recommended"])
                         st.toast(f"min_expected_R を {rec['recommended']:.3f} に固定しました（自動最適化）")
-                if st.button("自動最適化を解除", use_container_width=True):
+                if st.button("自動最適化を解除", width="stretch"):
                     st.session_state["min_expected_R_override"] = None
                     st.toast("min_expected_R の自動最適化を解除しました（プリセットに戻ります）")
             st.caption("※自動最適化は『直近ログのEV_raw分布』から、目標TRADE率になるよう min_expected_R を推奨します。外部リスクでEVを削らず、閾値だけ調整します。")
@@ -4266,7 +4374,7 @@ def _render_risk_dashboard(plan: Dict[str, Any], feats: Dict[str, float], ext_me
                 # show latest first
                 import pandas as _pd
                 df_a = _pd.DataFrame(list(reversed(rows))[:200])
-                st.dataframe(df_a, use_container_width=True)
+                st.dataframe(df_a, width="stretch")
                 try:
                     csv_a = _pd.DataFrame(rows).to_csv(index=False).encode("utf-8")
                     st.download_button(
@@ -4296,6 +4404,30 @@ if "pair_label" not in st.session_state:
 pair_label = st.session_state.get("pair_label", "USD/JPY")
 
 st.title("FX EV判断")
+
+st.markdown("""
+<style>
+.block-container { padding-top: 0.8rem; padding-bottom: 4rem; }
+.fx-pick-card { border: 1px solid rgba(148,163,184,0.28); border-radius: 18px; padding: 0.85rem 0.95rem; margin: 0.2rem 0 0.9rem 0; background: linear-gradient(180deg, rgba(15,23,42,0.03), rgba(15,23,42,0.01)); }
+.fx-pick-kicker { font-size: 0.76rem; font-weight: 700; letter-spacing: 0.04em; color: #64748b; text-transform: uppercase; }
+.fx-pair-line { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.45rem; margin: 0.15rem 0 0.45rem 0; }
+.fx-pair-line .pair { font-size: 1.35rem; line-height: 1.15; font-weight: 800; color: #0f172a; }
+.fx-pair-line .badge { font-size: 0.74rem; font-weight: 700; padding: 0.20rem 0.5rem; border-radius: 999px; background: rgba(59,130,246,0.10); color: #1d4ed8; }
+.fx-chip-row { display: flex; flex-wrap: wrap; gap: 0.35rem; margin: 0.1rem 0 0.55rem 0; }
+.fx-chip { font-size: 0.75rem; line-height: 1.1; padding: 0.28rem 0.55rem; border-radius: 999px; background: rgba(148,163,184,0.12); color: #334155; }
+.fx-mini { font-size: 0.84rem; line-height: 1.4; color: #475569; }
+.fx-compact-label { font-size: 0.78rem; color: #64748b; margin-bottom: 0.18rem; }
+div[data-testid="stMetric"] { border: 1px solid rgba(148,163,184,0.22); border-radius: 14px; padding: 0.55rem 0.7rem; }
+button[kind="secondary"], button[kind="primary"] { white-space: normal !important; line-height: 1.25 !important; min-height: 2.7rem; }
+@media (max-width: 640px) {
+  .block-container { padding-top: 0.55rem; }
+  .fx-pick-card { padding: 0.75rem 0.8rem; border-radius: 16px; }
+  .fx-pair-line .pair { font-size: 1.16rem; }
+  .fx-mini, .fx-chip, .fx-pick-kicker { font-size: 0.76rem; }
+  div[data-testid="stMetric"] { padding: 0.45rem 0.55rem; }
+}
+</style>
+""", unsafe_allow_html=True)
 
 with st.sidebar:
     st.header("運用操作（見る順）")
@@ -4702,7 +4834,7 @@ with tabs[0]:
         ranked.sort(key=lambda r: float(r["score"]), reverse=True)
         if not ranked:
             st.error("有効なペアがありません（全てNO_DATA）。")
-            st.dataframe(pd.DataFrame(rows)[["pair", "decision"]], use_container_width=True)
+            st.dataframe(pd.DataFrame(rows)[["pair", "decision"]], width="stretch")
             st.stop()
 
         # --- AI selection: pick ONE pair to act on (SBIガード込みのTRADE候補から) ---
@@ -4712,20 +4844,18 @@ with tabs[0]:
         shadow_ranked.sort(key=lambda r: float(r.get("shadow_score", -1.0)), reverse=True)
         global_shadow_row = _pick_global_shadow_row(ranked)
 
-        panel_trade_label = "今回の実行ペア" if "デイトレ" in str(trade_axis) else "本日の実行ペア"
-        panel_skip_label = "今回は **見送り**" if "デイトレ" in str(trade_axis) else "本日は **見送り**"
         if trade_ranked:
             best = trade_ranked[0]
-            st.markdown(f"## 🧠 AI選択：{panel_trade_label}  **{best['pair']}**")
+        elif shadow_ranked:
+            best = shadow_ranked[0]
         else:
-            if shadow_ranked:
-                best = shadow_ranked[0]
-                st.markdown(f"## 🧠 AI選択：{panel_skip_label}（実売買なし / SHADOW候補 **{best['pair']}**）")
-                st.caption("※ 実売買は見送りですが、出口ロジック検証のため SHADOW候補を常時出力しています。")
-            else:
-                best = ranked[0]
-                st.markdown(f"## 🧠 AI選択：{panel_skip_label}（トレード候補なし）")
-                st.caption("※ SBI最小1建ガード・イベント近接・閾値条件により、現時点の全ペアで見ても見送り判定です。")
+            best = ranked[0]
+
+        _render_ai_pick_banner(best, trade_axis, trade_ranked, shadow_ranked)
+        if not trade_ranked and shadow_ranked:
+            st.caption("実売買は見送りですが、逆方向や代替シナリオは SHADOW で追跡しています。")
+        elif not trade_ranked:
+            st.caption("現時点は見送り優勢です。イベント近接・閾値不足・短期足逆向きを優先して止めています。")
 
         plan = best["_plan"]
         plan_ui_best = best.get("_plan_ui", plan)
@@ -4922,7 +5052,7 @@ with tabs[1]:
             st.markdown("### サマリー")
             st.json(summ)
             st.markdown("### WFA結果")
-            st.dataframe(wf_df, use_container_width=True)
+            st.dataframe(wf_df, width="stretch")
 
             csv = wf_df.to_csv(index=False).encode("utf-8")
             st.download_button("CSVダウンロード", data=csv, file_name=f"ev_wfa_{bt_pair.replace('/','_')}.csv", mime="text/csv")
@@ -4963,10 +5093,10 @@ with tabs[2]:
         st.caption(f"最大DD（R）: {m.get('max_drawdown_R',0.0):.3f} / 総R: {m.get('sum_R',0.0):+.3f}")
 
     st.markdown("### 直近のトレード（trades）")
-    st.dataframe(df_t.tail(200), use_container_width=True)
+    st.dataframe(df_t.tail(200), width="stretch")
 
     st.markdown("### 直近のシグナル（signals）")
-    st.dataframe(df_s.tail(200), use_container_width=True)
+    st.dataframe(df_s.tail(200), width="stretch")
 
     # downloads
     try:
@@ -5116,7 +5246,7 @@ with st.expander("🔧 Webhook診断（送信テスト/失敗理由の表示）"
 
     colA, colB = st.columns(2)
     with colA:
-        if st.button("Webhookへテスト送信", use_container_width=True):
+        if st.button("Webhookへテスト送信", width="stretch"):
             if not url:
                 st.error("LOG_WEBHOOK_URL が未設定です。")
             else:
