@@ -3322,16 +3322,36 @@ def fetch_price_history(pair_label: str, symbol: str, period: str, interval: str
 
 
 @st.cache_data(ttl=60 * 10)
-def fetch_daytrade_subframes(pair_label: str, symbol: str) -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any]]:
-    """Fetch auxiliary intraday frames for DAYTRADE.
-    - 15m: setup / short-term structure
-    - 5m : execution / near-current price proxy
-    Never raises.
-    """
-    bundle: Dict[str, pd.DataFrame] = {"15m": pd.DataFrame(), "5m": pd.DataFrame()}
+
+
+def _resample_ohlc_frame(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    try:
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            return pd.DataFrame()
+        d = _coerce_ohlc(df.copy())
+        if d.empty:
+            return pd.DataFrame()
+        if not isinstance(d.index, pd.DatetimeIndex):
+            try:
+                d.index = pd.to_datetime(d.index, utc=True, errors='coerce')
+            except Exception:
+                d.index = pd.to_datetime(d.index, errors='coerce')
+        d = d[~d.index.isna()].sort_index()
+        if d.empty:
+            return pd.DataFrame()
+        agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
+        if "Volume" in d.columns:
+            agg["Volume"] = "sum"
+        out = d.resample(rule).agg(agg).dropna(subset=["Open", "High", "Low", "Close"])
+        return _coerce_ohlc(out)
+    except Exception:
+        return pd.DataFrame()
+
+
+def _build_daytrade_topdown_bundle(pair_label: str, symbol: str, base_1h_df: Optional[pd.DataFrame] = None) -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any]]:
+    bundle: Dict[str, pd.DataFrame] = {"5m": pd.DataFrame(), "15m": pd.DataFrame(), "4h": pd.DataFrame(), "1d": pd.DataFrame(), "1wk": pd.DataFrame(), "1mo": pd.DataFrame()}
     meta: Dict[str, Any] = {}
-    specs = [("15m", "60d"), ("5m", "5d")]
-    for iv, pd_period in specs:
+    for iv, pd_period in [("15m", "60d"), ("5m", "10d")]:
         try:
             df_i, meta_i = fetch_price_history(pair_label, symbol, period=pd_period, interval=iv, prefer_stooq=False)
             bundle[iv] = df_i if isinstance(df_i, pd.DataFrame) else pd.DataFrame()
@@ -3339,7 +3359,35 @@ def fetch_daytrade_subframes(pair_label: str, symbol: str) -> Tuple[Dict[str, pd
         except Exception as e:
             bundle[iv] = pd.DataFrame()
             meta[iv] = {"ok": False, "error": f"{type(e).__name__}:{e}"}
+    try:
+        base_1h = _coerce_ohlc(base_1h_df.copy()) if isinstance(base_1h_df, pd.DataFrame) and not base_1h_df.empty else pd.DataFrame()
+    except Exception:
+        base_1h = pd.DataFrame()
+    if not base_1h.empty:
+        bundle["4h"] = _resample_ohlc_frame(base_1h, "4H")
+        meta["4h"] = {"ok": not bundle["4h"].empty, "source": "resampled_from_1h"}
+    else:
+        meta["4h"] = {"ok": False, "error": "base_1h_empty"}
+    try:
+        daily_df, daily_meta = fetch_price_history(pair_label, symbol, period="2y", interval="1d", prefer_stooq=True)
+        bundle["1d"] = daily_df if isinstance(daily_df, pd.DataFrame) else pd.DataFrame()
+        meta["1d"] = daily_meta if isinstance(daily_meta, dict) else {"ok": False, "error": "bad_meta"}
+    except Exception as e:
+        bundle["1d"] = pd.DataFrame()
+        meta["1d"] = {"ok": False, "error": f"{type(e).__name__}:{e}"}
+    if isinstance(bundle.get("1d"), pd.DataFrame) and not bundle["1d"].empty:
+        bundle["1wk"] = _resample_ohlc_frame(bundle["1d"], "W-FRI")
+        bundle["1mo"] = _resample_ohlc_frame(bundle["1d"], "MS")
+        meta["1wk"] = {"ok": not bundle["1wk"].empty, "source": "resampled_from_1d"}
+        meta["1mo"] = {"ok": not bundle["1mo"].empty, "source": "resampled_from_1d"}
+    else:
+        meta["1wk"] = {"ok": False, "error": "daily_empty"}
+        meta["1mo"] = {"ok": False, "error": "daily_empty"}
     return bundle, meta
+
+
+def fetch_daytrade_subframes(pair_label: str, symbol: str, base_1h_df: Optional[pd.DataFrame] = None) -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any]]:
+    return _build_daytrade_topdown_bundle(pair_label, symbol, base_1h_df=base_1h_df)
 
 @st.cache_data(ttl=60 * 20)
 def fetch_external(pair_label: str, keys: Dict[str, str]) -> Tuple[Dict[str, float], Dict[str, Any]]:
@@ -3535,13 +3583,13 @@ def _style_defaults(style_name: str) -> Dict[str, Any]:
         return {"min_expected_R": 0.03, "horizon_days": 5}
     return {"min_expected_R": 0.07, "horizon_days": 7}  # 標準
 
+
 def _build_ctx(pair_label: str, df: pd.DataFrame, feats: Dict[str, float], horizon_days: int, min_expected_R: float, style_name: str,
                governor_cfg: Dict[str, Any], interval: str = "1d", timeframe_mode: str = "", mtf_bundle: Optional[Dict[str, pd.DataFrame]] = None) -> Dict[str, Any]:
     indicators = _compute_indicators_compat(df)
     ctx: Dict[str, Any] = {}
     ctx.update(indicators)
     ctx.update(feats)
-    # --- AI Trend Engine features (phase / continuation / similar patterns) ---
     try:
         phase_info = _phase_classify(df)
         interval_s = str(interval or "1d")
@@ -3558,13 +3606,10 @@ def _build_ctx(pair_label: str, df: pd.DataFrame, feats: Dict[str, float], horiz
         ctx["adx14"] = float(phase_info.get("adx", float("nan")))
         ctx["p_cont_up"] = float(cont.get("p_up", float("nan")))
         ctx["p_cont_dn"] = float(cont.get("p_dn", float("nan")))
-        # stash patterns for UI
         ctx["_similar_patterns_df"] = patt
-
         if interval_s == "1h" and isinstance(mtf_bundle, dict):
             fast_df = mtf_bundle.get("15m")
             micro_df = mtf_bundle.get("5m")
-
             if isinstance(fast_df, pd.DataFrame) and not fast_df.empty:
                 try:
                     fast_phase = _phase_classify(fast_df)
@@ -3578,7 +3623,6 @@ def _build_ctx(pair_label: str, df: pd.DataFrame, feats: Dict[str, float], horiz
                     ctx["_df_fast_15m"] = fast_df.tail(320).copy()
                 except Exception:
                     pass
-
             if isinstance(micro_df, pd.DataFrame) and not micro_df.empty:
                 try:
                     micro_close = micro_df["Close"].astype(float)
@@ -3587,6 +3631,13 @@ def _build_ctx(pair_label: str, df: pd.DataFrame, feats: Dict[str, float], horiz
                     ctx["_df_micro_5m"] = micro_df.tail(320).copy()
                 except Exception:
                     pass
+            for frame_key, source_key in [("_df_4h", "4h"), ("_df_daily", "1d"), ("_df_weekly", "1wk"), ("_df_monthly", "1mo")]:
+                alias = mtf_bundle.get(source_key)
+                if isinstance(alias, pd.DataFrame) and not alias.empty:
+                    try:
+                        ctx[frame_key] = alias.tail(320).copy()
+                    except Exception:
+                        pass
     except Exception:
         ctx["phase"] = "UNKNOWN"
         ctx["trend_strength"] = 0.0
@@ -3599,13 +3650,12 @@ def _build_ctx(pair_label: str, df: pd.DataFrame, feats: Dict[str, float], horiz
     ctx["timeframe_mode"] = str(timeframe_mode or "")
     ctx["trade_profile"] = ("DAYTRADE" if str(interval or "").lower() == "1h" else ("POSITION" if str(interval or "").lower() == "1wk" else "SWING"))
     ctx["is_intraday"] = bool(str(interval or "").lower() == "1h")
+    ctx["trend_breakout_only"] = bool(ctx.get("trend_breakout_only", True))
     ctx["model_horizon_bars"] = int(locals().get("model_horizon_bars", max(3, int(horizon_days))))
     ctx["horizon_days"] = int(horizon_days)
     ctx["min_expected_R"] = float(min_expected_R)
     ctx["style_name"] = style_name
-    # Capital Governor inputs (user provided / optional)
     ctx.update(governor_cfg)
-    # stash recent bars for UI (target zones / reference chart)
     try:
         ctx["_df"] = df.tail(320).copy()
     except Exception:
@@ -4673,7 +4723,7 @@ with tabs[0]:
             mtf_meta = None
             if str(interval) == "1h":
                 try:
-                    mtf_bundle, mtf_meta = fetch_daytrade_subframes(p, sym)
+                    mtf_bundle, mtf_meta = fetch_daytrade_subframes(p, sym, base_1h_df=df)
                 except Exception:
                     mtf_bundle, mtf_meta = None, {"ok": False, "error": "mtf_fetch_failed"}
             ctx = _build_ctx(p, df, feats, horizon_days=int(horizon_days), min_expected_R=float(min_expected_R), style_name=style_name, governor_cfg=governor_cfg, interval=interval, timeframe_mode=trade_axis, mtf_bundle=mtf_bundle)
@@ -4934,7 +4984,7 @@ with tabs[0]:
         mtf_meta = None
         if str(interval) == "1h":
             try:
-                mtf_bundle, mtf_meta = fetch_daytrade_subframes(pair_label, symbol)
+                mtf_bundle, mtf_meta = fetch_daytrade_subframes(pair_label, symbol, base_1h_df=df)
             except Exception:
                 mtf_bundle, mtf_meta = None, {"ok": False, "error": "mtf_fetch_failed"}
         ctx = _build_ctx(pair_label, df, feats, horizon_days=int(horizon_days), min_expected_R=float(min_expected_R), style_name=style_name, governor_cfg=governor_cfg, interval=interval, timeframe_mode=trade_axis, mtf_bundle=mtf_bundle)
