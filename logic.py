@@ -791,6 +791,206 @@ def _probe_intraday_frame(df: Optional[pd.DataFrame], direction: str, lookback: 
         return {}
 
 
+
+
+def _ema_series(series: pd.Series, span: int) -> pd.Series:
+    try:
+        return series.astype(float).ewm(span=int(span), adjust=False).mean()
+    except Exception:
+        return pd.Series(dtype=float)
+
+
+def _frame_defense_profile(df: Optional[pd.DataFrame], direction: str, label: str = "") -> Dict[str, Any]:
+    try:
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty or len(df) < 40:
+            return {}
+        d = df.copy().tail(220)
+        c = d["Close"].astype(float)
+        h = d["High"].astype(float)
+        l = d["Low"].astype(float)
+        atr = float(_atr(d, 14).iloc[-1])
+        atr = max(atr, 1e-9)
+        ema5 = _ema_series(c, 5)
+        ema25 = _ema_series(c, 25)
+        ema75 = _ema_series(c, 75)
+        px = float(c.iloc[-1])
+        prev_px = float(c.iloc[-2])
+        slope25 = float((ema25.iloc[-1] - ema25.iloc[max(0, len(ema25)-4)]) / atr) if len(ema25) >= 4 else 0.0
+        slope75 = float((ema75.iloc[-1] - ema75.iloc[max(0, len(ema75)-6)]) / atr) if len(ema75) >= 6 else 0.0
+        touch25 = bool(abs(px - float(ema25.iloc[-1])) <= 0.18 * atr or abs(float(l.iloc[-1]) - float(ema25.iloc[-1])) <= 0.18 * atr or abs(float(h.iloc[-1]) - float(ema25.iloc[-1])) <= 0.18 * atr)
+        touch75 = bool(abs(px - float(ema75.iloc[-1])) <= 0.20 * atr or abs(float(l.iloc[-1]) - float(ema75.iloc[-1])) <= 0.20 * atr or abs(float(h.iloc[-1]) - float(ema75.iloc[-1])) <= 0.20 * atr)
+        if str(direction).upper() == "LONG":
+            aligned = bool(px >= float(ema25.iloc[-1]) and float(ema25.iloc[-1]) >= float(ema75.iloc[-1]))
+            trend_ok = bool(slope25 >= -0.05 and slope75 >= -0.05)
+            defense25 = bool(touch25 and px >= float(ema25.iloc[-1]) and prev_px >= float(ema25.iloc[-2]) - 0.10 * atr)
+            defense75 = bool(touch75 and px >= float(ema75.iloc[-1]) and float(ema5.iloc[-1]) >= float(ema25.iloc[-1]) - 0.05 * atr)
+            broken25 = bool(px < float(ema25.iloc[-1]) - 0.08 * atr)
+            broken75 = bool(px < float(ema75.iloc[-1]) - 0.10 * atr)
+            rejection75 = bool(float(h.iloc[-1]) >= float(ema75.iloc[-1]) and px < float(ema75.iloc[-1]) and float(ema5.iloc[-1]) <= float(ema25.iloc[-1]) + 0.03 * atr)
+        else:
+            aligned = bool(px <= float(ema25.iloc[-1]) and float(ema25.iloc[-1]) <= float(ema75.iloc[-1]))
+            trend_ok = bool(slope25 <= 0.05 and slope75 <= 0.05)
+            defense25 = bool(touch25 and px <= float(ema25.iloc[-1]) and prev_px <= float(ema25.iloc[-2]) + 0.10 * atr)
+            defense75 = bool(touch75 and px <= float(ema75.iloc[-1]) and float(ema5.iloc[-1]) <= float(ema25.iloc[-1]) + 0.05 * atr)
+            broken25 = bool(px > float(ema25.iloc[-1]) + 0.08 * atr)
+            broken75 = bool(px > float(ema75.iloc[-1]) + 0.10 * atr)
+            rejection75 = bool(float(l.iloc[-1]) <= float(ema75.iloc[-1]) and px > float(ema75.iloc[-1]) and float(ema5.iloc[-1]) >= float(ema25.iloc[-1]) - 0.03 * atr)
+        return {"label": str(label), "price": float(px), "atr14": float(atr), "ema5": float(ema5.iloc[-1]), "ema25": float(ema25.iloc[-1]), "ema75": float(ema75.iloc[-1]), "slope25": float(slope25), "slope75": float(slope75), "aligned": bool(aligned), "trend_ok": bool(trend_ok), "defense25": bool(defense25), "defense75": bool(defense75), "broken25": bool(broken25), "broken75": bool(broken75), "rejection75": bool(rejection75), "touch25": bool(touch25), "touch75": bool(touch75)}
+    except Exception:
+        return {}
+
+
+def _frame_breakout_state(df: Optional[pd.DataFrame], direction: str, lookback: int = 20, atr_pad: float = 0.05) -> Dict[str, Any]:
+    try:
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty or len(df) < max(lookback + 5, 30):
+            return {}
+        d = df.copy().tail(max(lookback + 25, 60))
+        c = d["Close"].astype(float)
+        h = d["High"].astype(float)
+        l = d["Low"].astype(float)
+        atr = float(_atr(d, 14).iloc[-1])
+        atr = max(atr, 1e-9)
+        prior_high = float(h.iloc[-(lookback+1):-1].max())
+        prior_low = float(l.iloc[-(lookback+1):-1].min())
+        px = float(c.iloc[-1])
+        prev_px = float(c.iloc[-2])
+        if str(direction).upper() == "LONG":
+            trigger = prior_high + atr_pad * atr
+            active = bool(px >= trigger and prev_px >= prior_high - 0.08 * atr)
+            armed = bool(px >= prior_high - 0.20 * atr)
+            hold = bool(min(float(c.iloc[-1]), float(c.iloc[-2])) >= prior_high - 0.10 * atr)
+        else:
+            trigger = prior_low - atr_pad * atr
+            active = bool(px <= trigger and prev_px <= prior_low + 0.08 * atr)
+            armed = bool(px <= prior_low + 0.20 * atr)
+            hold = bool(max(float(c.iloc[-1]), float(c.iloc[-2])) <= prior_low + 0.10 * atr)
+        return {"trigger": float(trigger), "active": bool(active and hold), "armed": bool(armed), "hold": bool(hold), "atr14": float(atr)}
+    except Exception:
+        return {}
+
+
+def _collect_mtf_frames(ctx_in: Dict[str, Any], base_df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+    frames: Dict[str, pd.DataFrame] = {}
+    try:
+        if isinstance(base_df, pd.DataFrame) and not base_df.empty:
+            frames["1h"] = base_df.copy()
+    except Exception:
+        pass
+    mapping = {"5m": ("_df_micro_5m", "df_micro_5m", "_df_5m"), "15m": ("_df_fast_15m", "df_fast_15m", "_df_15m"), "4h": ("_df_4h", "df_4h"), "1d": ("_df_daily", "df_daily", "_df_1d"), "1wk": ("_df_weekly", "df_weekly", "_df_1wk"), "1mo": ("_df_monthly", "df_monthly", "_df_1mo")}
+    for label, keys in mapping.items():
+        df = _ctx_dataframe(ctx_in, *keys)
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            frames[label] = df.copy()
+    return frames
+
+
+def _trend_entry_engine(df: pd.DataFrame, ctx_in: Dict[str, Any], direction: str, trade_profile: Dict[str, Any], phase_label: str, strength: float, mom: float, breakout_ok: bool, breakout_strength: float, range_pos: float) -> Dict[str, Any]:
+    try:
+        direction = str(direction).upper()
+        frames = _collect_mtf_frames(ctx_in, df)
+        weights = {"1mo": 1.80, "1wk": 1.55, "1d": 1.30, "4h": 1.10, "1h": 1.00, "15m": 0.75, "5m": 0.55}
+        defense_map: Dict[str, Any] = {}
+        bias_raw = 0.0
+        wsum = 0.0
+        aligned_high = 0
+        high_count = 0
+        for label in ["1mo", "1wk", "1d", "4h", "1h", "15m", "5m"]:
+            prof = _frame_defense_profile(frames.get(label), direction, label=label)
+            if not prof:
+                continue
+            defense_map[label] = prof
+            w = float(weights.get(label, 0.5))
+            frame_score = (0.50 if prof.get("aligned") else -0.55) + (0.20 if prof.get("trend_ok") else -0.18) + (0.12 if prof.get("defense25") else 0.0) + (0.10 if prof.get("defense75") else 0.0) - (0.22 if prof.get("broken25") else 0.0) - (0.30 if prof.get("broken75") else 0.0) - (0.12 if prof.get("rejection75") else 0.0)
+            bias_raw += w * frame_score
+            wsum += w
+            if label in ("1mo", "1wk", "1d", "4h", "1h"):
+                high_count += 1
+                if prof.get("aligned") and prof.get("trend_ok"):
+                    aligned_high += 1
+        bias_score = float(_clamp((bias_raw / max(wsum, 1e-9) + 1.0) / 2.0, 0.0, 1.0))
+        br15 = _frame_breakout_state(frames.get("15m"), direction, lookback=24, atr_pad=0.04)
+        br5 = _frame_breakout_state(frames.get("5m"), direction, lookback=28, atr_pad=0.03)
+        br1h = _frame_breakout_state(frames.get("1h"), direction, lookback=18, atr_pad=0.05)
+        active_breakout = bool((br15.get("active") and br5.get("active")) or (br1h.get("active") and br15.get("armed")))
+        armed_breakout = bool((br15.get("armed") and br5.get("armed")) or br1h.get("armed"))
+        trend_breakout_only = bool(ctx_in.get("trend_breakout_only", True))
+        pullback_reclaim = bool(defense_map.get("15m", {}).get("defense25") and defense_map.get("5m", {}).get("defense25") and defense_map.get("1h", {}).get("aligned") and defense_map.get("1h", {}).get("trend_ok"))
+        range_block = bool(str(phase_label) == "RANGE" and ((direction == "LONG" and float(range_pos) > 0.84) or (direction == "SHORT" and float(range_pos) < 0.16)))
+        vetoes: List[str] = []
+        if high_count > 0 and aligned_high < max(2, min(high_count, 3)):
+            vetoes.append("上位足の方向一致が不足")
+        if range_block:
+            vetoes.append("1時間足レンジ中央〜逆端で伸び代が弱い")
+        if trend_breakout_only and not (active_breakout or armed_breakout or pullback_reclaim):
+            vetoes.append("レンジ高安の明確ブレイク待ち")
+        if defense_map.get("1h", {}).get("broken75") or defense_map.get("4h", {}).get("broken75"):
+            vetoes.append("上位足75EMA防衛が崩れている")
+        trigger_candidates = [x.get("trigger") for x in (br5, br15, br1h) if x.get("trigger") is not None]
+        trigger_price = max(trigger_candidates) if trigger_candidates and direction == "LONG" else (min(trigger_candidates) if trigger_candidates else None)
+        allow_trade = bool(bias_score >= (0.54 if bool(trade_profile.get("is_intraday")) else 0.50) and aligned_high >= max(2, min(high_count, 3)) and not range_block and (active_breakout or pullback_reclaim or (not trend_breakout_only and armed_breakout)))
+        prefer_breakout_order = bool((not active_breakout) and armed_breakout and trend_breakout_only)
+        mode = "BREAKOUT_ACTIVE" if active_breakout else ("BREAKOUT_WAIT" if prefer_breakout_order else ("PULLBACK_RECLAIM" if pullback_reclaim else "BLOCKED"))
+        score = float(_clamp(0.65 * bias_score + 0.15 * (1.0 if active_breakout else 0.0) + 0.10 * (1.0 if pullback_reclaim else 0.0) + 0.10 * max(0.0, float(strength)), 0.0, 1.0))
+        return {"ok": bool(allow_trade), "score": float(score), "bias_score": float(bias_score), "active_breakout": bool(active_breakout), "armed_breakout": bool(armed_breakout), "pullback_reclaim": bool(pullback_reclaim), "prefer_breakout_order": bool(prefer_breakout_order), "trigger_price": (float(trigger_price) if trigger_price is not None else None), "mode": str(mode), "defense_map": defense_map, "vetoes": vetoes, "why": ("上位足順行でブレイク発火" if active_breakout else ("上位足順行・ブレイク待機" if prefer_breakout_order else ("25EMA防衛からの再始動" if pullback_reclaim else "エントリー精度不足")))}
+    except Exception as e:
+        return {"ok": False, "score": 0.0, "bias_score": 0.0, "active_breakout": False, "armed_breakout": False, "pullback_reclaim": False, "prefer_breakout_order": False, "trigger_price": None, "mode": "ERROR", "defense_map": {}, "vetoes": [f"trend_entry_error:{type(e).__name__}"], "why": "trend_entry_error"}
+
+
+def _hold_defense_signal(ctx_in: Dict[str, Any], state: Dict[str, Any], mode: str = "DAYTRADE") -> Dict[str, Any]:
+    try:
+        side = str(state.get("side") or "BUY").upper()
+        direction = "LONG" if side == "BUY" else "SHORT"
+        base_df = _ctx_dataframe(ctx_in, "_df")
+        frames = _collect_mtf_frames(ctx_in, base_df if isinstance(base_df, pd.DataFrame) else pd.DataFrame())
+        unrealized_R = float(state.get("unrealized_R") or 0.0)
+        notes: List[str] = []
+        actions: List[str] = []
+        partial = 0.0
+        reduce_mult = 1.0
+        close_now = False
+        close_reason = None
+        defense_map: Dict[str, Any] = {}
+        labels = ["5m", "15m", "1h"] if str(mode).upper() == "DAYTRADE" else ["1h", "4h", "1d", "1wk"]
+        for label in labels:
+            prof = _frame_defense_profile(frames.get(label), direction, label=label)
+            if prof:
+                defense_map[label] = prof
+        if direction == "LONG":
+            if defense_map.get("5m", {}).get("broken25") and defense_map.get("15m", {}).get("broken25") and unrealized_R >= 0.20:
+                partial = max(partial, 0.35)
+                reduce_mult = min(reduce_mult, 0.65)
+                actions.extend(["PARTIAL_TP", "DEFENSE_EXIT"])
+                notes.append("5分足・15分足で25EMA防衛が崩れ、短期の失速が出ています")
+            if defense_map.get("1h", {}).get("rejection75") and unrealized_R >= 0.35:
+                partial = max(partial, 0.50)
+                reduce_mult = min(reduce_mult, 0.50)
+                actions.extend(["PARTIAL_TP", "DEFENSE_EXIT"])
+                notes.append("1時間足75EMAで上値を抑えられ、防衛ライン反落の形です")
+            if str(mode).upper() != "DAYTRADE" and (((defense_map.get("4h", {}).get("broken25") and defense_map.get("1d", {}).get("broken25")) or defense_map.get("4h", {}).get("broken75")) and unrealized_R >= 0.30):
+                close_now = True
+                close_reason = "4時間足/日足のEMA防衛崩れ"
+                actions.extend(["EXIT_NOW", "DEFENSE_EXIT"])
+                notes.append("4時間足〜日足で25EMA/75EMA防衛が崩れ、スイング継続の根拠が弱化しました")
+        else:
+            if defense_map.get("5m", {}).get("broken25") and defense_map.get("15m", {}).get("broken25") and unrealized_R >= 0.20:
+                partial = max(partial, 0.35)
+                reduce_mult = min(reduce_mult, 0.65)
+                actions.extend(["PARTIAL_TP", "DEFENSE_EXIT"])
+                notes.append("5分足・15分足で25EMA抵抗が崩れ、短期の戻しが強まっています")
+            if defense_map.get("1h", {}).get("rejection75") and unrealized_R >= 0.35:
+                partial = max(partial, 0.50)
+                reduce_mult = min(reduce_mult, 0.50)
+                actions.extend(["PARTIAL_TP", "DEFENSE_EXIT"])
+                notes.append("1時間足75EMAで下値を止められ、戻し優勢の形です")
+            if str(mode).upper() != "DAYTRADE" and (((defense_map.get("4h", {}).get("broken25") and defense_map.get("1d", {}).get("broken25")) or defense_map.get("4h", {}).get("broken75")) and unrealized_R >= 0.30):
+                close_now = True
+                close_reason = "4時間足/日足のEMA抵抗崩れ"
+                actions.extend(["EXIT_NOW", "DEFENSE_EXIT"])
+                notes.append("4時間足〜日足で25EMA/75EMA抵抗が崩れ、スイング継続の根拠が弱化しました")
+        return {"notes": list(dict.fromkeys(notes)), "actions": list(dict.fromkeys(actions)), "partial_tp_ratio": float(_clamp(partial, 0.0, 1.0)), "reduce_size_mult": float(_clamp(reduce_mult, 0.20, 1.00)), "close_now": bool(close_now), "close_reason": close_reason, "defense_map": defense_map}
+    except Exception:
+        return {"notes": [], "actions": [], "partial_tp_ratio": 0.0, "reduce_size_mult": 1.0, "close_now": False, "close_reason": None, "defense_map": {}}
+
 def _daytrade_refine_levels(entry: float, sl: float, tp: float, direction: str, trade_profile: Dict[str, Any], atr14: float,
                             recent_low: float, recent_high: float, liq_lookback: int,
                             fast_df: Optional[pd.DataFrame], fast_probe: Dict[str, Any],
@@ -1484,6 +1684,8 @@ def _swing_hold_v1(state: Dict[str, Any], ctx_in: Dict[str, Any], weekend_risk: 
         notes: List[str] = []
         actions: List[str] = []
         no_add = False
+        close_now = False
+        close_reason = None
         if (nh_f is not None) and (nh_f <= no_add_h):
             no_add = True
             notes.append(f"高インパクト指標が{nh_f:.1f}時間以内 → 追加建て禁止（スイングでも実行リスク回避）")
@@ -1538,6 +1740,20 @@ def _swing_hold_v1(state: Dict[str, Any], ctx_in: Dict[str, Any], weekend_risk: 
                 new_sl = _round_to_pip(float(new_sl), state.get("pair", ""))
         except Exception:
             pass
+        defense_signal = _hold_defense_signal(ctx_in, state, mode="SWING")
+        try:
+            partial_tp = max(float(partial_tp), float((defense_signal or {}).get("partial_tp_ratio", 0.0) or 0.0))
+            reduce_mult = min(float(reduce_mult), float((defense_signal or {}).get("reduce_size_mult", 1.0) or 1.0))
+            if bool((defense_signal or {}).get("close_now", False)):
+                close_now = True
+                close_reason = (defense_signal or {}).get("close_reason") or close_reason
+            for _a in list((defense_signal or {}).get("actions", []) or []):
+                if _a not in actions:
+                    actions.append(_a)
+            for _n in list((defense_signal or {}).get("notes", []) or []):
+                notes.append(_n)
+        except Exception:
+            defense_signal = {"defense_map": {}}
         return {
             "version": "swing_hold_v1",
             "trade_profile": str(trade_profile.get("name", "SWING")),
@@ -1560,8 +1776,11 @@ def _swing_hold_v1(state: Dict[str, Any], ctx_in: Dict[str, Any], weekend_risk: 
             "partial_tp_ratio": float(_clamp(partial_tp, 0.0, 1.0)),
             "move_sl_to_be": bool(move_be),
             "new_sl_reco": (float(new_sl) if new_sl is not None else None),
+            "close_now": bool(close_now),
+            "close_reason": (str(close_reason) if close_reason else None),
             "actions": list(dict.fromkeys(actions)),
             "notes": notes,
+            "defense_map": dict((defense_signal or {}).get("defense_map", {}) or {}),
         }
     except Exception:
         return {}
@@ -1674,6 +1893,20 @@ def daytrade_hold_v1(state: Dict[str, Any], ctx_in: Dict[str, Any], weekend_risk
                 new_sl = _round_to_pip(float(new_sl), state.get("pair", ""))
         except Exception:
             pass
+        defense_signal = _hold_defense_signal(ctx_in, state, mode="DAYTRADE")
+        try:
+            partial_tp = max(float(partial_tp), float((defense_signal or {}).get("partial_tp_ratio", 0.0) or 0.0))
+            reduce_mult = min(float(reduce_mult), float((defense_signal or {}).get("reduce_size_mult", 1.0) or 1.0))
+            if bool((defense_signal or {}).get("close_now", False)):
+                close_now = True
+                close_reason = (defense_signal or {}).get("close_reason") or close_reason
+            for _a in list((defense_signal or {}).get("actions", []) or []):
+                if _a not in actions:
+                    actions.append(_a)
+            for _n in list((defense_signal or {}).get("notes", []) or []):
+                notes.append(_n)
+        except Exception:
+            defense_signal = {"defense_map": {}}
         return {
             "version": "daytrade_hold_v1",
             "trade_profile": str(trade_profile.get("name", "DAYTRADE")),
@@ -1709,6 +1942,7 @@ def daytrade_hold_v1(state: Dict[str, Any], ctx_in: Dict[str, Any], weekend_risk
             "new_sl_reco": (float(new_sl) if new_sl is not None else None),
             "actions": list(dict.fromkeys(actions)),
             "notes": notes,
+            "defense_map": dict((defense_signal or {}).get("defense_map", {}) or {}),
         }
     except Exception:
         return {}
@@ -3046,6 +3280,18 @@ def get_ai_order_strategy(
         structure_ok = bool(breakout_ok or structure_effective_dir_ok or (hhhl_ok if direction == "LONG" else lllh_ok))
     if bool(trade_profile.get("is_intraday")) and bool((intraday_opposition or {}).get("hard_block", False)):
         structure_ok = False
+    trend_entry_engine = _trend_entry_engine(
+        df=df,
+        ctx_in=ctx_in,
+        direction=str(direction),
+        trade_profile=trade_profile,
+        phase_label=str(phase_label),
+        strength=float(strength),
+        mom=float(mom),
+        breakout_ok=bool(breakout_ok),
+        breakout_strength=float(breakout_strength),
+        range_pos=float(range_pos),
+    ) if bool(trade_profile.get("is_intraday")) else {"ok": True, "score": 0.50, "bias_score": 0.50, "active_breakout": False, "armed_breakout": False, "pullback_reclaim": False, "prefer_breakout_order": False, "trigger_price": None, "mode": "SWING_OR_HIGHER", "defense_map": {}, "vetoes": [], "why": ""}
     structure_rescue_used = False
     if bool(trade_profile.get("is_intraday")) and not structure_ok:
         structure_rescue_used = bool(
@@ -3055,6 +3301,8 @@ def get_ai_order_strategy(
         )
         if structure_rescue_used:
             structure_ok = True
+    if bool(trade_profile.get("is_intraday")) and not bool((trend_entry_engine or {}).get("ok", False)):
+        structure_ok = False
 
     # -----------------------------------------------------------------
     # 10) veto/decision（veto乱立を抑える）
@@ -3079,6 +3327,24 @@ def get_ai_order_strategy(
         if entry_timing_rescue_used:
             entry_timing_ok = True
     intraday_rescue_margin = _intraday_entry_rescue_margin(float(intraday_entry_quality or 0.0)) if bool(trade_profile.get("is_intraday")) else 0.0
+
+    trend_entry_engine = _trend_entry_engine(
+        df=df,
+        ctx_in=ctx_in,
+        direction=str(direction),
+        trade_profile=trade_profile,
+        phase_label=str(phase_label),
+        strength=float(strength),
+        mom=float(mom),
+        breakout_ok=bool(breakout_ok),
+        breakout_strength=float(breakout_strength),
+        range_pos=float(range_pos),
+    ) if bool(trade_profile.get("is_intraday")) else {"ok": True, "score": 0.50, "bias_score": 0.50, "active_breakout": False, "armed_breakout": False, "pullback_reclaim": False, "prefer_breakout_order": False, "trigger_price": None, "mode": "SWING_OR_HIGHER", "defense_map": {}, "vetoes": [], "why": ""}
+    if bool(trade_profile.get("is_intraday")):
+        dynamic_threshold = float(_clamp(dynamic_threshold - 0.018 * max(0.0, float((trend_entry_engine or {}).get("bias_score", 0.0)) - 0.55) - (0.012 if bool((trend_entry_engine or {}).get("active_breakout", False)) else 0.0), 0.02, 0.30))
+        if (not entry_timing_ok) and (bool((trend_entry_engine or {}).get("active_breakout", False)) or bool((trend_entry_engine or {}).get("pullback_reclaim", False))):
+            entry_timing_ok = True
+            entry_timing_rescue_used = True
     sbi_conf_floor = 0.42
     if bool(trade_profile.get("is_intraday")):
         if float(intraday_entry_quality or 0.0) >= 0.72 and float(ev_gate) >= float(dynamic_threshold) + 0.01:
@@ -3111,6 +3377,9 @@ def get_ai_order_strategy(
             why = "レンジ優勢で構造根拠が不足（ブレイク or 端の逆張り条件が未達）"
         else:
             why = "価格構造の根拠が弱い（トレンド強度/構造擬似OK/ブレイクが不足）"
+        if bool(trade_profile.get("is_intraday")):
+            for _msg in list((trend_entry_engine or {}).get("vetoes", []) or [])[:3]:
+                _veto(_msg)
         _veto(why)
         decision = "NO_TRADE"
     else:
@@ -3317,6 +3586,18 @@ def get_ai_order_strategy(
         "structure_rescue_used": bool(structure_rescue_used),
         "entry_timing_rescue_used": bool(entry_timing_rescue_used),
         "sbi_conf_floor": float(sbi_conf_floor),
+
+        "trend_entry_mode": str((trend_entry_engine or {}).get("mode", "none") or "none"),
+        "trend_entry_score": float((trend_entry_engine or {}).get("score", 0.0) or 0.0),
+        "trend_bias_score": float((trend_entry_engine or {}).get("bias_score", 0.0) or 0.0),
+        "trend_entry_ok": bool((trend_entry_engine or {}).get("ok", False)),
+        "trend_entry_active_breakout": bool((trend_entry_engine or {}).get("active_breakout", False)),
+        "trend_entry_armed_breakout": bool((trend_entry_engine or {}).get("armed_breakout", False)),
+        "trend_entry_pullback_reclaim": bool((trend_entry_engine or {}).get("pullback_reclaim", False)),
+        "trend_entry_prefer_breakout_order": bool((trend_entry_engine or {}).get("prefer_breakout_order", False)),
+        "trend_entry_trigger_price": (float((trend_entry_engine or {}).get("trigger_price")) if (trend_entry_engine or {}).get("trigger_price") is not None else None),
+        "trend_entry_vetoes": list((trend_entry_engine or {}).get("vetoes", []) or []),
+        "trend_defense_map": dict((trend_entry_engine or {}).get("defense_map", {}) or {}),
     }
 
     # -----------------------------------------------------------------
@@ -3327,10 +3608,11 @@ def get_ai_order_strategy(
     exec_guard_notes: List[str] = []
 
     # setup-based suggestion (even for NO_TRADE; UI上は参考として表示可能)
+
     setup_kind = "TREND"
     if phase_label == "RANGE" and bool(range_edge_setup):
         setup_kind = "RANGE_EDGE"
-    elif bool(breakout_pass) or str(phase).startswith("BREAKOUT") or (event_mode == "POST_BREAKOUT"):
+    elif bool((trend_entry_engine or {}).get("prefer_breakout_order", False)) or bool((trend_entry_engine or {}).get("active_breakout", False)) or bool(breakout_pass) or str(phase).startswith("BREAKOUT") or (event_mode == "POST_BREAKOUT"):
         setup_kind = "BREAKOUT"
 
     try:
@@ -3358,12 +3640,14 @@ def get_ai_order_strategy(
         except Exception:
             pass
 
+
     elif setup_kind == "BREAKOUT":
+        te_trigger = (trend_entry_engine or {}).get("trigger_price") if isinstance(trend_entry_engine, dict) else None
         if direction == "LONG":
-            new_entry = entry + 0.10 * atr_for_entry
+            new_entry = float(te_trigger) if te_trigger is not None else (entry + 0.10 * atr_for_entry)
             entry_type = "STOP_BREAKOUT"
         else:
-            new_entry = entry - 0.10 * atr_for_entry
+            new_entry = float(te_trigger) if te_trigger is not None else (entry - 0.10 * atr_for_entry)
             entry_type = "STOP_BREAKDOWN"
         order_type = "STOP"
         exec_guard_notes.append("ブレイク捕獲のため、逆指値（STOP）を推奨")
@@ -3601,6 +3885,18 @@ def get_ai_order_strategy(
         "structure_rescue_used": bool(structure_rescue_used),
         "entry_timing_rescue_used": bool(entry_timing_rescue_used),
         "sbi_conf_floor": float(sbi_conf_floor),
+
+        "trend_entry_mode": str((trend_entry_engine or {}).get("mode", "none") or "none"),
+        "trend_entry_score": float((trend_entry_engine or {}).get("score", 0.0) or 0.0),
+        "trend_bias_score": float((trend_entry_engine or {}).get("bias_score", 0.0) or 0.0),
+        "trend_entry_ok": bool((trend_entry_engine or {}).get("ok", False)),
+        "trend_entry_active_breakout": bool((trend_entry_engine or {}).get("active_breakout", False)),
+        "trend_entry_armed_breakout": bool((trend_entry_engine or {}).get("armed_breakout", False)),
+        "trend_entry_pullback_reclaim": bool((trend_entry_engine or {}).get("pullback_reclaim", False)),
+        "trend_entry_prefer_breakout_order": bool((trend_entry_engine or {}).get("prefer_breakout_order", False)),
+        "trend_entry_trigger_price": (float((trend_entry_engine or {}).get("trigger_price")) if (trend_entry_engine or {}).get("trigger_price") is not None else None),
+        "trend_entry_vetoes": list((trend_entry_engine or {}).get("vetoes", []) or []),
+        "trend_defense_map": dict((trend_entry_engine or {}).get("defense_map", {}) or {}),
 
         "confidence": float(confidence),
         "p_win": float(p_eff),       # UIには縮退後を提示（整合性を優先）
